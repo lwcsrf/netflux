@@ -1,0 +1,339 @@
+from types import SimpleNamespace
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union, cast
+import copy
+
+from ..core import (
+    Node, RunContext, Function, AgentNode, AgentException,
+    UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
+    TokenUsage,
+)
+from . import ModelNames, Provider
+from ..func_lib.text_editor import TextEditor
+
+import anthropic
+from anthropic.types import (
+    Message, MessageParam,
+    Usage,
+    TextBlock, TextBlockParam,
+    ThinkingBlock, ThinkingBlockParam,
+    RedactedThinkingBlock, RedactedThinkingBlockParam,
+    ToolUseBlock, ToolUseBlockParam,
+    ToolResultBlockParam,
+    ToolParam, ToolUnionParam, ToolTextEditor20250728Param,
+    CacheControlEphemeralParam,
+    ToolChoiceAutoParam, ThinkingConfigEnabledParam,
+
+)
+from anthropic.types.tool_param import InputSchemaTyped
+from overrides import override
+
+ANTHROPIC_API_KEY = "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"
+INTERLEAVED_BETA = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
+MAX_TOKENS = 32_000
+THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=80_000)
+TOOL_CHOICE = ToolChoiceAutoParam(type="auto")
+CACHE_TTL = "5m"  # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
+
+
+class AnthropicAgentNode(AgentNode):
+    """
+    Anthropic agent driver using strongly-typed SDK.
+
+    - Messages: history kept as List[MessageParam] with *Param content blocks.
+    - Replay: response Blocks -> corresponding *Param blocks.
+    - Tool calls: executed in parallel here (impl detail), results batched into
+      a single user message session continuation request.
+    - Cache watermark: applied just-in-time to the latest user message before each request.
+    """
+
+    def __init__(self, ctx: RunContext, id: int, fn: Function, inputs: Dict[str, Any], parent: Optional[Node]):
+        super().__init__(ctx, id, fn, inputs, parent)
+        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.model = ModelNames[Provider.Anthropic]
+        self._history: List[MessageParam] = []   # Typed conversation history we replay every turn
+        self._tools: List[ToolUnionParam] = self._build_tool_params(self.agent_fn.uses)
+        self._token_usage = TokenUsage()
+
+        # Seed initial user message (cache watermark will be added pre-send)
+        user_text = self.build_user_text()
+        self.transcript.append(UserTextPart(text=user_text))
+        self._history.append(
+            cast(MessageParam, {"role": "user", "content": [TextBlockParam(text=user_text, type="text")]})
+        )
+
+    @property
+    @override
+    def token_usage(self) -> TokenUsage:
+        return self._token_usage
+
+    def run(self) -> None:
+        system_prompt = self.agent_fn.system_prompt
+
+        while True:
+            # Apply watermark to *latest* user message only (just-in-time)
+            msgs = self._messages_with_latest_cache_ttl(self._history, CACHE_TTL)
+
+            # One interleaved-thinking turn (streaming for correctness; we just take final message)
+            # TODO: Implement retry/backoff for known transient Anthropic SDK exceptions.
+            with self.client.messages.stream(
+                model=self.model,
+                system=system_prompt,
+                messages=msgs,
+                tools=self._tools,
+                tool_choice=TOOL_CHOICE,
+                max_tokens=MAX_TOKENS,
+                thinking=THINKING_CFG,
+                extra_headers=INTERLEAVED_BETA,
+            ) as stream:
+                resp: Message = stream.get_final_message()
+                self._accumulate_usage(resp.usage)
+
+            # Map response ContentBlocks -> *Param blocks for strict replay,
+            # while also projecting into our framework transcript.
+            assistant_params: List[Union[
+                TextBlockParam, ToolUseBlockParam, ThinkingBlockParam, RedactedThinkingBlockParam
+            ]] = []
+            tool_uses: List[ToolUseBlock] = []
+            final_text_chunks: List[str] = []
+
+            for blk in resp.content:
+                if isinstance(blk, ThinkingBlock):
+                    # Record in our own framework-type msg for transcript.
+                    self.transcript.append(
+                        ThinkingBlockPart(content=blk.thinking, signature=blk.signature, redacted=False)
+                    )
+                    # Add sdk-type msg for session replay.
+                    assistant_params.append(
+                        ThinkingBlockParam(signature=blk.signature, thinking=blk.thinking, type=blk.type)
+                    )
+
+                elif isinstance(blk, RedactedThinkingBlock):
+                    self.transcript.append(
+                        ThinkingBlockPart(content=blk.data, signature="", redacted=True)
+                    )
+                    assistant_params.append(
+                        RedactedThinkingBlockParam(data=blk.data, type=blk.type)
+                    )
+
+                elif isinstance(blk, ToolUseBlock):
+                    args = cast(Dict[str, Any], blk.input or {})
+                    self.transcript.append(
+                        ToolUsePart(tool_use_id=blk.id, tool_name=blk.name, args=args)
+                    )
+                    tool_uses.append(blk)
+                    assistant_params.append(
+                        ToolUseBlockParam(id=blk.id, name=blk.name, input=args, type="tool_use")
+                    )
+
+                elif isinstance(blk, TextBlock):
+                    if blk.text and blk.text.strip():
+                        final_text_chunks.append(blk.text)
+                        # Non-final interleaved text should also be replayed
+                        assistant_params.append(TextBlockParam(text=blk.text, type="text"))
+
+            # Append assistant turn to history for strict session replay.
+            self._history.append(
+                MessageParam(role="assistant", content=assistant_params)
+            )
+
+            # If no tool uses -> finalize with the accumulated text
+            if not tool_uses:
+                final_text = "\n".join(t for t in final_text_chunks if t).strip()
+                self.transcript.append(ModelTextPart(text=final_text))
+                self.ctx.post_success(final_text)
+                return
+
+            # Execute requested tools in parallel and aggregate tool_result blocks.
+            # Even if some tool invocations fail early, continue processing others.
+            result_blocks: List[ToolResultBlockParam] = []
+            children: List[Optional[Node]] = []                 # Index to match `tool_uses` 1:1.
+            invoke_exceptions: List[Optional[Exception]] = []   # Index to match `tool_uses` 1:1.
+            for tu in tool_uses:
+                args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
+
+                # Workaround for Anthropic using TextEditor:
+                # Normalize Anthropic's `view_range` [start, end] into TextEditor's args.
+                # We cannot change the spec because Anthropic is trained on it for adherence.
+                # It's not worth having to support collection arguments in our framework.
+                if tu.name == TextEditor.name:
+                    if args.get("command") == "view" and "view_range" in args:
+                        vr = args.pop("view_range", None)
+                        if isinstance(vr, list) and len(vr) == 2:
+                            start, end = vr
+                            if start is not None:
+                                args["view_start_line"] = start
+                            if end is not None:
+                                args["view_end_line"] = end
+
+                try:
+                    children.append(self.invoke_tool_function(tu.name, args))
+                    invoke_exceptions.append(None)
+                except Exception as ex:
+                    children.append(None)
+                    invoke_exceptions.append(ex)
+
+            pending_agent_ex: Optional[AgentException] = None
+
+            # WaitAll + transcribe results.
+            for tu, child, invoke_ex in zip(tool_uses, children, invoke_exceptions):
+                out_text: str
+                is_error: bool
+
+                # Did the invocation itself fail-fast?
+                if invoke_ex:
+                    out_text = AgentNode.stringify_exception(invoke_ex)
+                    is_error = True
+
+                # Check if the child Node is success / error.
+                else:
+                    assert child
+                    try:
+                        # This will re-raise any exception that happened inside the tool function.
+                        result: Any = child.result()
+                        out_text = "" if result is None else str(result)
+                        is_error = False
+                    except AgentException as ex:
+                        # Agent decided to raise an exception. Keep processing the rest of the batch
+                        # per spec before propagating the exception outside the loop.
+                        pending_agent_ex = ex
+                        continue
+                    except Exception as ex:
+                        out_text = AgentNode.stringify_exception(ex)
+                        is_error = True
+
+                self.transcript.append(
+                    ToolResultPart(
+                        tool_use_id=tu.id,
+                        tool_name=tu.name,
+                        outputs=out_text,
+                        is_error=is_error,
+                    )
+                )
+
+                result_blocks.append(
+                    ToolResultBlockParam(
+                        tool_use_id=tu.id,
+                        type="tool_result",
+                        content=[TextBlockParam(text=out_text, type="text")],
+                        is_error=is_error,
+                    )
+                )
+
+            # Per protocol: next user message contains only tool_result blocks
+            if pending_agent_ex:
+                self.ctx.post_exception(pending_agent_ex)
+                return
+            self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
+
+    def _accumulate_usage(self, usage: Usage) -> None:
+        cache_read = usage.cache_read_input_tokens or 0
+        cache_write = usage.cache_creation_input_tokens or 0
+        input_tokens = usage.input_tokens
+        output_tokens = usage.output_tokens
+
+        token_usage = self._token_usage
+        token_usage.input_tokens_cache_read += cache_read
+        token_usage.input_tokens_cache_write = (token_usage.input_tokens_cache_write or 0) + cache_write
+        token_usage.input_tokens_regular += input_tokens
+        token_usage.input_tokens_total += input_tokens + cache_write + cache_read
+        token_usage.output_tokens_total += output_tokens
+
+    def _build_tool_params(self, funcs: Sequence[Function]) -> List[ToolUnionParam]:
+        tools: List[ToolUnionParam] = []
+        for f in funcs:
+            # Anthropic's training harness includes some common tools for which it
+            # already knows the schema and Anthropic will inject their own system prompt.
+            if isinstance(f, TextEditor):
+                # Reference: `https://docs.claude.com/en/docs/agents-and-tools/tool-use/text-editor-tool`
+                # `TextEditor` is meant for use by *any* model, but is inspired by Anthropic's spec.
+                # Because it follows Anthropic's spec exactly, we only need this for its tool spec:
+                tools.append(
+                    ToolTextEditor20250728Param(
+                        type="text_editor_20250728",
+                        name="str_replace_based_edit_tool",
+                        max_characters=TextEditor.max_characters,
+                    )
+                )
+                continue
+
+            # Build args spec.
+            props: Dict[str, Dict[str, Any]] = {}
+            required: List[str] = []
+            for arg in f.args:
+                arg_schema: Dict[str, Any] = {
+                    "type": self.json_type_for_arg(arg.argtype),
+                    "description": arg.desc,
+                }
+                if arg.argtype is str and arg.enum is not None:
+                    arg_schema["enum"] = sorted(list(arg.enum))
+                props[arg.name] = arg_schema
+
+                if not arg.optional:
+                    required.append(arg.name)
+
+            input_schema: InputSchemaTyped = {
+                "type": "object",
+                "properties": props,
+                "required": required,
+            }
+
+            tools.append(
+                ToolParam(name=f.name, description=f.desc, input_schema=input_schema)
+            )
+
+        return tools
+
+    @staticmethod
+    def _messages_with_latest_cache_ttl(msgs: List[MessageParam], ttl: Literal['5m', '1h']) -> List[MessageParam]:
+        """
+        Deep-copy and attach CacheControlEphemeralParam(ttl) to the *latest* user message’s
+        parent blocks (text/tool_result). This is applied pre-send every turn.
+        """
+        out: List[MessageParam] = copy.deepcopy(msgs)
+
+        # Find last user message
+        idx = None
+        for i in range(len(out) - 1, -1, -1):
+            if out[i].get("role") == "user":
+                idx = i
+                break
+        if idx is None:
+            return out
+
+        cc = CacheControlEphemeralParam(type="ephemeral", ttl=ttl)
+        new_blocks: List[Any] = []
+
+        to_obj = lambda x: x if not isinstance(x, dict) else SimpleNamespace(**x)
+
+        for blk in cast(List[Any], out[idx]["content"]):
+            b = to_obj(blk)
+
+            if b.type == "text":
+                new_blocks.append(
+                    TextBlockParam(text=b.text, type="text", cache_control=cc)
+                )
+
+            elif b.type == "tool_result":
+                new_blocks.append(
+                    ToolResultBlockParam(
+                        tool_use_id=b.tool_use_id,
+                        type="tool_result",
+                        content=b.content,
+                        is_error=b.is_error,
+                        cache_control=cc,
+                    )
+                )
+
+            else:
+                new_blocks.append(blk)
+
+        out[idx] = cast(MessageParam, {"role": "user", "content": new_blocks})
+        return out
+
+    @staticmethod
+    def json_type_for_arg(py_t: type) -> str:
+        if py_t is str:   return "string"
+        if py_t is int:   return "integer"
+        if py_t is float: return "number"
+        if py_t is bool:  return "boolean"
+        return "string"  # fallback
