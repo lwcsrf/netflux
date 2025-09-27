@@ -5,4 +5,4 @@ No limits in how many guesses it gets per stage, but it needs to get the correct
 
 The `puzzle` demo also serves the purpose of proving that the provider is capable of a single continuous reasoning chain that envelopes the multi cycles of tool use.
 
-`python3 -m skynet.demos.puzzle -provider={gemini,anthropic}`
+`python3 -m netflux.demos.puzzle -provider={gemini,anthropic}`

@@ -408,7 +408,7 @@ class Node(ABC):
         if self.thread is not None:
             return
         self.ctx.post_status_update(NodeState.Running)
-        self.thread = Thread(target=self.run_wrapper, name=f"skynet-node-{self.id}", daemon=True)
+        self.thread = Thread(target=self.run_wrapper, name=f"netflux-node-{self.id}", daemon=True)
         self.thread.start()
 
     def run_wrapper(self) -> None:

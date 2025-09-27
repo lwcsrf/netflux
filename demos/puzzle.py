@@ -261,7 +261,7 @@ def parse_args(
     argv: Optional[List[str]] = None,
 ) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run the interleaved reasoning puzzle experiment through the skynet runtime.",
+        description="Run the interleaved reasoning puzzle experiment through the netflux runtime.",
     )
     parser.add_argument(
         "--provider",

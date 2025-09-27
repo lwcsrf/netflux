@@ -90,7 +90,7 @@ def _perf_profile_tool(ctx: core.RunContext, *, test_script: str, venv_path: str
     if not test_script_path.exists():
         raise FileNotFoundError(f"test_script not found: {test_script_path}")
 
-    out_txt = Path(tempfile.mkstemp(prefix="skynet_profile_", suffix=".txt")[1])
+    out_txt = Path(tempfile.mkstemp(prefix="netflux_profile_", suffix=".txt")[1])
     trace(f"CodeFunction PerfProfileTool: compile-check {test_script_path}")
     comp = subprocess.run(
         [py, "-m", "py_compile", str(test_script_path)],
@@ -208,7 +208,7 @@ def main():
 if __name__ == "__main__":
     main()
 """
-    wrapper_path = Path(tempfile.mkstemp(prefix="skynet_profwrap_", suffix=".py")[1])
+    wrapper_path = Path(tempfile.mkstemp(prefix="netflux_profwrap_", suffix=".py")[1])
     wrapper_path.write_text(wrapper, encoding="utf-8")
 
     trace("CodeFunction PerfProfileTool: running profiler wrapper in venv")
@@ -344,7 +344,7 @@ def make_demo_workspace() -> Dict[str, str]:
       - a bench script that imports the function and runs it once
     Returns a dict with paths and the baseline function source.
     """
-    root = Path(tempfile.mkdtemp(prefix="skynet_demo_")).resolve()
+    root = Path(tempfile.mkdtemp(prefix="netflux_demo_")).resolve()
     trace(f"Workspace: {root}")
 
     venv_dir = root / "venv"
@@ -559,7 +559,7 @@ def main():
     monitor_thread = threading.Thread(
         target=monitor_with_nodeview,
         args=(root,),
-        name="skynet-nodeview-monitor",
+        name="netflux-nodeview-monitor",
         daemon=True
     )
     monitor_thread.start()

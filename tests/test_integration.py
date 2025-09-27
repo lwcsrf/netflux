@@ -107,7 +107,7 @@ def pretty_tree(view: NodeView, indent: int = 0) -> None:
         pretty_tree(child, indent + 1)
 
 def main():
-    print("=== skynet demo: end-to-end ===")
+    print("=== netflux demo: end-to-end ===")
     print(f"File to analyze: {DEMO_FILE_ABS_PATH}")
 
     # Register all functions with the Runtime
