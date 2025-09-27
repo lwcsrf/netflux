@@ -12,6 +12,58 @@ import google.genai as genai
 from google.genai import types
 from overrides import override
 
+"""
+## Misc Research Notes.
+
+* Strict structured outputs (if needed, e.g. if framework supports a ReturnStructured concept
+  in the future)
+    * `config={"response_mime_type": "application/json", "response_schema": list[Recipe]}`
+    * Refer to: https://ai.google.dev/gemini-api/docs/structured-output
+    * Validation: Post-validate all structured outputs with jsonschema or Pydantic;
+      don't assume perfection. (Google notes validators aren't applied
+
+* Thinking with Interleaved Function Calls:
+    * Refer to: https://ai.google.dev/gemini-api/docs/function-calling?example=meeting#thinking
+        * Preserving the thought signatures in the user request callbacks. This works very
+          similarly to Anthropic and other model providers. The idea is that they are the
+          decrypted reasoning tokens, which the model can use to restore the continuous CoT
+          across tool calls, while remaining stateless on the server side.
+    * The manual loop (Automatic Function Calling disabled):
+        1. Send generateContent with your tool declarations and prompt.
+        2. If the response contains functionCall(s), execute those functions in your app.
+        3. Build Part.from_function_response(name=..., response=...) for each call.
+        4. Send another generateContent with:
+            - the same configs and tools
+            - all the session messages thus far, and:
+            - append the previous response model content (containing the last “thinking”
+              thought signatures and the last function call(s)),
+            - append your functionResponse parts (role can be `tool` or `user`).
+        5. Repeat until the model returns a non-thinking text answer and no follow-up function
+           calls.
+    * Interleaved reasoning with tools — Gemini 2.5 Pro behaves like Opus 4.1 (strong evidence
+      for both models).
+        * After a reasoning phase, the model can emit one or more functionCalls; once tool
+          results are returned, it resumes with new reasoning before deciding whether to call
+          more tools or produce text. Empirically you see thought-signature parts preceding
+          the calls, then, after tool responses, new thought-signatures and another round of
+          calls/text. This repeats across many cycles—matching Opus 4.1's interleaved
+          “think → tool → think → …” pattern.
+    * Full reasoning continuity across tool cycles — same continuity model as Opus 4.1 (strong
+      evidence for both models).
+        * As long as you replay the entire prior model response (including thought-signatures)
+          plus your function responses, the next turn continues a single, coherent chain of
+          reasoning starting from the last user text prompt onward. Empirically, we ran
+          experiments whose final outputs were dependent on early internal thought state from
+          many tool cycles ago, and these do prove that the context window includes thought
+          parts from many tool cycles ago - just like with Opus 4.1 when you fully replay
+          history.
+
+* No particular tool specially used in training for bash or text editor like opus.
+    - Re-use the `Bash` and `TextEditor` functions inspired by Anthropic's spec, but you need
+      to provide the full tool specs unlike Anthropic.
+"""
+
+
 # Max tool call + response cycles before giving up.
 MAX_STEPS = 64
 
@@ -74,6 +126,8 @@ class GeminiAgentNode(AgentNode):
         return [types.Tool(function_declarations=decls)] if decls else []
 
     def _append_thought_signatures(self, candidate: types.Candidate):
+        """Append all thought signatures in the candidate as ThinkingBlockPart
+        in the framework transcript (not the SDK replay transcript)."""
         if not candidate.content or not candidate.content.parts:
             return
         for part in candidate.content.parts:
@@ -130,8 +184,16 @@ class GeminiAgentNode(AgentNode):
                     mode=types.FunctionCallingConfigMode.AUTO
                 )
             ),
+            # We should only use manual function call loop, never auto function calling (incompatible
+            # with our transcripts, event posting, exceptions model, etc).
+            # Refer to: https://googleapis.github.io/python-genai/#function-calling
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(
+                disable=True
+            ),
             thinking_config=types.ThinkingConfig(
                 thinking_budget=32768,
+                # Disable Thought Summaries always: they are not useful, and we don't want to
+                # accidentally allow them to be included as past thinking content ever.
                 include_thoughts=False,
             ),
             max_output_tokens=64000,
@@ -258,6 +320,7 @@ class GeminiAgentNode(AgentNode):
         raise RuntimeError("Gemini tool loop exceeded MAX_STEPS without producing a final answer.")
 
     def _accumulate_usage(self, usage: types.GenerateContentResponseUsageMetadata):
+        """For updating TokenUsage after each SDK response in the agent loop."""
         assert usage.prompt_token_count is not None, "Gemini response missing prompt token count"
 
         cache_read = usage.cached_content_token_count or 0

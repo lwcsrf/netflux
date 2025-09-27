@@ -27,12 +27,92 @@ from anthropic.types import (
 from anthropic.types.tool_param import InputSchemaTyped
 from overrides import override
 
+"""
+## Misc Research Notes (applicable to Claude 4 models)
+
+"Tool" = Anthropic LLM invoking our framework concept of `Function`.
+
+* Extended Thinking Interleaved with Tool Use:
+    * This is the only mode really compatible with our agentic framework since we want
+      long-running agentic tasks with continuous reasoning.
+    * In this mode, Claude is allowed to emit new thinking blocks after tool results, potentially
+      leading to another tool_use in the next assistant turn—something it won't do in the
+      non-interleaved mode. E.g.:
+        * thinking → tool_use(s) → (user sends tool_result(s)) → thinking → text
+        * thinking → tool_use(s) → (user sends tool_result(s)) → thinking → tool_use(s) →
+          (user sends tool_result(s)) → thinking → text
+        * etc
+    * Ref: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#example-passing-thinking-blocks-with-tool-results
+    * Ref: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#tool-use-with-interleaved-thinking
+    * To simplify caching and api usage, always request with the full history of thinking blocks,
+      tool use request, tool use response, etc, and for the prompt caching policy we select for
+      the agent, always put the `cache_control` on every request latest msg.
+    * While tool results appear as user messages in the API structure, they're part of a
+      continuous reasoning flow. Preserving thinking blocks maintains this conceptual flow across
+      multiple API calls.
+    * With interleaved thinking, Claude can:
+        * Reason about the results of a tool call before deciding what to do next
+        * Chain multiple tool calls with reasoning steps in between
+        * Make more nuanced decisions based on intermediate results
+    * When streaming with tool use, we should wait to receive the full tool use inputs before
+      invoking tool, since our framework is not real-time and does not support streaming
+      arguments.
+        * Ref: https://docs.anthropic.com/en/docs/build-with-claude/streaming#streaming-request-with-tool-use
+    * Our empirical experiments:
+        * Conversation shape: One initial user text prompt starts the session. After that, every
+          "user" request is just a `tool_result` only (no user `text` type part), or multiple
+          `tool_result` if the assistant requested parallel tool use. And every non-final
+          `assistant` response contains reasoning (or redacted-reasoning) block and signature,
+          [optional `text` block seen sometimes], `tool_use` block (parallel or single). Final
+          `assistant` response contains reasoning (or redacted-reasoning) block and signature,
+          followed by final `text` block.
+        * Signatures will be included from the assistant on reasoning or redacted-reasoning
+          blocks. These must be included when sending the conversation history back in user
+          requests.
+        * Model will decrypt redacted reasoning blocks when they are sent back (with signatures).
+          It is only the user that cannot see them.
+        * Our replay policy: on every user request (tool use follow-ups), you always replay the
+          full conversation history (all elements) since the initial user text prompt, in exact
+          sequence sent and received, unmodified.
+        * Continuous reasoning: When this is done properly (Never alter, reorder, trim, or
+          re-wrap any assistant block. You only append new tool_result blocks to transcript and
+          then send the request), and the tool-reasoning interleaving beta header is enabled,
+          and tool choice "auto" is used, you will attain **full fluent context since the last
+          user text prompt**: the model's follow-up reasoning step has direct access to the
+          entire chain of prior reasoning and actions in its context window. Thus, you get 
+          **reasoning continuity**: the model will produce new thinking that references earlier
+          thinking you replayed. From the model's perspective, this behaves like **one
+          continuous, ever-expanding assistant turn across many tool cycles incorporating
+          continuous reasoning**.
+        * In experiments, we observed direct evidence of the assistant referring to an early
+          thinking block dozens of tool-cycles apart in another thinking block toward the end.
+
+* Tools that Claude was optimized to use during training:
+    * text editor
+        * Ref: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/text-editor-tool
+        * Specified without reference implementation.
+        * We implemented very robustly in `func_lib/text_editor.py`.
+    * bash tool
+        * Ref: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/bash-tool
+        * Specified without reference implementation.   
+        * We implemented in `func_lib/bash.py`.
+
+* Strict structured outputs
+    * should be achieved via tools (their arg schema is the output schema)
+"""
+
 ANTHROPIC_API_KEY = "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"
+# Enables: Extended Thinking Interleaved with Tool Use.
+# Since we want agentic task completion end to end, we must always add the
+# header on each of our requests.
 INTERLEAVED_BETA = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
+TOOL_CHOICE = ToolChoiceAutoParam(type="auto")
+# "With interleaved thinking, the budget_tokens can exceed the max_tokens parameter,
+# as it represents the total budget across all thinking blocks within one assistant turn."
 MAX_TOKENS = 32_000
 THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=80_000)
-TOOL_CHOICE = ToolChoiceAutoParam(type="auto")
-CACHE_TTL = "5m"  # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
+# 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
+CACHE_TTL = "5m"
 
 
 class AnthropicAgentNode(AgentNode):
@@ -70,7 +150,9 @@ class AnthropicAgentNode(AgentNode):
         system_prompt = self.agent_fn.system_prompt
 
         while True:
-            # Apply watermark to *latest* user message only (just-in-time)
+            # Apply watermark to *latest* user message only (just-in-time).
+            # The longest prefix cache partial hit wins. We get partial credit for
+            # a cached prefix and the rest are new tokens which we incrementally pay to cache.
             msgs = self._messages_with_latest_cache_ttl(self._history, CACHE_TTL)
 
             # One interleaved-thinking turn (streaming for correctness; we just take final message)

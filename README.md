@@ -3,8 +3,9 @@
 - minimalist python framework for authoring custom agentic applications. The core idea is to treat agents like any code function in imperative programming: you have inputs, outputs, logic composition (by calling on building blocks of other functions), and side effects on structures.
 - our goal was to build a framework that is semantically flexible to do the equivalent of both workflows and dynamic, open-ended problem solvers. Fundamentally, we believe hierarchical Task Decomposition is important to doing this effectively, the same cohesion and reusability of libraries and utility functions in traditional programming.
 - explain the central abstraction `Function`.
-- explain `CodeFunction`
-- explain `AgentFunction`. and why the abstraction of treating it like a Function works well. We may often say "Agent" and we mean an instance of `AgentFunction`.
+- explain `CodeFunction`. Refer to the `TextEditor` example in func_lib/text_editor.py as a straightforward but very high utility example.
+- explain `AgentFunction`. and why the abstraction of treating it like a Function works well. We may often say "Agent" and we mean an instance of `AgentFunction`. Refer to the `ApplyDiff` example in func_lib/apply_diff.py as an example of a straightforward high utility example. The story with this particular example:
+    - it is that often we want agents to be very focused, such as editing an implementation for a new feature or bug fix (planned in an earlier step), without burdening that same agent of being responsible for making the file edits. Or perhaps we want a human to inspect the diffs before we proceed. Thus, we often want to separate patch creation from patch application. `ApplyDiff` is specialized in, once you have the patch, applying to successfully especially in the case where there can be fuzzy match due to imperfections often in whitespace matching. (please state this much more concisely than I did!).
 - explain how any Function can call any Function, e.g. agents can invoke code, other agents, and code can invoke agents. Code invoking code is classic programming, and this framework attempts to enable the other 3 of 4 combinations.
 - The framework is both the convention / pattern for specifying such functions (defining the building blocks of agents for your application) but also a lightweight execution infrastructure for running, monitoring, debugging, tracing agent instances.
 - the concept of **Task Decomposition**: this is an important design philosophy: just as we build on a foundation of cohesive functions for writing higher layer application logic, and such is observable in a call stack, the idea is to do exactly the same when we are defining agents as `AgentFunction`s: a high-level agent should build on a foundation of more specialized sub-`Functions` (in the case of sub-agents, this is just modeled as an `AgentFunction` that invokes another `AgentFunction` to do one particular sub-tasl). So just as good programming practice is to do functional decomposition, we attempt to encourage the same with this framework.
@@ -38,6 +39,8 @@
     - Agents can be given the `RaiseException` function which will allow them to raise an `AgentException` for any reason.
 - Give a briefer on the Exception Model that we use. The key concept is that we make `Exception`s fluid with `Function`s just like in traditional programming. Explain why an agent would want to raise an `Exception`. Refer to the `Exception Model` section for more details (give hash link).
 - Providers are subtypes of AgentNode that bridge the framework's pattern to the model's SDK. refer to section below for how to write a provider extension for a new model. Give a brief idea of how a new `AgentNode` provider would be added and then refer to the relevant section below. 
+- Agent instance token accounting. Discuss in a couple sentence what we track. Refer to relevant section below.
+
 
 Tips & Tricks
 
@@ -49,99 +52,11 @@ Tips & Tricks
     - becomes blocking for human input. Human can interject and this content will present forward guidance in the "function" output.
     - implement the hook to human UI using whatever mechanism particular to your application.
     - various reasons why model may choose to invoke: (a) sign-off at key points; (b) lacking confidence and need guidance on the task; (c) on the verge of RaiseException and seeking opinion of what to try before doing so.
-
-- Agent instance token accounting. Discuss in a couple sentence what we track. Refer to relevant section below.
-
-- Framework shall use a process-wide global semaphore to limit the number of concurrent requests to any model api in flight. When an agent or tool is invoked, it is given a shared object containing a reference to the semaphore and a boolean `has_sem`, which is inherited from the top-level task. Some non-agentic tools that know they are long-running can courteously give up their lease on the semaphore. For example, the human_in_loop tool should do this. After unwinding, when an agent once again needs to make a request to a model, it would need to re-acquire the semaphore lease if it was given up. By default, we do not give up the semaphore in order to make more effective use of prompt caching (which has ephemeral ttl) and to encourage front-of-line agent throughput when many top-level tasks have been enqueued.
-
-
-
-Claude Opus 4.1 Specific Notes:
-- Prompt caching:
-    - Longest prefix cache partial hit wins: you get partial credit for cached prefix and the rest are new tokens which you incrementally pay to cache (if cache watermark added again on latest request).
-    - Any agent that has no tools should never enable cache watermarks
-    - Any agent that has only leaf tools and no human-in-loop tool should add 5 minute ttl ephemeral cache watermark on initial prompt and on every tool result callback. Only put the cache watermark on the latest.
-    - Any agent otherwise: before the agent commences any request, the framework should check the last 5 **completed** invocations of that agent and get the average number of tool calls and average time between tool calls. If more than 1 tool call on average and average time between tool calls is less than 1 hour, add 1 hour ttl ephemeral cache watermark on initial prompt and after each tool result callback, else no cache watermark. This behavior stays consistent once the agent starts. Only put the cache watermark on the latest.
-    - The framework is responsible for acting on the logic mentioned here and providing caching as either 'none', '5m', '1hr'.
-    - Track cache performance using the `cache_creation_input_tokens` and `cache_read_input_tokens` fields in each query response -- this should be part of agent instance token accounting.
-- Extended Thinking: always use the maximum output tokens and thinking budget: `{ max_tokens=32000, thinking={"type": "enabled", "budget_tokens": 80000}}`
-    - normally budget_tokens must be set to a value less than max_tokens. However, when using interleaved thinking with tools, as we are, you can exceed this limit as the token limit becomes your entire context window (200k tokens).
-    - Extended Thinking Interleaved with Tool Use:
-        - Add the beta header interleaved-thinking-2025-05-14 to each api request.
-        - always use this. Must use: `tool_choice: {"type": "auto"}`.
-        - With the header, Claude is allowed to emit new thinking blocks after tool results, potentially leading to another tool_use in the next assistant turn—something it won’t do in the non‑interleaved mode. E.g.:
-            - thinking → tool_use(s) → (user sends tool_result(s)) → thinking → text
-            - thinking → tool_use(s) → (user sends tool_result(s)) → thinking → tool_use(s) → (user sends tool_result(s)→ thinking → text
-            - etc
-        - Since we want agentic task completion end to end, you must always use the header.
-        - Refer to: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#example-passing-thinking-blocks-with-tool-results
-        - Refer to: https://docs.anthropic.com/en/docs/build-with-claude/extended-thinking#tool-use-with-interleaved-thinking
-        - To simplify caching and api usage, always request with the full history of thinking blocks, tool use request, tool use response, etc, and for the prompt caching policy we select for the agent, always put the `cache_control` on every request latest msg.
-        - While tool results appear as user messages in the API structure, they’re part of a continuous reasoning flow. Preserving thinking blocks maintains this conceptual flow across multiple API calls.
-        - With interleaved thinking, Claude can:
-            - Reason about the results of a tool call before deciding what to do next
-            - Chain multiple tool calls with reasoning steps in between
-            - Make more nuanced decisions based on intermediate results
-        - "With interleaved thinking, the budget_tokens can exceed the max_tokens parameter, as it represents the total budget across all thinking blocks within one assistant turn."
-            - so should we try always using `{ max_tokens=32000, thinking={"type": "enabled", "budget_tokens": 64000}}` instead ?
-        - When streaming with tool use, you should wait to receive the full tool use inputs before invoking tool, to simplify.
-            - Refer to: https://docs.anthropic.com/en/docs/build-with-claude/streaming#streaming-request-with-tool-use
-        - If Opus asks for parallel tools call, remember to aggregate tool results into one message per turn even though we will locally process the tool calls sequentially (session: logically concurrent. in our process: serial/sequential but independent).
-- Agents will often make available and provide implementation of tools claude was optimized to use:
-    - bash tool
-        - Refer to: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/text-editor-tool
-        - implementation given at link above.
-    - text editor tool
-        - Refer to: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/text-editor-tool
-        - author or find robust implementation as one is not provided
-- Strict structured outputs
-    - via schematized tool call `return_result`
-- **Intended Usage:**
-    - Conversation shape: One initial user text prompt starts the session. After that, every "user" request is just a `tool_result` only (no user `text` type part), or multiple `tool_result` if the assistant requested parallel tool use. And every non-final `assistant` response contains reasoning (or redacted-reasoning) block and signature, [optional `text` block seen sometimes], `tool_use` block (parallel or single). Final `assistant` response contains reasoning (or redacted-reasoning) block and signature, followed by final `text` block.
-    - Signatures will be included from the assistant on reasoning or redacted-reasoning blocks. These must be included when sending the conversation history back in user requests.
-    - Model will decrypt redacted reasoning blocks when they are sent back (with signatures). It is only the user that cannot see them.
-    - Our replay policy: on every user request (tool use follow-ups), you always replay the full conversation history (all elements) since the initial user text prompt, in exact sequence sent and received, unmodified.
-    - Continuous reasoning: When this is done properly (Never alter, reorder, trim, or re-wrap any assistant block. You only append new tool_result blocks to transcript and then send the request), and the tool-reasoning interleaving beta header is enabled, and tool choice "auto" is used, you will attain ** full fluent context since the last user text prompt **: the model's follow-up reasoning step has direct access to the entire chain of prior reasoning and actions in its context window. Thus, you get ** reasoning continuity **: the model will produce new thinking that references earlier thinking you replayed. From the model’s perspective, this behaves like ** one continuous, ever‑expanding assistant turn across many tool cycles incorporating continuous reasoning **.
-    - I observed direct evidence of the assistant referring to an early thinking block dozens of tool-cycles later in another thinking block toward the end.
-
-Gemini 2.5 Pro Specific Notes:
-- Strict structured outputs
-    - `config={"response_mime_type": "application/json", "response_schema": list[Recipe]}`
-    - Refer to: https://ai.google.dev/gemini-api/docs/structured-output
-    - Validation: Post‑validate all structured outputs with jsonschema or Pydantic; don’t assume perfection. (Google notes validators aren’t applied
-- Function calling
-    - Refer to: https://googleapis.github.io/python-genai/#function-calling
-        - In case our framework impl makes it better for us to manually intercept function calls (e.g. to stay as event-based automaton system), you can do that and then it looks more like the the anthropic api with tool use.
-    - Thinking with Interleaved Tool Use:
-        - Refer to: https://ai.google.dev/gemini-api/docs/function-calling?example=meeting#thinking
-            - Preserving the thought signatures in the user request callbacks suggests that this works very similarly to Anthropic
-        - The manual loop (what you’d write yourself if Automatic Function Calling disabled)
-            1. Send generateContent with your tool declarations and prompt.
-            2. If the response contains functionCall(s), execute those functions in your app.
-            3. Build Part.from_function_response(name=..., response=...) for each call.
-            4. Send another generateContent with:
-                - the same configs and tools
-                - the conversation messages thus far, and:
-                - append the previous response model content (containing the last “thinking” thought signatures and the last function call(s)),
-                - append your functionResponse parts (Google’s 2025 docs show these under role "user" in the contents, which the API accepts).
-            5. Repeat until the model returns a normal text answer.
-        - Interleaved reasoning with tools — Gemini 2.5 Pro behaves like Opus 4.1 (strong evidence for both models).
-            - After a reasoning phase, the model can emit one or more functionCalls; once tool results are returned, it resumes with new reasoning before deciding whether to call more tools or produce text. Empirically you see thought-signature parts preceding the calls, then, after tool responses, new thought-signatures and another round of calls/text. This repeats across many cycles—matching Opus 4.1’s interleaved “think → tool → think → …” pattern.
-        - Full reasoning continuity across tool cycles — same continuity model as Opus 4.1 (strong evidence for both models).
-            - As long as you replay the entire prior model response (including thought-signatures) plus your function responses, the next turn continues a single, coherent chain of reasoning starting from the last user text prompt onward. Empirically, we find final outputs that are dependent on early internal thought state from many tool cycles ago, proving that the context window includes thought parts from many tool cycles ago - just like with Opus 4.1 when you fully replay history.
-- Disable Thought Summaries always: they are not useful, and you don't want to accidentally allow them to be included as past thinking content.
-- No particular tool specially used in training for bash or text editor like opus.
-    - Re-use the `bash_tool` and `text_editor` but you need to provide tool explanation unlike opus.
-
-Additional Notes:
+- may help to be slightly repetitive of system prompt elements in user prompt to get better adherence.
 - system prompts kept tiny and stable: agent’s role declaration, non‑negotiable rules/guardrails, output contract, meticulosity, verbosity/brevity, tool‑use policy (steer how often and when to use certain tools, beyond tool schema).
     - "you focus on performance optimization of the algorithm already select; do not propose new algorithms, just optimize impl using the one chosen."
     - "you must use tools to test performance and confirm speedups. You cannot just be speculative -- your results need to be backed up by numbers and you can admit lack of improvement."
 - user prompt: (1) all the agent-specific context of the generic problem background (even if common to all instances this is still not system prompt), (2) the specific problem instance the agent is being invoked to do now.
-- may help to be slightly repetitive of system prompt elements in user prompt to get better adherence.
-
-Tools of note:
-
 
 
 -----
@@ -157,7 +72,7 @@ Tools of note:
 * `AgentFunction`: can be invoked by any `Function`.
     * user subtypes to define their own agents (could use abstract properties that user must override).
     * subtype must specify: input vars, system prompt, templated user prompt (var substitution). Each var may be given as strings or filepaths (upon instantiation of the agent, files would have to be loaded and then substitution done by the runner infra instead of asking the agent to do it).
-    * subtype specifies `uses: List[Function]` — the Functions it can invoke via tool calls
+    * subtype specifies `uses: List[Function]` — the `Function`s that the agent may invoke.
 * `CodeFunction`: can also be invoked by any `Function`.
     * some framework built-in subtypes (`Ensemble`, `ThinkMoreDecorator`).
     * mostly user subtypes to define any plain python functions that do some deterministic logic, intended to be invoked most often by `AgentFunction`s or as the top-level request, to coordinate sub-agents doing sub-tasks.
@@ -190,9 +105,10 @@ Tools of note:
         * `CodeNode` will always be started immediately.
 * Provides consumer interface for querying trees of `Node`s.
     * e.g. visualization
-    * `list_toplevel() -> List[Node]`
-    * `get_subtree(node_id: int)`
-    * To prevent race conditions, consumers should use `Runtime` to query state and do top-level invocations.
+    * `list_toplevel_views() -> List[NodeView]`: get consistent snapshot of all root tasks
+    * `get_view(node_id: int) -> NodeView`: get latest snapshot for any node without blocking
+    * `watch(node: Node | int, as_of_seq: int = 0) -> NodeView`: block until newer snapshot available (read more about `NodeView`s below).
+    * To prevent race conditions, consumers should use `Runtime` to query state via `NodeView`s and do top-level invocations.
 
 ## `RunContext`
 
@@ -202,17 +118,23 @@ Tools of note:
     1. top-level task invocation; called by an app that is consuming the framework and a collection of `Function`s (the app or someone else may define these); access via `Runtime.get_ctx()`.
     2. python code for user-defined or framework-builtin `CodeFunction`s that invoke other `Function`s.
     3. when some framework component needs to handle agents doing tool calls, that component delegates invocation to the `RunContext`.
-    * e.g. they all use: `ctx.invoke(fn: Function, args)`
+    * e.g. they all use: `ctx.invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None) -> Node`
 * every `Function` invocation has a `RunContext` given to it, providing the interface, but also tracking the particular `Function` using it.
     * when a `Function` invokes another `Function` (including when framework handles `AgentFunction` invoking any `Function` via tool call), the `RunContext` knows its associated invoking `Node` (identity of the caller) and causes creation of the invoked `Node`.
         * this information is used to construct the directed edges relationships of the `Node` tree. A single top-level task invocation is the parent `Node` of a tree.
 * Each top-level `ctx.invoke()` (by consuming app) initiates one tree of `Node`s where the parent `Node` of the tree is the top-level Task.
     * Each top-level Task is an independent tree with `Node`s disjoint from those originating from other top-level tasks.
-    * Each top-level Task may originate from the invocation of **any** `Function` that was registered with `start_runtime()`, thus being coarse-grained tasks or fine-grained tasks at the top level.
+    * Each top-level Task may originate from the invocation of **any** `Function` that was registered with the `Runtime` constructor, thus being coarse-grained tasks or fine-grained tasks at the top level.
         * General idea: Fine-grained top-level Tasks would appear as shallow trees, that may be comparable to the deepest subtrees of a coarse-grained top-level Task that decomposes into the former -- the latter being a broader-scope task that needs to solve the former's scope of problem perhaps as a mere sub-sub-Task.
 * Fields:
-    * `node: Node`: a reference to the particular `Node` identifying this specific `Function` invocation.
+    * `node: Optional[Node]`: a reference to the particular `Node` identifying this specific `Function` invocation. `None` for top-level contexts.
     * `runtime: Runtime`: a reference to the shared `Runtime`.
+    * `object_bags: Dict[SessionScope, SessionBag]`: references to session bags accessible at different scopes.
+* Methods:
+    * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None) -> Node`: invoke a `Function` and return the created `Node`.
+    * `post_status_update(state: NodeState)`: update the current node's status.
+    * `post_success(outputs: Any)`: mark the current node as successful with given outputs.
+    * `post_exception(exception: Exception)`: mark the current node as failed with given exception.
 * Narrow Scope: `RunContext` is just a mechanism to pass on `Function` invocation directives to the `Runtime` to act on them.
 
 ## `Node`
@@ -228,35 +150,37 @@ Tools of note:
         * Subtypes `AnthropicAgentNode` and `GeminiAgentNode` store and use the SDK-specific types in their internal impl.
     * `node.get_transcript() -> List[TranscriptPart]`
         * Subtypes must implement; they must convert the SDK-specific types in the transcription they are tracking to the framework-common `TranscriptPart`s. They never convert types in the reverse direction.
-    * `node.get_children() -> List[Node | List[Node]]` (single | parallel tool call).
-        * Always ordered to reflect the sequence in which `Function`s were invoked. Parallel tool calls by LLM (parallel `Function` invocations) always shown tied by being in same inner List.
-        * Outer list index gives the invocation sequence.
+    * Child `Function` invocations are tracked in `node.children: List[Node]` property.
+        * Always ordered to reflect the sequence in which `Function`s were invoked. 
+        * For consumers outside the framework, use `NodeView.children: tuple[NodeView, ...]` instead to access child information safely.
     * Has states (Waiting, Running, Success, Error) but also sub-state including tool use (`Function` invocation) that it is waiting on.
-    * `AgentNode` is completed once it returns final assistant text or has its `return_result` or `raise_exception` called (if it has those tools).
+    * `AgentNode` is completed once it returns final assistant text or the model decides to `RaiseException` (if it has been given as an option).
+    * `TokenUsage` cumulative accounting must be reportable by every `AgentNode` and kept up to date throughout the agent loop (updated on every request/response iteration).
+        * Subtype implementations must use the provider SDK's token usage meta to track the accumulation.
 * `CodeNode`: represents and manages the state and running of a `CodeFunction` invocation.
-    * Considerably simpler than `AgentFunction` because there are few states (Waiting, Running, Success, Error) and simple function call (unlike LLM session complexity).
-    * Only implements `node.get_children() -> List[Node]`.
+    * Simpler than `AgentFunction` because it is just a function call (unlike LLM session complexity). Authors invoke `Function`s directly from within the `Callable`.
     * `CodeNode` is completed once it either returns or raises.
 * Fields / Properties:
     * `id: int`: monotonically increasing unique identifier when Node is to be used as key in any lookup. This is one and the same as "task id".
-    * `function: Function`: which `Function` the `Node` is an instance of.
-    * `inputs: Dict`: (dynamic). What the inputs were for the invocation.
-    * `outputs: Optional[Dict]`: (dynamic). What the outputs were from the run (if finished).
+    * `fn: Function`: which `Function` the `Node` is an instance of.
+    * `inputs: Dict[str, Any]`: What the inputs were for the invocation.
+    * `outputs: Optional[Any]`: What the output(s) were from the run (if finished). Usually just an unstructured string.
     * `exception: Optional[Exception]`: the exception, if there was an exception.
     * `state: NodeState`: (Waiting, Running, Success, Error) enum
-    * `waiting_on: Optional[Node]`: the `Node` of the `Function` being waited on if we are currently in the process of calling one.
+    * `children: List[Node]`: ordered list of child `Function` invocations made by this `Node`.
+    * **Note**: External consumers should access this information through `NodeView` instead of `Node` directly to avoid race conditions.
 
 ## `TranscriptPart`
 
 `TranscriptPart` represents each of the parts that are common to the model-specific SDKs in concept. The subtypes:
 
-* `UserText`
-* `ModelText`
-* `ToolUse`
-* `ToolResult`
-* `ThinkingBlock`
+* `UserTextPart`
+* `ModelTextPart`
+* `ToolUsePart`
+* `ToolResultPart`
+* `ThinkingBlockPart`
     * including both redacted and non-redacted
-    * includes `ThinkingSignature`
+    * includes `signature` field for thinking block signatures
 * On every follow-up call, replay the full history in original order.
 
 ## `Ensemble`
@@ -349,11 +273,6 @@ Tools of note:
     * Allow any other unexpected `Exception` to bubble past `run()`. The supertype `AgentNode` will wrap it in a `ModelProviderException` with context.
     * A batch of parallel tool calls may result in 0, 1, or more of them succeeding or excepting and this is normal.
     * When a model issues a batch of tool calls and one of them is RaiseException (unusual), honor the model's intent and propagate `AgentException` to end the agent loop after the whole batch is attempted.
-    * Token accounting: maintain a cumulative `TokenUsage` throughout the agent loop and update it on every request/response iteration.
-        * Refer to the `TokenUsage` class fields in code for exact semantics. Keep all applicable fields up to date each turn, mapping from the provider SDK usage metadata.
-        * Inputs: increment `input_tokens_cache_read`, `input_tokens_cache_write` (if applicable), `input_tokens_regular`, and `input_tokens_total`.
-        * Outputs: increment `output_tokens_reasoning` and/or `output_tokens_text` when the provider exposes a breakdown; always increment `output_tokens_total`.
-        * Each provider subtype must expose a `token_usage` property returning the cumulative `TokenUsage`. See `AnthropicAgentNode` and `GeminiAgentNode` for reference.
 * `CodeFunction` authors guidance:
     * Be aware that `Node.result()` from invoked functions may raise.
     * Ensure raisable `Exception`s from the Callable have descript type names and sufficient detail. If bubbling, sometimes this requires try-catch interception just to augment details (e.g. is the error pertaining to an input or output) and then re-raising.
@@ -405,7 +324,7 @@ This is a bucket list of nice-to-haves.
     * Single event loop per Runtime; remove the per-`Node` thread.
 * Smarter caching based on past `Function` instance statistics.
 * Cycle & Recursion Prohibition
-    * Enforce at `start_runtime()`.
+    * Enforce at `Runtime` construction.
     * Ensure each `Function` has legal references to other `Function`s.
     * Reject if not a DAG.
     * Reject if function type annotations do not match the spec in `CodeFunction`.
