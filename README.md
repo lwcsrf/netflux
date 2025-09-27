@@ -17,7 +17,7 @@
     - a wrapper around an `AgentFunction` to decorate or enhance it. The best example of this is something like the `Ensemble` utility (`func_libs/ensemble.py`), which ...
 - We model a function invocation as a "task". We implement the running of a function invocation using a `Node`. Thus, we often refer to a function invocation also as a "task" or as a `Node`. An `AgentNode` tracks the state of a running `AgentFunction` call, including past `Function` calls it has in turn made (a sequence of children `Node`s), a transcript of the full LLM session of the current instance as it progresses (for tracing and observability), and manages the "agent loop" which uses a provider's SDK against their remote endpoint. Importantly, a `Node` represents the state and history of a function call both while it is executing and after it is done executing.
 - Tree of `Node`s is kept around even after a top-level task is complete, until the user deletes it, for post-run debuggability and traceability.
-- Explain that external consumers don't use Node directly (except for CodeFunction authors), they instead use `NodeView`. Consumers use `NodeView` to ensure that they are seeing atomic checkpoints of a tree's total state. Discuss more about `NodeView` and why it is necessary and the idea that it is a single consistent view. Show an example with the `watch()` loop.
+- Explain that external consumers don't use Node directly (except for CodeFunction authors), they instead use `NodeView`. Consumers use `NodeView` to ensure that they are seeing atomic checkpoints of a tree's total state. Discuss more about `NodeView` and why it is necessary and the idea that it is a single consistent view. Show an example with the `watch()` loop of how it is supposed to be used, briefly.
 - At any point in time, if you take a snapshot of the call hierarchy, this looks just like a traditional call stack, except now a Function can be an agent doing a task.
 - In Object-oriented programming, methods are just functions that can mutate state of an object. To support this, we introduce the concept of a `SessionBag` which is a way for objects to have a lifetime of a task. 
 - The execution of a task, including its subtasks, can be modeled as a tree where each task is a Node and each Node's children are an ordered sequence of edges to children Nodes representing the order in which the function called other functions.
@@ -349,6 +349,11 @@ Tools of note:
     * Allow any other unexpected `Exception` to bubble past `run()`. The supertype `AgentNode` will wrap it in a `ModelProviderException` with context.
     * A batch of parallel tool calls may result in 0, 1, or more of them succeeding or excepting and this is normal.
     * When a model issues a batch of tool calls and one of them is RaiseException (unusual), honor the model's intent and propagate `AgentException` to end the agent loop after the whole batch is attempted.
+    * Token accounting: maintain a cumulative `TokenUsage` throughout the agent loop and update it on every request/response iteration.
+        * Refer to the `TokenUsage` class fields in code for exact semantics. Keep all applicable fields up to date each turn, mapping from the provider SDK usage metadata.
+        * Inputs: increment `input_tokens_cache_read`, `input_tokens_cache_write` (if applicable), `input_tokens_regular`, and `input_tokens_total`.
+        * Outputs: increment `output_tokens_reasoning` and/or `output_tokens_text` when the provider exposes a breakdown; always increment `output_tokens_total`.
+        * Each provider subtype must expose a `token_usage` property returning the cumulative `TokenUsage`. See `AnthropicAgentNode` and `GeminiAgentNode` for reference.
 * `CodeFunction` authors guidance:
     * Be aware that `Node.result()` from invoked functions may raise.
     * Ensure raisable `Exception`s from the Callable have descript type names and sufficient detail. If bubbling, sometimes this requires try-catch interception just to augment details (e.g. is the error pertaining to an input or output) and then re-raising.
@@ -359,17 +364,29 @@ Tools of note:
     * Provide additional guidance on when to raise, when to bubble up, (or how hard to retry alternatives first) in the system and user prompt. Iterate through trial and error. This will be very specific to the agent's purpose and scope.
     * Strongly consider instructing the model to invoke `human_in_loop()` **before** considering `raise_exception()`.
 
+## `NodeView`
+
+`NodeView` is an immutable, consistent snapshot of a `Node` and, through reference, its entire subtree, intended for external consumers to observe task tree state without races. Do not read `Node` fields directly from UI/visualizers or outside code running inside a `CodeFunction` — those mutate concurrently while tasks run and are part of the framework's object model. Instead, use `NodeView`s.
+
+- Purpose: provide a race-free, immutable view of a (sub-)tree at a single global version. The snapshot includes most fields in `Node` (e.g. `state`, `outputs`, `exception`, `children`).
+- Consistency model: the `Runtime` maintains a global sequence number. On any change (node creation, status updates, success/exception), it rebuilds the `NodeView` for the changed node and all ancestors and updates the latest cached `NodeView` tree as of that version. Notice that siblings and siblings of the ancestors don't need to have their `NodeView`s regenerated because they aren't affected. Consumers can only acquire `NodeView` trees in-between these updates. Each `NodeView` also has `update_seqnum` giving when it was last updated.
+- Consumer Watcher loop: call `node.watch(as_of_seq=prev_seq+1)` to block until there is a newer snapshot (where `touch_seqno >= as_of_seq`) and then receive the latest `NodeView` for that subtree. Start with `prev_seq = 0` and after each update set `prev_seq = view.update_seqnum` to continue receiving atomic updates. This is similar to etcd/zookeeper watchers, except the `Runtime` keeps only the latest view available. Watcher loops should be used for event-driven UI.
+- Top-level views: use `runtime.list_toplevel_views()` to get a consistent snapshot of all root tasks at once; `runtime.get_view(node_id)` returns the latest snapshot for any node without blocking.
+- Why: this isolates observers from partial, in-flight mutations during execution and guarantees each delivered view is a self-consistent global snapshot of the tree at a specific sequence number.
+
 ## Deferred Features
 
 This is a bucket list of nice-to-haves.
 
 - `ApplyDiffPatch(CodeFunction)`
-    - when a file needs to have a diff patch applied
-    - file and diff patch provided as filepath
+    - when a file needs to have a diff patch applied (the thing that a git diff patch looks like).
+    - file and diff patch provided as filepath or as the content itself.
     - output path (usually different) where the new version goes
-    - tries first to use git apply
-    - if 1 or more hunk failures, reverts to text_editor if file is much larger than diff patch. If more than 30% of file affected, llm just rewrites the new file.
-    - eases the burden on diff patch producers that don't actually need the patch to be applied
+    - tries first to use git apply on each hunk using bash.
+    - for any hunk that fails, reverts to text_editor for those hunks.
+    - if one of those hunks still fails, can try searching (e.g. using grep or other) to get context and see what might be going on.
+    - raises exception if one or more hunks is significantly different as the Before or even fuzzy matching is not possible. Only be lenient to very minor things like extra newline or minor typo but otherwise unambiguous.
+    - eases the burden on diff patch producers that don't actually need the patch to be applied immediately.
 
 * Concurrency control
     * Limit the number of `AgentNode`s in the agent loop concurrently, keyed by `Provider`.
