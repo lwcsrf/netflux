@@ -4,8 +4,8 @@
 - our goal was to build a framework that is semantically flexible to do the equivalent of both workflows and dynamic, open-ended problem solvers. Fundamentally, we believe hierarchical Task Decomposition is important to doing this effectively, the same cohesion and reusability of libraries and utility functions in traditional programming.
 - explain the central abstraction `Function`.
 - explain `CodeFunction`. Refer to the `TextEditor` example in func_lib/text_editor.py as a straightforward but very high utility example.
-- explain `AgentFunction`. and why the abstraction of treating it like a Function works well. We may often say "Agent" and we mean an instance of `AgentFunction`. Refer to the `ApplyDiff` example in func_lib/apply_diff.py as an example of a straightforward high utility example. The story with this particular example:
-    - it is that often we want agents to be very focused, such as editing an implementation for a new feature or bug fix (planned in an earlier step), without burdening that same agent of being responsible for making the file edits. Or perhaps we want a human to inspect the diffs before we proceed. Thus, we often want to separate patch creation from patch application. `ApplyDiff` is specialized in, once you have the patch, applying to successfully especially in the case where there can be fuzzy match due to imperfections often in whitespace matching. (please state this much more concisely than I did!).
+- explain `AgentFunction`. and why the abstraction of treating it like a Function works well. We may often say "Agent" and we mean an instance of `AgentFunction`. Refer to the `ApplyDiffPatch` example in func_lib/apply_diff.py as an example of a straightforward high utility example. The story with this particular example:
+    - it is that often we want agents to be very focused, such as editing an implementation for a new feature or bug fix (planned in an earlier step), without burdening that same agent of being responsible for making the file edits. Or perhaps we want a human to inspect the diffs before we proceed. Thus, we often want to separate patch creation from patch application. `ApplyDiffPatch` is specialized in, once you have the patch, applying to successfully especially in the case where there can be fuzzy match due to imperfections often in whitespace matching. (please state this much more concisely than I did!).
 - explain how any Function can call any Function, e.g. agents can invoke code, other agents, and code can invoke agents. Code invoking code is classic programming, and this framework attempts to enable the other 3 of 4 combinations.
 - The framework is both the convention / pattern for specifying such functions (defining the building blocks of agents for your application) but also a lightweight execution infrastructure for running, monitoring, debugging, tracing agent instances.
 - the concept of **Task Decomposition**: this is an important design philosophy: just as we build on a foundation of cohesive functions for writing higher layer application logic, and such is observable in a call stack, the idea is to do exactly the same when we are defining agents as `AgentFunction`s: a high-level agent should build on a foundation of more specialized sub-`Functions` (in the case of sub-agents, this is just modeled as an `AgentFunction` that invokes another `AgentFunction` to do one particular sub-tasl). So just as good programming practice is to do functional decomposition, we attempt to encourage the same with this framework.
@@ -296,16 +296,6 @@ Tips & Tricks
 ## Deferred Features
 
 This is a bucket list of nice-to-haves.
-
-- `ApplyDiffPatch(CodeFunction)`
-    - when a file needs to have a diff patch applied (the thing that a git diff patch looks like).
-    - file and diff patch provided as filepath or as the content itself.
-    - output path (usually different) where the new version goes
-    - tries first to use git apply on each hunk using bash.
-    - for any hunk that fails, reverts to text_editor for those hunks.
-    - if one of those hunks still fails, can try searching (e.g. using grep or other) to get context and see what might be going on.
-    - raises exception if one or more hunks is significantly different as the Before or even fuzzy matching is not possible. Only be lenient to very minor things like extra newline or minor typo but otherwise unambiguous.
-    - eases the burden on diff patch producers that don't actually need the patch to be applied immediately.
 
 * Concurrency control
     * Limit the number of `AgentNode`s in the agent loop concurrently, keyed by `Provider`.
