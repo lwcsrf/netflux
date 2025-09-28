@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
+from functools import lru_cache
+from pathlib import Path
 
 from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
@@ -101,7 +103,23 @@ from overrides import override
     * should be achieved via tools (their arg schema is the output schema)
 """
 
-ANTHROPIC_API_KEY = "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"
+ANTHROPIC_KEY_FILENAME = "anthropic_key.txt"
+
+@lru_cache(maxsize=1)
+def anthropic_api_key() -> str:
+    path = Path(__file__).with_name(ANTHROPIC_KEY_FILENAME)
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as ex:
+        raise RuntimeError(
+            f"Anthropic API key file not found: {path}. Expected a plain text file containing the API key."
+        ) from ex
+    except Exception as ex:
+        raise RuntimeError("Unable to instantiate anthropic sdk client due to key read error") from ex
+    if not key:
+        raise RuntimeError(f"Anthropic API key file {path} is empty.")
+    return key
+
 # Enables: Extended Thinking Interleaved with Tool Use.
 # Since we want agentic task completion end to end, we must always add the
 # header on each of our requests.
@@ -128,7 +146,7 @@ class AnthropicAgentNode(AgentNode):
 
     def __init__(self, ctx: RunContext, id: int, fn: Function, inputs: Dict[str, Any], parent: Optional[Node]):
         super().__init__(ctx, id, fn, inputs, parent)
-        self.client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        self.client = anthropic.Anthropic(api_key=anthropic_api_key())
         self.model = ModelNames[Provider.Anthropic]
         self._history: List[MessageParam] = []   # Typed conversation history we replay every turn
         self._tools: List[ToolUnionParam] = self._build_tool_params(self.agent_fn.uses)

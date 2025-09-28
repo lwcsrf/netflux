@@ -1,5 +1,7 @@
 from typing import Any, Dict, List, Optional, Union
 import base64
+from functools import lru_cache
+from pathlib import Path
 
 from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
@@ -63,7 +65,23 @@ from overrides import override
       to provide the full tool specs unlike Anthropic.
 """
 
+GEMINI_KEY_FILE = "gemini_key.txt"
 
+@lru_cache(maxsize=1)
+def gemini_api_key() -> str:
+    path = Path(__file__).with_name(GEMINI_KEY_FILE)
+    try:
+        key = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError as ex:
+        raise RuntimeError(
+            f"Gemini API key file not found: {path}. Expected a plain text file containing the API key."
+        ) from ex
+    except Exception as ex:
+        raise RuntimeError("Unable to instantiate gemini sdk client due to key read error") from ex
+    if not key:
+        raise RuntimeError(f"Gemini API key file {path} is empty.")
+    return key
+    
 # Max tool call + response cycles before giving up.
 MAX_STEPS = 64
 
@@ -173,7 +191,7 @@ class GeminiAgentNode(AgentNode):
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
 
     def run(self) -> None:
-        client = genai.Client(vertexai=True, project="speedy-now-471205-c8", location="global")
+        client = genai.Client(api_key=gemini_api_key())
 
         tools = self._build_gemini_tools()
         config = types.GenerateContentConfig(
