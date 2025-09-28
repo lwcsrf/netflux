@@ -24,3 +24,7 @@ class RaiseException(CodeFunction):
         node_id = parent.id
 
         raise AgentException(msg, agent_name, node_id)
+
+
+# Built-in global singleton for author reference.
+raise_exception = RaiseException()

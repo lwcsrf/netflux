@@ -667,3 +667,7 @@ class TextEditor(CodeFunction):
     # accidentally include in follow-up `old_str`: "1|", "1│", "1:", or "1\t" (cat -n).
     # We only use this to sometimes craft better error messages when no match found.
     _LINE_NUMBER_PATTERN = re.compile(r"(?:^|\n)\s*\d+\s*(?:[|│:]\s?|\t)")
+
+
+# Built-in global singleton for author reference.
+text_editor = TextEditor()
