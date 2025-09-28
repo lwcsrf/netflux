@@ -22,6 +22,7 @@ class TextEditor(CodeFunction):
     max_characters: int = 96000
 
     desc = (
+        "aka: `TextEditor`; `text_editor`. "
         "View, create, and edit text files. Commands:\n"
         "• `view`: View a file or list a directory. "
         "Files show line numbers (format: `number|content`) and you can optionally "
