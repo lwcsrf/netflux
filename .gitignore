@@ -1,3 +1,2 @@
-providers/gemini_key.txt
-providers/anthropic_key.txt
-
+demos/gemini.key
+demos/anthropic.key

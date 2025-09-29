@@ -1,6 +1,4 @@
-"""Client factory mapping used by demos and tests."""
-
-from __future__ import annotations
+"""Client factories used by the demos, which rely on simple api key."""
 
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -10,15 +8,15 @@ import google.genai as genai
 
 from ..providers import Provider
 
-_DEMO_DIR = Path(__file__).resolve().parent
+DEMO_DIR = Path(__file__).resolve().parent
 
 
 def _read_key(filename: str) -> str:
-    path = _DEMO_DIR / filename
+    path = DEMO_DIR / filename
     try:
         key = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError as exc:
-        raise RuntimeError(
+        raise FileNotFoundError(
             f"Missing API key file '{filename}' in demos directory: {path}. "
             "Create the file and place your API key inside."
         ) from exc
@@ -34,17 +32,17 @@ def _read_key(filename: str) -> str:
     return key
 
 
-def _anthropic_client_factory() -> anthropic.Anthropic:
+def anthropic_client_factory() -> anthropic.Anthropic:
     key = _read_key("anthropic.key")
     return anthropic.Anthropic(api_key=key)
 
 
-def _gemini_client_factory() -> genai.Client:
+def gemini_client_factory() -> genai.Client:
     key = _read_key("gemini.key")
     return genai.Client(api_key=key)
 
 
 CLIENT_FACTORIES: Dict[Provider, Callable[[], Any]] = {
-    Provider.Anthropic: _anthropic_client_factory,
-    Provider.Gemini: _gemini_client_factory,
+    Provider.Anthropic: anthropic_client_factory,
+    Provider.Gemini: gemini_client_factory,
 }

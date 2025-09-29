@@ -95,7 +95,10 @@ Tips & Tricks
 
 * Framework-provided object encapsulating all runner infra
 * Created with a collection of user-defined `Function`s (hierarchy) that may be invoked directly or indirectly; Author defines `Function`s fully before creating a `Runtime`.
-    * `runtime = Runtime(specs: List[Function])`
+    * `runtime = Runtime(specs: List[Function], client_factories: Mapping[Provider, Callable[[], Any]])`
+        * `client_factories` are factory functions that return an instance of the client type expected by each provider.
+            * Used in `AgentNode` provider-specific subtypes.
+            * Support pluggable configuration and authentication mechanisms unique to the consumer's app.
     * `runtime.get_ctx() -> RunContext`: return a special `RunContext` that is outside the scope of any Task (`Function` invocation).
 * During registration, the runtime automatically performs a **BFS over each Function's `uses` graph** to discover and register all transitively referenced Functions. Consumers may seed with a partial set; transitives are added automatically. Duplicate names that point to different Function instances are rejected.
 * Responsible for creating trees of `Node`s that execute `Function`s.

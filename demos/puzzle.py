@@ -243,7 +243,10 @@ INTERLEAVE_AGENT, INTERLEAVE_TOOLS = build_interleave_agent(
 def run_interleave_experiment(provider: Optional[Provider] = None) -> str:
     """Execute the shared puzzle against the requested provider."""
 
-    runtime = Runtime(specs=[INTERLEAVE_AGENT, *INTERLEAVE_TOOLS], client_factories=CLIENT_FACTORIES)
+    runtime = Runtime(
+        specs=[INTERLEAVE_AGENT, *INTERLEAVE_TOOLS], 
+        client_factories=CLIENT_FACTORIES
+    )
     ctx = runtime.get_ctx()
     node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider)
     result = node.result() or ""

@@ -35,7 +35,8 @@ class Runtime:
         self._functions: List[Function] = list(specs)  # shallow copy
         # Index functions by name; uniqueness enforced.
         self._fn_by_name: Dict[str, Function] = {}
-        self._client_factories: Dict[Provider, Callable[[], Any]] = self._validate_client_factories(client_factories)
+        self._client_factories: Dict[Provider, Callable[[], Any]] = \
+            self.validate_client_factories(client_factories)
 
         # Auto-register transitive Function dependencies via BFS over .uses
         queue: Deque[Function] = deque(specs)
@@ -66,7 +67,7 @@ class Runtime:
         self._global_seqno: int = 0
 
     @staticmethod
-    def _validate_client_factories(
+    def validate_client_factories(
         factories: Mapping[Provider, Callable[[], Any]],
     ) -> Dict[Provider, Callable[[], Any]]:
         validated: Dict[Provider, Callable[[], Any]] = {}
