@@ -1,7 +1,5 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union
 import base64
-from functools import lru_cache
-from pathlib import Path
 
 from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
@@ -65,23 +63,6 @@ from overrides import override
       to provide the full tool specs unlike Anthropic.
 """
 
-GEMINI_KEY_FILE = "gemini_key.txt"
-
-@lru_cache(maxsize=1)
-def gemini_api_key() -> str:
-    path = Path(__file__).with_name(GEMINI_KEY_FILE)
-    try:
-        key = path.read_text(encoding="utf-8").strip()
-    except FileNotFoundError as ex:
-        raise RuntimeError(
-            f"Gemini API key file not found: {path}. Expected a plain text file containing the API key."
-        ) from ex
-    except Exception as ex:
-        raise RuntimeError("Unable to instantiate gemini sdk client due to key read error") from ex
-    if not key:
-        raise RuntimeError(f"Gemini API key file {path} is empty.")
-    return key
-    
 # Max tool call + response cycles before giving up.
 MAX_STEPS = 64
 
@@ -95,8 +76,22 @@ class GeminiAgentNode(AgentNode):
     - Final assistant content is appended to history even on the last turn.
     - No caching (handled by Gemini service transparently).
     """
-    def __init__(self, ctx: RunContext, id: int, fn: Function, inputs: Dict[str, Any], parent: Optional['Node']):
-        super().__init__(ctx, id, fn, inputs, parent)
+    def __init__(
+        self,
+        ctx: RunContext,
+        id: int,
+        fn: Function,
+        inputs: Dict[str, Any],
+        parent: Optional['Node'],
+        client_factory: Callable[[], Any],
+    ):
+        super().__init__(ctx, id, fn, inputs, parent, client_factory)
+        client = client_factory()
+        if not isinstance(client, genai.Client):
+            raise TypeError(
+                "GeminiAgentNode expected client_factory to return google.genai.Client"
+            )
+        self.client = client
         self._tool_call_counter = 0
         self._token_usage = TokenUsage()
 
@@ -191,8 +186,6 @@ class GeminiAgentNode(AgentNode):
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
 
     def run(self) -> None:
-        client = genai.Client(api_key=gemini_api_key())
-
         tools = self._build_gemini_tools()
         config = types.GenerateContentConfig(
             system_instruction=self.agent_fn.system_prompt or "",
@@ -226,7 +219,7 @@ class GeminiAgentNode(AgentNode):
 
         for _ in range(MAX_STEPS):
             # TODO: Add retry/backoff for transient Google Generative AI client errors.
-            resp = client.models.generate_content(
+            resp = self.client.models.generate_content(
                 model=ModelNames[Provider.Gemini],
                 contents=contents,
                 config=config,

@@ -16,6 +16,7 @@ from typing import Dict, Any, List, Set, Tuple, Optional
 # ──────────────────────────────────────────────────────────────────────────────
 from .. import core
 from ..runtime import Runtime
+from ..demos.auth_factory import CLIENT_FACTORIES
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Simple tracing utilities
@@ -534,7 +535,8 @@ def main():
             # Agents
             PerfReasoningAgent,
             PerfImprovementAgent,
-        ]
+        ],
+        client_factories=CLIENT_FACTORIES,
     )
     trace("Registration complete.")
 

@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import logging
-from typing import Any, Deque, Dict, List, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence
 from threading import Condition, Lock
 from collections import deque
 
@@ -29,10 +29,14 @@ class NodeObservable:
 class Runtime:
     def __init__(self,
         specs: Sequence[Function],
+        *,
+        client_factories: Mapping[Provider, Callable[[], Any]],
     ):
         self._functions: List[Function] = list(specs)  # shallow copy
         # Index functions by name; uniqueness enforced.
         self._fn_by_name: Dict[str, Function] = {}
+        self._client_factories: Dict[Provider, Callable[[], Any]] = \
+            self.validate_client_factories(client_factories)
 
         # Auto-register transitive Function dependencies via BFS over .uses
         queue: Deque[Function] = deque(specs)
@@ -61,6 +65,24 @@ class Runtime:
         self._providers: Dict[Provider, type[AgentNode]] = {}
         self._node_observables: Dict[int, NodeObservable] = {}
         self._global_seqno: int = 0
+
+    @staticmethod
+    def validate_client_factories(
+        factories: Mapping[Provider, Callable[[], Any]],
+    ) -> Dict[Provider, Callable[[], Any]]:
+        validated: Dict[Provider, Callable[[], Any]] = {}
+        for provider, factory in factories.items():
+            if not isinstance(provider, Provider):
+                raise TypeError(
+                    "client_factories keys must be Provider instances; "
+                    f"got {provider!r}"
+                )
+            if not callable(factory):
+                raise TypeError(
+                    "client_factories values must be callables that create SDK clients"
+                )
+            validated[provider] = factory
+        return validated
 
     def get_ctx(self) -> RunContext:
         """Return a RunContext not tied to any specific Node
@@ -122,7 +144,13 @@ class Runtime:
             if provider not in self._providers:
                 self._providers[provider] = get_AgentNode_impl(provider)
             impl: type[AgentNode] = self._providers[provider]
-            node = impl(ctx, node_id, fn, inputs, caller)
+            factory = self._client_factories.get(provider)
+            if factory is None:
+                raise ValueError(
+                    f"No client factory registered for provider '{provider.value}'. "
+                    "Update Runtime(client_factories=...) to include this provider."
+                )
+            node = impl(ctx, node_id, fn, inputs, caller, factory)
         else:
             raise TypeError(f"Unknown Function subtype: {type(fn).__name__}")
 

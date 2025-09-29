@@ -487,15 +487,20 @@ class AgentNode(Node):
         fn: Function,
         inputs: Dict[str, Any],
         parent: Optional[Node],
+        client_factory: Callable[[], Any],
     ) -> None:
         super().__init__(ctx, id, fn, inputs, parent)
         assert isinstance(fn, AgentFunction), "AgentNode must wrap an AgentFunction"
         self.agent_fn: AgentFunction = fn
         self.transcript: List[TranscriptPart] = []
 
+        if not callable(client_factory):
+            raise TypeError("AgentNode requires a callable client_factory")
+        self.client_factory: Callable[[], Any] = client_factory
+
         # For each `Function` the agent may invoke, map from string tool names
         # (as will be referred to by model tool call responses) to the `Function`.
-        self.tool_map: Dict[str, Function] = {t.name: t for t in self.agent_fn.uses}
+        self.func_map: Dict[str, Function] = {t.name: t for t in self.agent_fn.uses}
 
     def get_transcript(self) -> List[TranscriptPart]:
         return list(self.transcript)  # shallow copy
@@ -533,10 +538,10 @@ class AgentNode(Node):
     def invoke_tool_function(
         self, tool_name: str, tool_args: Dict[str, Any],
     ) -> Node:
-        if tool_name not in self.tool_map:
+        if tool_name not in self.func_map:
             raise RuntimeError(
-                f"Invoking unknown tool: '{tool_name}'. Tools available: {self.tool_map.keys()}")
-        fn: Function = self.tool_map[tool_name]
+                f"Invoking unknown tool: '{tool_name}'. Tools available: {self.func_map.keys()}")
+        fn: Function = self.func_map[tool_name]
 
         return self.ctx.invoke(fn, tool_args)
 
