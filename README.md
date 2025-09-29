@@ -1,66 +1,307 @@
-`netflux` is :
+**netflux** is a minimalist Python framework for authoring custom agentic applications. Its core idea is simple but powerful: **treat agents exactly like functions** in an imperative program — with **inputs**, **outputs**, **composition** (by calling other functions), and **side‑effects** on stateful structures.
 
-- minimalist python framework for authoring custom agentic applications. The core idea is to treat agents like any code function in imperative programming: you have inputs, outputs, logic composition (by calling on building blocks of other functions), and side effects on structures.
-- our goal was to build a framework that is semantically flexible to do the equivalent of both workflows and dynamic, open-ended problem solvers. Fundamentally, we believe hierarchical Task Decomposition is important to doing this effectively, the same cohesion and reusability of libraries and utility functions in traditional programming.
-- explain the central abstraction `Function`.
-- explain `CodeFunction`. Refer to the `TextEditor` example in func_lib/text_editor.py as a straightforward but very high utility example.
-- explain `AgentFunction`. and why the abstraction of treating it like a Function works well. We may often say "Agent" and we mean an instance of `AgentFunction`. Refer to the `ApplyDiffPatch` example in func_lib/apply_diff.py as an example of a straightforward high utility example. The story with this particular example:
-    - it is that often we want agents to be very focused, such as editing an implementation for a new feature or bug fix (planned in an earlier step), without burdening that same agent of being responsible for making the file edits. Or perhaps we want a human to inspect the diffs before we proceed. Thus, we often want to separate patch creation from patch application. `ApplyDiffPatch` is specialized in, once you have the patch, applying to successfully especially in the case where there can be fuzzy match due to imperfections often in whitespace matching. (please state this much more concisely than I did!).
-- explain how any Function can call any Function, e.g. agents can invoke code, other agents, and code can invoke agents. Code invoking code is classic programming, and this framework attempts to enable the other 3 of 4 combinations.
-- The framework is both the convention / pattern for specifying such functions (defining the building blocks of agents for your application) but also a lightweight execution infrastructure for running, monitoring, debugging, tracing agent instances.
-- the concept of **Task Decomposition**: this is an important design philosophy: just as we build on a foundation of cohesive functions for writing higher layer application logic, and such is observable in a call stack, the idea is to do exactly the same when we are defining agents as `AgentFunction`s: a high-level agent should build on a foundation of more specialized sub-`Functions` (in the case of sub-agents, this is just modeled as an `AgentFunction` that invokes another `AgentFunction` to do one particular sub-tasl). So just as good programming practice is to do functional decomposition, we attempt to encourage the same with this framework.
-    - this becomes especially important for agents because the importance of focused tasks with limited context and deliberate context window is currently the bottleneck to the successful applications of LLMs for agentic work.
-- An agent can break up its work into sub-tasks, and may delegate a sub-task to another agent that is well-suited to executing that sub-task. However, circular references must be impossible. Recursion should also be disallowed to ensure no runaway scenarios.
-- When agents invoke "tools" we semantically are referring to physically the act of an agent invoking tools. However, in our framework this is just the physical mechanism by which an LLM is invoking what we actually consider to be functions. 
-- An agent is invoked as a Function invocation of an AgentFunction. Every agent has a schematized function that is used to invoke it. When a developer specifies that one agent is able to call another agent to complete a sub-task, this will be translated to making the latter agent's function entrypoint as a tool/function available to the former agent.
-- What exactly is a CodeFunction then? Many people consider "tools" to be what we would actually call leaf `CodeFunction`s which are functions that do not invoke any other `Function`. Examples of this are viewing a file, replacing a string in a file, running bash commands. These are the most basic building blocks. Examples of higher-level `CodeFunction`s:
-    - a workflow with fixed logic (thus easily described in deterministic code) that coordinates fan-out of work to other `AgentFunction`s. A `CodeFunction` could invoke a `CodeFunction` through the `Runtime`, however usually you would just have a function call instead. Ordinarily, a `CodeFunction` will invoke one or more `AgentFunction`s.
-    - a wrapper around an `AgentFunction` to decorate or enhance it. The best example of this is something like the `Ensemble` utility (`func_libs/ensemble.py`), which ...
-- We model a function invocation as a "task". We implement the running of a function invocation using a `Node`. Thus, we often refer to a function invocation also as a "task" or as a `Node`. An `AgentNode` tracks the state of a running `AgentFunction` call, including past `Function` calls it has in turn made (a sequence of children `Node`s), a transcript of the full LLM session of the current instance as it progresses (for tracing and observability), and manages the "agent loop" which uses a provider's SDK against their remote endpoint. Importantly, a `Node` represents the state and history of a function call both while it is executing and after it is done executing.
-- Tree of `Node`s is kept around even after a top-level task is complete, until the user deletes it, for post-run debuggability and traceability.
-- Explain that external consumers don't use Node directly (except for CodeFunction authors), they instead use `NodeView`. Consumers use `NodeView` to ensure that they are seeing atomic checkpoints of a tree's total state. Discuss more about `NodeView` and why it is necessary and the idea that it is a single consistent view. Show an example with the `watch()` loop of how it is supposed to be used, briefly.
-- At any point in time, if you take a snapshot of the call hierarchy, this looks just like a traditional call stack, except now a Function can be an agent doing a task.
-- In Object-oriented programming, methods are just functions that can mutate state of an object. To support this, we introduce the concept of a `SessionBag` which is a way for objects to have a lifetime of a task. 
-- The execution of a task, including its subtasks, can be modeled as a tree where each task is a Node and each Node's children are an ordered sequence of edges to children Nodes representing the order in which the function called other functions.
-    - In asynchronous programming, concurrent function calls can be done using Futures/Tasks. We also permit a similar model by having a caller not need to invoke blocking Node.result() until it is ready to wait -- similar to a Future. Thus a Function is free to invoke other Functions in parallel. For an AgentFunction, this is supported for LLMs that have "parallel tool calling" as a feature.
-- A "top-level task" is a Function call where the caller is external to the framework and agents spec. For example, when a user app or web server consumes the framework (and a Functions spec on which it is instantiated) to invoke a top-level Function, which could be either a `CodeFunction` or `AgentFunction` alike, this is a top-level task instance.
-- An agent may be invoked as a top-level task externally or as a sub-task (invoked by another AgentFunction or CodeFunction). The external caller may choose to invoke a broad-scoped AgentFunction that in turn coordinates a complex task, or the external caller may directly invoke a much more purpose-specific AgentFunction that might also be used multiple layers deep within some other broader AgentFunction -- there is no need to force an agent as always being one or the other. There is no concept of top vs non-top Functions: any Function can be either, just as in normal programming.
-- A long-running workflow-like agent will usually play more of an orchestrator agent kind of role, breaking the problem into sub-tasks which may change dynamically as progress is made.
-- Function Call Stack Analogy: as you go deeper in a call stack trace, functions are more specialized, until you get to the lowest-level library functions. In our Call Stack, function calls are instead agents (AgentFunction) or traditional code functions (CodeFunction), where usually at the bottom of the stack one will find CodeFunctions utilities that operate like built-in low level library functions. Agents are like higher level functions, and at any point in time during execution you can take a top-level task and visualize the netflux Call Stack like we do a traditional function call stack.
-- **The logical reasoning of an agent replaces the fixed code logic of a function, but other than this we see little difference between traditional functions and agents, which is why we base the framework on this fundamental idea**.
-- A highly specialized agent will often have only leaf tools (for example, if it needs to analyze inputs that are files or produce output to files), or no tools (for example if it is only doing analysis), and is going to be deeper in depth of the netflux call stack at any time.
-- Every agent is specified as:
-    - schematized invocation arguments such that the agent can be invoked as a function call
-    - system prompt with optional string substitution using one or more of calling function's arguments.
-    - 1 initial user turn prompt - ditto.
-    - Specifics of the task (agent invocation) are injected into the system and/or user prompt in a predefined way - typically this would just be string substitution but it can also be whatever the author desires as long as the transformation of fixed arguments -> concretized prompt can be specified.
-    - Short description of the agent's purpose and arguments.
-    - List of other `Function`s (defined in this framework) that can be invoked by the agent. That can be for leaf tasks like file editing or sub-task delegation.
-    - Agents can be given the `RaiseException` function which will allow them to raise an `AgentException` for any reason.
-- Give a briefer on the Exception Model that we use. The key concept is that we make `Exception`s fluid with `Function`s just like in traditional programming. Explain why an agent would want to raise an `Exception`. Refer to the `Exception Model` section for more details (give hash link).
-- Providers are subtypes of AgentNode that bridge the framework's pattern to the model's SDK. refer to section below for how to write a provider extension for a new model. Give a brief idea of how a new `AgentNode` provider would be added and then refer to the relevant section below. 
-- Agent instance token accounting. Discuss in a couple sentence what we track. Refer to relevant section below.
+Our goal is a framework that is semantically flexible enough to express both **deterministic workflows** and **dynamic, open‑ended problem solvers**. We build on **hierarchical task decomposition** so higher‑level behavior is assembled from focused, reusable building blocks, just like well‑factored libraries and utility functions in traditional programming.
 
+* **One mental model:** Agents are first‑class functions. They take typed arguments, return results, can call other functions, and leave a trace of their work.
+* **Two usage styles, one framework:** Build **deterministic workflows** *and* **open‑ended problem solvers** with the same abstractions.
+* **Task Decomposition by design:** Compose complex work from cohesive, reusable building blocks—mirroring how we structure libraries and helper functions in traditional programming. This hierarchy is key to building reliable agents with current LLMs.
 
-Tips & Tricks
+---
+
+## The central idea: `Function`
+
+Everything in netflux is a `Function`. There are two concrete kinds:
+
+* **`CodeFunction`** — Deterministic Python code (your callable) with a declared signature. Think basic utilities, orchestrators, and agent decorators.
+  *Example utility:* `TextEditor` (`func_lib/text_editor.py`) provides high‑leverage file viewing and editing commands.
+
+* **`AgentFunction`** — An LLM‑backed function with a schema (arguments), a system prompt, and an initial user prompt template. Under the hood it runs an **agent loop** and can call other Functions in-between thinking. We casually say *“Agent”* to mean an instance of `AgentFunction`.
+  *Example agent:* `ApplyDiffPatch` (`func_lib/apply_diff.py`) applies unified diff patches (including diffs fenced in markdown) to files. It focuses on **applying** a patch — tolerating small whitespace/indentation drift and other minor fuzz — while keeping **patch creation** as a separate concern. This separation lets you review diffs or delegate patch generation to a different agent, avoiding context window dilution for the patch producer (an example of what we mean by "task decomposition").
+
+Because both kinds are just `Function`s, **any Function can call any Function**:
+
+* code → code (classic programming),
+* code → agent,
+* agent → code,
+* agent → agent.
+
+Calling an agent is simply **invoking a function** whose implementation happens to be an LLM reasoning-with-tools loop.
+
+> **On “tools”.** When we say an agent “invokes tools,” that’s physically the LLM issuing tool calls (Anthropic calls it "tools", Gemini calls it "functions"); *semantically* in netflux, those tools are just `Function`s made available to the agent. They may map to `AgentFunction`s or `CodeFunction`s.
+
+> **Why treat agents like functions?**
+> Because then composition is uniform: **code can call code or agents; agents can call code or other agents**. Classic programming already covers “code → code”; netflux enables the other three combinations in a principled way that looks consistent.
+
+---
+
+## What the framework gives you
+
+* A **clear convention** for specifying agents, workflows, orchestrators, utilities, etc (your building blocks)
+* A **minimal execution runtime** for running, monitoring, debugging, and tracing agent instances.
+* Library of well-tested built-ins (`func_lib`).
+
+---
+
+## Task decomposition, by design
+
+Good programs decompose behavior into cohesive functions. We encourage the same pattern for agents:
+
+* A high‑level `AgentFunction` **breaks work into sub‑tasks** and delegates to more specialized sub‑`Function`s (including other agents).
+* This disciplined decomposition matters for agents because **focused sub‑tasks with deliberate, limited context** are often the bottleneck to reliable LLM execution.
+* **Circular references are forbidden** and **recursion is disallowed** to prevent runaway scenarios.
+
+There is **no notion of “top” vs. “non‑top”** functions. *Any* `Function` (code or agent) can be invoked as the top‑level entry from your app, or it can be a deeply nested sub‑task inside a broader agent.
+
+Long‑running, workflow‑like agents typically act as **orchestrators**, breaking problems into sub‑tasks that can change as progress is made.
+
+---
+
+## What defines an Agent
+
+Every `AgentFunction` specifies:
+
+* **Invocation schema** (typed args) so it can be called like a regular function.
+* **System prompt** (may include string substitutions from args).
+* **First user turn** (templated; substitutions using the input args).
+* **How to inject specifics**—typically string substitution, but any deterministic transform is fine as long as args ⇒ concrete prompt is well‑defined.
+* **Short description** (purpose and arguments).
+* **Allowed `Function`s** it may call (task decomposition, sub‑agents, actuators i.e. leaf tools).
+*  Opt-in to the built‑in **`RaiseException`** function so the agent can proactively signal failure by raising an `AgentException`.
+
+> **Design note:** *The agent’s logical reasoning replaces a function’s fixed code body. Otherwise, we treat agents and functions uniformly—which is the foundation of netflux.*
+
+---
+
+## What exactly is a `CodeFunction`?
+
+Many frameworks use the word *tool* for what we call **leaf `CodeFunction`s**: file viewers, string replacers, shell runners, etc. These are your lowest‑level building blocks. But higher‑level `CodeFunction`s are just as important:
+
+* **Deterministic orchestrators**: fixed logic that fans out work to one or more `AgentFunction`s (and, less commonly, to other `CodeFunction`s via the runtime).
+* **Decorators/wrappers around agents** that enhance behavior. The prime example is **`Ensemble`** (`func_lib/ensemble.py`), which launches multiple independent agent runs (optionally across providers) and then reconciles them.
+
+---
+
+## `runtime`: definition and execution
+
+We model each `Function` invocation as a **task** executed by a **`Node`**.
+
+> We often use the terms "function invocation", "task", and `Node` interchangeably.
+
+* **`CodeNode`** runs a `CodeFunction` (a single Python call).
+* **`AgentNode`** runs an `AgentFunction` (the provider‑specific LLM loop), **tracking**:
+
+  * the **ordered sequence** of child `Function` calls it makes,
+  * a **full transcript** of the LLM session (user/model messages, tool calls and results, and thinking blocks when available) for traceability,
+  * **token usage** accumulated throughout the loop.
+
+A **tree of `Node`s** represents a top‑level task and all of its sub‑tasks. This tree persists **after completion** (until you delete it) so you can **debug and trace** what happened.
+
+At any point, if you snapshot the call hierarchy, it looks like a traditional **call stack**—except a frame may be an **agent** instead of a piece of deterministic code. Deeper frames tend to be **more specialized**, and at the bottom you’ll typically find **leaf `CodeFunction`s** (e.g., file IO, text replacement, running a shell command).
+
+> **Key perspectives**
+> * **The logical reasoning of an agent replaces the fixed code logic of a function, but otherwise we treat them the same.**
+> * At any moment, a snapshot of the invocation tree reads like a **traditional call stack**—except that stack frames can be *agents* or *code*.
+> * Highly specialized agents often use only **leaf tools** (e.g., read/write files) or **no tools at all** (analysis‑only). Such agents appear **deeper** in the call stack.
+
+---
+
+## Observability: `NodeView` and snapshots
+
+External consumers (e.g., your UI) do **not** read `Node` objects directly—those mutate as tasks run. Instead, you consume **`NodeView`**, an **immutable, consistent, atomic snapshot** of a node and its entire subtree at a single global version.
+
+A minimal **watch loop** facility is provided for event-driven UI and looks like this:
+
+```python
+from netflux.core import NodeState
+
+prev = 0
+while True:
+    view = node.watch(as_of_seq=prev)   # blocks until there is a newer snapshot
+    prev = view.update_seqnum
+    
+    # read view.state / view.outputs / view.exception / view.children safely
+    print(f"[{view.update_seqnum}] node={view.id} state={view.state.name}")
+    
+    if view.state in (NodeState.Success, NodeState.Error):
+        break
+```
+
+This ensures your UI only sees **consistent** views of the task tree.
+
+---
+
+## `SessionBag` & Objects
+
+In OOP, methods are functions that mutate an object’s state. netflux supports similar patterns with a **`SessionBag`**, a scoped object store with the **lifetime of a task** (and handy access to parent/root scopes). There are two important use cases in mind:
+
+* `Function`s can stash and retrieve objects to act like methods scoped to their parent or root ancestor. A good example of this is an agent that uses `bash` to perform its task, where it needs to persist a `BashSession` across command invocations (in this case, the `BashSession` is kept in the agent-scope `SessionBag` and the children invocations retrieve it).
+* `Function`s may use the `SessionBag` objects to pass input/output across sub‑tasks without serializing through text.
+
+---
+
+## Concurrency (fan‑out)
+
+A task and its sub‑tasks form a **tree** where each node’s children are ordered by invocation (child edges record the call sequence). Like `Future`s, you can **launch multiple children in parallel** and defer collecting each `node.result()` until you’re ready to block. For `AgentFunction`s, this also works when the underlying model supports **parallel tool calling**.
+
+---
+
+## Top‑level tasks vs. sub‑tasks
+
+A **top‑level task** is any `Function` call initiated by your app, which is external to and consuming the framework (e.g., a web handler or CLI tool). It can be a coarse orchestrator or a fine‑grained utility; **there’s no special status**—any `Function` can be called from the top or from deep inside a tree.
+
+Long‑running, workflow‑like agents usually act as **orchestrators**, dynamically redefining sub‑tasks as progress is made. Highly specialized agents tend to live deeper in the stack and may use only **leaf `CodeFunction`s** (or even **no tools** if purely analytical). However, nothing stops your from invoking specialized agents directly to create top-level tasks — the framework is agnostic to this.
+
+---
+
+## Exceptions
+
+Another core idea is that `Exception`s flow **fluidly** through `Function`s as in regular programming:
+
+* A `CodeFunction` can `raise` for ordinary reasons (bad args, invariants, business logic). They may be raised by the framework during argument validation. Or they may be raised by the function during biz logic execution. They will be presented to agents in function call results. Most LLM providers support some way to indicate error, and we put the `Exception` stringification in the response (`providers/` extensions must do this correctly).
+* An `AgentFunction` can **decide to fail** by calling the built‑in `raise_exception()`, which raises an **`AgentException`**. Example reasons include missing context, unavailable sub‑functions, irrecoverable or repeated child errors, or determining the task is unsolvable. This **reduces hallucinations** by encouraging honest failure.
+* Downstream code can catch and handle exceptions, or let them **bubble** to the caller. This is true for both `CodeFunction`s via normal try/catch, and `AgentFunction`s which can be instructed how to handle various problems or not. The smarter models get, the more they can handle exceptions autonomously, provided the messages are sufficiently descriptive.
+
+See the detailed [Exception Model](#exception-model) below for guidance on when agents should raise, bubble, or retry.
+
+---
+
+## Providers
+
+Providers are **subtypes of `AgentNode`** that bridge the framework’s pattern to each model’s SDK (Anthropic, Gemini, etc.). It is the **driver** that runs the agent loop and manages function calls, forwarding them through the framework. Adding a new provider means implementing a new `AgentNode` subtype. See more details below on writing a new `providers/` extension.
+
+### Token accounting
+
+Each agent instance **tracks token usage** over its lifetime (updated on every request/response), including input tokens (e.g., cache hits/writes vs. regular), and output tokens (e.g., reasoning vs. final text where available). See the section below for the full accounting fields and how to access them.
+
+---
+
+## A tiny end‑to‑end example
+
+Below is a minimal example that defines:
+
+1. a small **`CodeFunction`** (`verify_contains`) that uses the built‑in **TextEditor**,
+2. an **`AgentFunction`** (`edit_file_agent`) that uses both our `CodeFunction` and built‑ins (**ApplyDiffPatch**, **TextEditor**, **RaiseException**), and
+3. an **Ensemble** wrapper that runs multiple instances and reconciles the answer.
+
+```python
+# --- Imports from netflux ---
+from netflux.core import CodeFunction, AgentFunction, FunctionArg, RunContext
+from netflux.providers import Provider
+from netflux.runtime import Runtime
+
+# Built-ins
+from netflux.func_lib.text_editor import text_editor           # CodeFunction (leaf tool)
+from netflux.func_lib.apply_diff import apply_diff_patch       # AgentFunction (built-in)
+from netflux.func_lib.raise_exception import raise_exception   # CodeFunction (to raise AgentException)
+from netflux.func_lib.ensemble import Ensemble                 # CodeFunction decorator
+
+# 1) Our CodeFunction: verify that a file contains a substring.
+def _verify_contains(ctx: RunContext, *, path: str, must_contain: str) -> str:
+    view = ctx.invoke(text_editor, {
+        "command": "view",
+        "path": path,
+    }).result()
+    if must_contain in view:
+        return "Verified."
+    raise ValueError(f"Expected text not found in {path!r}.")
+
+verify_contains = CodeFunction(
+    name="verify_contains",
+    desc="Fail if the file does not contain the expected text.",
+    args=[
+        FunctionArg("path", str, "File to inspect"),
+        FunctionArg("must_contain", str, "Expected substring"),
+    ],
+    callable=_verify_contains,
+    # Because _verify_contains invokes another Function via ctx.invoke(...)
+    uses=[text_editor],
+)
+
+# 2) Our AgentFunction: plan a small edit, generate a unified diff, apply it, then verify.
+edit_file_agent = AgentFunction(
+    name="edit_file_agent",
+    desc="Plan and apply a small edit to a file using a unified diff, then verify the result.",
+    args=[
+        FunctionArg("path", str, "Target file"),
+        FunctionArg("edit_instructions", str, "What to change (natural language)"),
+        FunctionArg("must_contain", str, "Text that must appear after the edit"),
+    ],
+    system_prompt=(
+        "You are a precise code editor. Generate a minimal unified diff that implements the requested change. "
+        "Use tools instead of describing steps. Apply the diff, then verify the outcome."
+    ),
+    user_prompt_template=(
+        "Target file: {path}\n"
+        "Desired change: {edit_instructions}\n"
+        "Steps:\n"
+        "  1) If needed, inspect the file with text_editor.\n"
+        "  2) Produce a unified diff implementing the change.\n"
+        "  3) Call apply_diff_patch(diff_content=...) to apply it.\n"
+        "  4) Call verify_contains(path={path}, must_contain={must_contain}).\n"
+        "If verification fails, call raise_exception(msg=...)."
+    ),
+    uses=[text_editor, apply_diff_patch, verify_contains, raise_exception],
+)
+
+# 3) Ensemble: run multiple instances and reconcile the answer.
+edit_file_ensemble = Ensemble(
+    agent=edit_file_agent,
+    instances={Provider.Anthropic: 2, Provider.Gemini: 1},
+    allow_fail={Provider.Anthropic: 1, Provider.Gemini: 0},
+)
+```
+
+Wiring it up (top‑level task):
+
+```python
+from netflux.demos.auth_factory import CLIENT_FACTORIES  # reads API keys for the demos
+
+runtime = Runtime(
+    specs=[edit_file_agent, verify_contains, text_editor, apply_diff_patch, raise_exception, edit_file_ensemble],
+    client_factories=CLIENT_FACTORIES,
+)
+
+node = runtime.get_ctx().invoke(
+    edit_file_ensemble,
+    {"path": "core.py", "edit_instructions": "Ensure the file ends with a newline.", "must_contain": "\n"}
+)
+print(node.result())   # blocks until Success or Error (exceptions bubble like normal)
+```
+
+This tiny example shows:
+
+* **agent → code** (the agent calls `verify_contains` and `text_editor`),
+* **agent → agent** (it can delegate to other agents, e.g., your own),
+* **agent → built‑in agent** (`apply_diff_patch`),
+* **code → code** (`verify_contains` calls `text_editor` through the runtime),
+* and **Ensemble** as a `CodeFunction` that decorates an agent to run in parallel and reconcile.
+
+---
+
+# Tips & Tricks
+
+## Context Engineering
 
 - The framework tries to make it easy to do effective context engineering. Usually higher-level agents will have the role of orchestration or workflow. Lower-level agents will solve more concrete patterns of problem. As LLMs become more sophisticated, a single agent can take on a broader set of responsibilities (more Functions as its disposal, and longer-running). Partition sub-tasks as fine-grained as needed but don't over-partition unnecessarily as this can degrade your evals.
-- agents may use files for input(s)/output(s). Input filepaths would be given as args, and output filepaths may be returned (Write File tool used prior to returning).
-- structured outputs are discouraged since LLMs are sophisticated enough to parse unstructured outputs from their sub-tasks. However, sometimes strict structured outputs are critical, and this can be enforced by defining `CodeFunction`s where the arguments are the schema and the Callable performs serialization and/or verification, depending on the reason for the structured output, and returns empty or provides a filepath with the serialized data, etc. You can leverage the framework's Exceptions Model to propagate an Exception if verification fails.
-- When authoring agents, place the common prompt before the specifics of the task instance. This is because LLMs are known to pay greater attention to the beginning and end of the context window. Particularly, when giving background information, whatever most heavily will influence the specific actions the agent will take should be placed closer to the end of the prompt.
-- human_in_loop()
-    - becomes blocking for human input. Human can interject and this content will present forward guidance in the "function" output.
-    - implement the hook to human UI using whatever mechanism particular to your application.
-    - various reasons why model may choose to invoke: (a) sign-off at key points; (b) lacking confidence and need guidance on the task; (c) on the verge of RaiseException and seeking opinion of what to try before doing so.
-- may help to be slightly repetitive of system prompt elements in user prompt to get better adherence.
-- system prompts kept tiny and stable: agent’s role declaration, non‑negotiable rules/guardrails, output contract, meticulosity, verbosity/brevity, tool‑use policy (steer how often and when to use certain tools, beyond tool schema).
+- user prompt: (1) all the agent-specific context of the generic problem background (even if common to all instances this is still not system prompt), (2) the specific problem instance the agent is being invoked to do now.
+- may help to be slightly repetitive of system prompt elements in user prompt to get better adherence of critical instructions.
+- system prompts kept focused, relevant, small and stable: agent’s role declaration, generic task explanation, non‑negotiable rules/guardrails, output contract, meticulosity, verbosity/brevity, tool‑use policy (steer how often and when to use certain tools, beyond tool schema).
     - "you focus on performance optimization of the algorithm already select; do not propose new algorithms, just optimize impl using the one chosen."
     - "you must use tools to test performance and confirm speedups. You cannot just be speculative -- your results need to be backed up by numbers and you can admit lack of improvement."
-- user prompt: (1) all the agent-specific context of the generic problem background (even if common to all instances this is still not system prompt), (2) the specific problem instance the agent is being invoked to do now.
+- agents may use files for input(s)/output(s). Input filepaths would be given as args, and output filepaths may be returned (Write File tool used prior to returning).
+    - Allows the same intermediate output to be re-used by multiple Functions without needing to repeat tokens.
 
+## Misc
 
------
-
+* structured outputs are discouraged since LLMs are sophisticated enough to parse unstructured outputs from their sub-tasks. However, sometimes strict structured outputs are critical, and this can be enforced by defining `CodeFunction`s where the arguments are the schema and the Callable performs serialization and/or verification, depending on the reason for the structured output, and returns empty or provides a filepath with the serialized data, etc. You can leverage the framework's Exceptions Model to propagate an Exception if verification fails.
+* When authoring agents, place the common prompt before the specifics of the task instance. This is because LLMs are known to pay greater attention to the beginning and end of the context window. Particularly, when giving background information, whatever most heavily will influence the specific actions the agent will take should be placed closer to the end of the prompt.
+* `human_in_loop()`
+    - becomes blocking for human input. Human can interject and this content will present forward guidance in the "function" output.
+    - implement the hook to human UI using whatever mechanism particular to your application.
+    - various reasons why model may choose to invoke:
+        a. sign-off at key points
+        b. lacking confidence and need guidance on the task
+        c. on the verge of raise_exception() and seeking opinion of what to try before doing so.
 
 # Entities & Architecture
 
