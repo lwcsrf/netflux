@@ -11,9 +11,23 @@ Our goal is a framework that is:
 
 ---
 
-## Quick-start demos
+## Quick-Start Demos & Development
 
-Use any venv that satifies `requirements.txt` and then see `demos/README.md` to run any demo.
+To run the `demos/`, you will need the provider-specific dependencies installed.
+Once you make a venv, see `demos/README.md` to run any demo.
+
+```
+python -m venv .venv
+source .venv/bin/activate
+
+# Install the library in "editable" mode (`-e`), meaning your source code changes
+# are immediately reflected. It also installs the `test` and `all` dependency groups,
+# which include `pytest` and all the provider SDKs (Anthropic, Gemini, etc).
+pip install -e .[test,all]
+
+# Run all tests.
+pytest tests
+```
 
 ## The central idea: `Function`
 
