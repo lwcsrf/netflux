@@ -1,5 +1,4 @@
 import unittest
-from typing import Any, Dict
 
 from ..core import (
     AgentFunction,
@@ -12,8 +11,6 @@ from ..core import (
 )
 from ..providers import Provider
 from ..runtime import Runtime
-
-
 
 class _FakeAgentNode(AgentNode):
     """Minimal AgentNode for tests. Default run() is a no-op; tests can subclass/override."""

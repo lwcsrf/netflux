@@ -26,7 +26,7 @@ source .venv/bin/activate
 pip install -e .[test,all]
 
 # Run all tests.
-pytest tests
+pytest tests/ -v
 ```
 
 ## The central idea: `Function`
