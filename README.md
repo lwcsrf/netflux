@@ -105,6 +105,7 @@ find_bug_agent = AgentFunction(
         "Observed error: {error_message}\n---\n"
     ),
     # Here we can list any instances of `AgentFunction` or `CodeFunction`.
+    # Each callee's schematized entrypoint is automatically exposed to the agent as a tool/function.
     uses=[text_editor, repo_search, raise_exception],
     # Every LLM has types of tasks it is top-ranked for. Set a default or
     # set based on your availability constraints. Can override on each `ctx.invoke()`.
@@ -207,6 +208,8 @@ fix_bug_workflow = CodeFunction(
 ## `runtime`: definition and execution
 
 We model each `Function` invocation as a **task** executed by a **`Node`**.
+
+A `Node` represents the state and history of a call both **while it is executing** and **after it completes**.
 
 > We often use the terms "function invocation", "task", and `Node` interchangeably.
 
