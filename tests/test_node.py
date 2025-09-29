@@ -9,10 +9,6 @@ import unittest
 
 
 class TestNodeLifecycle(unittest.TestCase):
-    def test_node_start_transitions_state_and_spawns_thread_once(self):
-        """Create a CodeNode via Runtime.invoke; call node.start() twice; assert first call sets state Running and spawns a thread, second call is an Exception."""
-        pass
-
     def test_node_success_returns_outputs(self):
         """Invoke and then wait on a CodeFunction that definitely succeeds. For a success path: node.result() returns outputs."""
         pass
@@ -31,10 +27,7 @@ class TestNodeLifecycle(unittest.TestCase):
         pass
 
 
-class TestNodeViewStructure(unittest.TestCase):
-    def test_node_view_children_is_tuple_and_preserves_order(self):
-        """Build a parent with two sequential child invocations; fetch NodeView; assert children is a tuple and the order matches invocation order."""
-        pass
+
 
 
 if __name__ == "__main__":
