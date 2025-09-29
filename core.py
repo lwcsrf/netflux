@@ -487,11 +487,16 @@ class AgentNode(Node):
         fn: Function,
         inputs: Dict[str, Any],
         parent: Optional[Node],
+        client_factory: Callable[[], Any],
     ) -> None:
         super().__init__(ctx, id, fn, inputs, parent)
         assert isinstance(fn, AgentFunction), "AgentNode must wrap an AgentFunction"
         self.agent_fn: AgentFunction = fn
         self.transcript: List[TranscriptPart] = []
+
+        if not callable(client_factory):
+            raise TypeError("AgentNode requires a callable client_factory")
+        self._client_factory: Callable[[], Any] = client_factory
 
         # For each `Function` the agent may invoke, map from string tool names
         # (as will be referred to by model tool call responses) to the `Function`.

@@ -16,6 +16,7 @@ from ..core import (
     NodeView,
 )
 from ..runtime import Runtime
+from ..demos.auth_factory import CLIENT_FACTORIES
 
 # This test file is the demo file.
 DEMO_FILE_ABS_PATH: Optional[str] = os.path.abspath(__file__)
@@ -111,7 +112,7 @@ def main():
     print(f"File to analyze: {DEMO_FILE_ABS_PATH}")
 
     # Register all functions with the Runtime
-    runtime = Runtime(specs=[ViewFile, AgentA, Outer])
+    runtime = Runtime(specs=[ViewFile, AgentA, Outer], client_factories=CLIENT_FACTORIES)
 
     # Kick off the top-level task (Outer)
     ctx = runtime.get_ctx()
