@@ -66,9 +66,51 @@ Every `AgentFunction` specifies:
 * **How to inject specifics**—typically string substitution, but any deterministic transform is fine as long as args ⇒ concrete prompt is well‑defined.
 * **Short description** (purpose and arguments).
 * **Allowed `Function`s** it may call (task decomposition, sub‑agents, actuators i.e. leaf tools).
-*  Opt-in to the built‑in **`RaiseException`** function so the agent can proactively signal failure by raising an `AgentException`.
+* Opt-in to the built‑in **`RaiseException`** function so the agent can proactively signal failure by raising an `AgentException`.
 
 > **Design note:** *The agent’s logical reasoning replaces a function’s fixed code body. Otherwise, we treat agents and functions uniformly—which is the foundation of netflux.*
+
+### Example: `find_bug_agent`
+
+`find_bug_agent` is an instance of `AgentFunction` (notice that usually it is not even necessary to subtype `AgentFunction`). It is an agent that inspects one or more source files in a repository, given an error message, searches for likely root causes, and **writes a short report under `/tmp`**. It returns the **absolute path** to the report file it created.
+
+> This is an example of task decomposition: the same agent need not be concerned with both RCA'ing the bug and resolving it, in case either or both tasks require substantial effort. This minimizes the context rot and dilution that one sub-task would have on the other, much like how a human organization would compartmentalize or even delegate these tasks separately.
+
+It uses:
+
+* the built‑in `text_editor` tool to read/write files,
+* the built‑in `raise_exception` to fail honestly when appropriate.
+* a `repo_search` function (impl not shown for brevity),
+
+```python
+find_bug_agent = AgentFunction(
+    name="find_bug_agent",
+    desc="Inspects an error message (with as many details as possible e.g. stacktrace), "
+         "searches workspace for context, and authors an in-depth bug report. "
+         "Returns the absolute path to the report written under `/tmp`. "
+         "Raises if details are insufficient, has trouble exploring the workspace, or lacks confidence."
+    args=[
+        FunctionArg("root", str, "Absolute path to the project or a finer-scoped dir subtree."),
+        FunctionArg("error_message", str, "Observed error/stack trace or description of failing behavior."),
+    ],
+    system_prompt=(
+        "You are an extremely thorough bug investigator agent (non-conversational). "
+        "When invoked with an investigation, run autonomously for an extended period "
+        "to explore the project subtree provided, and use extreme critical thinking to "
+        # ... (mirror the intent of the `desc`; make sure your prompts are a superset)
+    ),
+    user_prompt_template=(
+        # User prompt is usually composed of the instance-specific details made from `args`.
+        "Target project subtree: {root}\n"
+        "Observed error: {error_message}\n---\n"
+    ),
+    # Here we can list any instances of `AgentFunction` or `CodeFunction`.
+    uses=[text_editor, repo_search, raise_exception],
+    # Every LLM has types of tasks it is top-ranked for. Set a default or
+    # set based on your availability constraints. Can override on each `ctx.invoke()`.
+    default_model=Provider.Gemini,
+)
+```
 
 ---
 
@@ -76,8 +118,82 @@ Every `AgentFunction` specifies:
 
 Many frameworks use the word *tool* for what we call **leaf `CodeFunction`s**: file viewers, string replacers, shell runners, etc. These are your lowest‑level building blocks. But higher‑level `CodeFunction`s are just as important:
 
-* **Deterministic orchestrators**: fixed logic that fans out work to one or more `AgentFunction`s (and, less commonly, to other `CodeFunction`s via the runtime).
-* **Decorators/wrappers around agents** that enhance behavior. The prime example is **`Ensemble`** (`func_lib/ensemble.py`), which launches multiple independent agent runs (optionally across providers) and then reconciles them.
+* **Deterministic orchestrators**: fixed logic that fans out work to one or more `AgentFunction`s (or to other `CodeFunction`s via direct call, or via the runtime just for observability).
+* **Decorators/wrappers around agents** that enhance behavior. The prime example is **`Ensemble`** (`func_lib/ensemble.py`): it decorates any `AgentFunction`; when invoked, it launches multiple independent agent runs (optionally across providers) and then forces a follow-up reconciliation of the alternative responses for enhanced results.
+
+### Example: `BugFixWorkflow` (a `CodeFunction` orchestrator)
+
+This orchestrator does three steps deterministically:
+
+1. Invoke **`find_bug_agent`** (wrapped in an **Ensemble**) to produce a report path under `/tmp`.
+2. Invoke **`fix_bug_agent`** to generate a **unified diff**.
+3. Use the built‑in **`apply_diff_patch`** agent to apply that diff.
+
+```python
+# Another agent: given the bug report path, produce a unified diff to fix it.
+fix_bug_agent = AgentFunction(
+    name="fix_bug_agent",
+    desc="Given a bug report and project (sub-)dir, emit a minimal unified diff (`git`-like) that fixes the issue.",
+    args=[
+        FunctionArg("root", str, "Absolute path to the project or a finer-scoped dir subtree."),
+        FunctionArg("bug_report", str, "Absolute path to the bug report."),
+    ],
+    system_prompt=(
+        # ...
+        # Author a prompt that clearly instructs the agent to **plan** a fix
+        # and consider alternatives, before proceeding to implement the fix.
+        # This usually leads to much better results on difficult problems.
+        # Emphasize: no workarounds, minimal changes but keeping cohesive architecture, etc.
+    ),
+    user_prompt_template=(
+        # ...
+    ),
+    uses=[text_editor, raise_exception],
+    default_model=Provider.Anthropic,
+)
+
+# Wrap `find_bug_agent` with an Ensemble-of-Answers for extra reliability.
+find_bug_ensemble = Ensemble(
+    agent=find_bug_agent,
+    instances={Provider.Anthropic: 2, Provider.Gemini: 1},
+    allow_fail={Provider.Anthropic: 1, Provider.Gemini: 0},
+)
+
+def _bugfix_workflow(ctx: RunContext, *, proj_root: str, error_msg: str) -> str:
+    # 1) Find the bug (ensembled)
+    report_node = ctx.invoke(find_bug_ensemble, {
+        "proj_root": proj_root,
+        "error_msg": error_msg,
+    })
+    report_path = report_node.result()  # path to report returned by the agent
+
+    # 2) Fix the bug -> unified diff
+    patch_node = ctx.invoke(bugfixer_agent, {
+        "bug_report": report_path,
+        "source_path": source_path,
+    })
+    diff_text = patch_node.result()
+
+    # 3) Apply the diff
+    apply_node = ctx.invoke(apply_diff_patch, {"diff_content": diff_text})
+    apply_result = apply_node.result()  # e.g. "Target successfully patched N hunks."
+
+    return f"{apply_result}\nReport: {report_path}"
+
+bugfix_workflow = CodeFunction(
+    name="bugfix_workflow",
+    desc="Find the bug (ensembled), generate a minimal diff, and apply it.",
+    args=[
+        FunctionArg("root", str, "Absolute path to the project or a finer-scoped dir subtree."),
+        FunctionArg("error_message", str, "Observed error (stack trace or message)."),
+    ],
+    callable=_bugfix_workflow,
+    # For `CodeFunction`s, the `uses` should still be populated because it
+    # helps enforce function hierarchy to prevent risk of agent causing
+    # infinite cycles or recursion runaway.
+    uses=[find_bug_ensemble, bugfixer_agent, apply_diff_patch],
+)
+```
 
 ---
 
@@ -99,6 +215,7 @@ A **tree of `Node`s** represents a top‑level task and all of its sub‑tasks. 
 At any point, if you snapshot the call hierarchy, it looks like a traditional **call stack**—except a frame may be an **agent** instead of a piece of deterministic code. Deeper frames tend to be **more specialized**, and at the bottom you’ll typically find **leaf `CodeFunction`s** (e.g., file IO, text replacement, running a shell command).
 
 > **Key perspectives**
+>
 > * **The logical reasoning of an agent replaces the fixed code logic of a function, but otherwise we treat them the same.**
 > * At any moment, a snapshot of the invocation tree reads like a **traditional call stack**—except that stack frames can be *agents* or *code*.
 > * Highly specialized agents often use only **leaf tools** (e.g., read/write files) or **no tools at all** (analysis‑only). Such agents appear **deeper** in the call stack.
@@ -177,15 +294,19 @@ Each agent instance **tracks token usage** over its lifetime (updated on every r
 
 ## A tiny end‑to‑end example
 
-Below is a minimal example that defines:
+Below we **reuse** the earlier definitions:
 
-1. a small **`CodeFunction`** (`verify_contains`) that uses the built‑in **TextEditor**,
-2. an **`AgentFunction`** (`edit_file_agent`) that uses both our `CodeFunction` and built‑ins (**ApplyDiffPatch**, **TextEditor**, **RaiseException**), and
-3. an **Ensemble** wrapper that runs multiple instances and reconciles the answer.
+* `find_bug_agent` (AgentFunction)
+* `bugfixer_agent` (AgentFunction)
+* `find_bug_ensemble` (CodeFunction decorator/wrapper)
+* `bugfix_workflow` (CodeFunction orchestrator)
+* built‑ins: `text_editor`, `apply_diff_patch`, `raise_exception`
+
+…and wire them up in a minimal end‑to‑end run. We also show a **simple watcher** using `NodeView` to print progress.
 
 ```python
 # --- Imports from netflux ---
-from netflux.core import CodeFunction, AgentFunction, FunctionArg, RunContext
+from netflux.core import NodeState
 from netflux.providers import Provider
 from netflux.runtime import Runtime
 
@@ -195,86 +316,62 @@ from netflux.func_lib.apply_diff import apply_diff_patch       # AgentFunction (
 from netflux.func_lib.raise_exception import raise_exception   # CodeFunction (to raise AgentException)
 from netflux.func_lib.ensemble import Ensemble                 # CodeFunction decorator
 
-# 1) Our CodeFunction: verify that a file contains a substring.
-def _verify_contains(ctx: RunContext, *, path: str, must_contain: str) -> str:
-    view = ctx.invoke(text_editor, {
-        "command": "view",
-        "path": path,
-    }).result()
-    if must_contain in view:
-        return "Verified."
-    raise ValueError(f"Expected text not found in {path!r}.")
+# Introduced earlier in the sections above (already defined):
+#   - repo_search (CodeFunction)
+#   - find_bug_agent (AgentFunction)
+#   - bugfixer_agent (AgentFunction)
+#   - find_bug_ensemble = Ensemble(agent=find_bug_agent, ...)
+#   - bugfix_workflow (CodeFunction orchestrator)
 
-verify_contains = CodeFunction(
-    name="verify_contains",
-    desc="Fail if the file does not contain the expected text.",
-    args=[
-        FunctionArg("path", str, "File to inspect"),
-        FunctionArg("must_contain", str, "Expected substring"),
-    ],
-    callable=_verify_contains,
-    # Because _verify_contains invokes another Function via ctx.invoke(...)
-    uses=[text_editor],
-)
+# Demo auth factories (reads api keys for Anthropic & Gemini from file).
+# Consumer must always specify the factory functions to create the LLM SDK clients
+# since this configures endpoint, authorization mechanism, etc.
+from netflux.demos.auth_factory import CLIENT_FACTORIES
 
-# 2) Our AgentFunction: plan a small edit, generate a unified diff, apply it, then verify.
-edit_file_agent = AgentFunction(
-    name="edit_file_agent",
-    desc="Plan and apply a small edit to a file using a unified diff, then verify the result.",
-    args=[
-        FunctionArg("path", str, "Target file"),
-        FunctionArg("edit_instructions", str, "What to change (natural language)"),
-        FunctionArg("must_contain", str, "Text that must appear after the edit"),
-    ],
-    system_prompt=(
-        "You are a precise code editor. Generate a minimal unified diff that implements the requested change. "
-        "Use tools instead of describing steps. Apply the diff, then verify the outcome."
-    ),
-    user_prompt_template=(
-        "Target file: {path}\n"
-        "Desired change: {edit_instructions}\n"
-        "Steps:\n"
-        "  1) If needed, inspect the file with text_editor.\n"
-        "  2) Produce a unified diff implementing the change.\n"
-        "  3) Call apply_diff_patch(diff_content=...) to apply it.\n"
-        "  4) Call verify_contains(path={path}, must_contain={must_contain}).\n"
-        "If verification fails, call raise_exception(msg=...)."
-    ),
-    uses=[text_editor, apply_diff_patch, verify_contains, raise_exception],
-)
-
-# 3) Ensemble: run multiple instances and reconcile the answer.
-edit_file_ensemble = Ensemble(
-    agent=edit_file_agent,
-    instances={Provider.Anthropic: 2, Provider.Gemini: 1},
-    allow_fail={Provider.Anthropic: 1, Provider.Gemini: 0},
-)
-```
-
-Wiring it up (top‑level task):
-
-```python
-from netflux.demos.auth_factory import CLIENT_FACTORIES  # reads API keys for the demos
-
+# Register everything we intend to use.
 runtime = Runtime(
-    specs=[edit_file_agent, verify_contains, text_editor, apply_diff_patch, raise_exception, edit_file_ensemble],
+    specs=[
+        # Our app's custom building blocks:
+        repo_search, find_bug_agent, bugfixer_agent, find_bug_ensemble, bugfix_workflow,
+        # Built-ins we depend on:
+        text_editor, apply_diff_patch, raise_exception
+    ],
     client_factories=CLIENT_FACTORIES,
 )
 
-node = runtime.get_ctx().invoke(
-    edit_file_ensemble,
-    {"path": "core.py", "edit_instructions": "Ensure the file ends with a newline.", "must_contain": "\n"}
+# Invoke the top-level `CodeFunction` task.
+# We also could directly invoke any of the agents if we wanted.
+root = runtime.get_ctx().invoke(
+    bugfix_workflow,
+    {"source_path": "/repos/my_repo/sub/problem_library", "error_msg": "..."}
 )
-print(node.result())   # blocks until Success or Error (exceptions bubble like normal)
+
+# Optional: simple watcher to show progress (consistent snapshots via NodeView).
+prev = 0
+while True:
+    view = root.watch(as_of_seq=prev)
+    prev = view.update_seqnum
+
+    print(f"[{view.update_seqnum}] node={view.id} fn={view.fn.name} state={view.state.name}")
+    for child in view.children:
+        print(f"  └─ child id={child.id} fn={child.fn.name} state={child.state.name}")
+
+    if view.state in (NodeState.Success, NodeState.Error):
+        break
+
+# Finally, print the result or surface the exception.
+try:
+    print(root.result())  # blocks until done; returns output or raises the exception.
+except Exception as e:
+    print(f"Workflow failed: {e}")
 ```
 
-This tiny example shows:
+This refined example shows:
 
-* **agent → code** (the agent calls `verify_contains` and `text_editor`),
-* **agent → agent** (it can delegate to other agents, e.g., your own),
-* **agent → built‑in agent** (`apply_diff_patch`),
-* **code → code** (`verify_contains` calls `text_editor` through the runtime),
-* and **Ensemble** as a `CodeFunction` that decorates an agent to run in parallel and reconcile.
+* **agent → code** (`find_bug_agent` and `fix_bug_agent` use `text_editor`, `repo_search`, and `raise_exception`)
+* **code → agent** (the `bugfix_workflow` orchestrator calls both agents and the built-in `apply_diff_patch`)
+* **decorator CodeFunction** (`Ensemble`) wrapping an agent to improve reliability
+* **watcher loop** using `NodeView` to print **consistent** progress updates
 
 ---
 
