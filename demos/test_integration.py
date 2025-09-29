@@ -16,7 +16,7 @@ from ..core import (
     NodeView,
 )
 from ..runtime import Runtime
-from ..demos.auth_factory import CLIENT_FACTORIES
+from .auth_factory import CLIENT_FACTORIES
 
 # This test file is the demo file.
 DEMO_FILE_ABS_PATH: Optional[str] = os.path.abspath(__file__)
