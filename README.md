@@ -1,21 +1,30 @@
-**netflux** is a minimalist Python framework for authoring custom agentic applications. Its core idea is simple but powerful: **treat agents exactly like functions** in an imperative program — with **inputs**, **outputs**, **composition** (by calling other functions), and **side‑effects** on stateful structures.
+## netflux
 
-Our goal is a framework that is semantically flexible enough to express both **deterministic workflows** and **dynamic, open‑ended problem solvers**. We build on **hierarchical task decomposition** so higher‑level behavior is assembled from focused, reusable building blocks, just like well‑factored libraries and utility functions in traditional programming.
+**netflux** is a minimalist Python framework for authoring custom agentic applications. Its core idea is simple but powerful: **treat agents exactly like functions** — with **inputs**, **outputs**, **composition** (by calling other functions), and **side‑effects** on stateful structures.
 
-* **One mental model:** Agents are first‑class functions. They take typed arguments, return results, can call other functions, and leave a trace of their work.
-* **Two usage styles, one framework:** Build **deterministic workflows** *and* **open‑ended problem solvers** with the same abstractions.
-* **Task Decomposition by design:** Compose complex work from cohesive, reusable building blocks—mirroring how we structure libraries and helper functions in traditional programming. This hierarchy is key to building reliable agents with current LLMs.
+Our goal is a framework that is:
+
+* semantically flexible enough to express **workflows** or **dynamic, open‑ended problem solvers**, or any hybrid of the two.
+* **Agents are first‑class functions.** They take typed arguments, return results, can call other functions, and leave a trace of their work.
+* **Task Decomposition by design:** Compose higher-level behavior from cohesive, reusable building blocks—mirroring how we structure libraries and helper functions in traditional programming. This hierarchy is key to building reliable agents with current LLM limitations.
+* **`Exception`s for agents**: let agents raise or bubble up exceptions, or attempt to handle and recover, just like traditional code.
 
 ---
+
+## Quick-start demos
+
+Use any venv that satifies `requirements.txt` and then see `demos/README.md` to run any demo.
 
 ## The central idea: `Function`
 
 Everything in netflux is a `Function`. There are two concrete kinds:
 
 * **`CodeFunction`** — Deterministic Python code (your callable) with a declared signature. Think basic utilities, orchestrators, and agent decorators.
-  *Example utility:* `TextEditor` (`func_lib/text_editor.py`) provides high‑leverage file viewing and editing commands.
+
+  *Example utility:* `TextEditor` (`func_lib/text_editor.py`) provides file viewing and editing commands.
 
 * **`AgentFunction`** — An LLM‑backed function with a schema (arguments), a system prompt, and an initial user prompt template. Under the hood it runs an **agent loop** and can call other Functions in-between thinking. We casually say *“Agent”* to mean an instance of `AgentFunction`.
+
   *Example agent:* `ApplyDiffPatch` (`func_lib/apply_diff.py`) applies unified diff patches (including diffs fenced in markdown) to files. It focuses on **applying** a patch — tolerating small whitespace/indentation drift and other minor fuzz — while keeping **patch creation** as a separate concern. This separation lets you review diffs or delegate patch generation to a different agent, avoiding context window dilution for the patch producer (an example of what we mean by "task decomposition").
 
 Because both kinds are just `Function`s, **any Function can call any Function**:
@@ -27,7 +36,7 @@ Because both kinds are just `Function`s, **any Function can call any Function**:
 
 Calling an agent is simply **invoking a function** whose implementation happens to be an LLM reasoning-with-tools loop.
 
-> **On “tools”.** When we say an agent “invokes tools,” that’s physically the LLM issuing tool calls (Anthropic calls it "tools", Gemini calls it "functions"); *semantically* in netflux, those tools are just `Function`s made available to the agent. They may map to `AgentFunction`s or `CodeFunction`s.
+> When we say an agent “invokes tools,” that’s physically the LLM issuing tool calls (Anthropic calls it "tools", Gemini calls it "functions"); *semantically* in netflux, those tools are just `Function`s made available to the agent. They may map to `AgentFunction`s or `CodeFunction`s.
 
 > **Why treat agents like functions?**
 > Because then composition is uniform: **code can call code or agents; agents can call code or other agents**. Classic programming already covers “code → code”; netflux enables the other three combinations in a principled way that looks consistent.
@@ -60,21 +69,21 @@ Long‑running, workflow‑like agents typically act as **orchestrators**, break
 
 Every `AgentFunction` specifies:
 
-* **Invocation schema** (typed args) so it can be called like a regular function.
-* **System prompt** (may include string substitutions from args).
-* **First user turn** (templated; substitutions using the input args).
+* **Invocation schema**: typed args, so it can be called like a regular function. Seen by other agents.
+* **Short description**: purpose and usage explanation. Seen by other agents.
+* **System prompt** (usually static).
+* **First (and only) user turn** (templated; substitutions using the input args).
 * **How to inject specifics**—typically string substitution, but any deterministic transform is fine as long as args ⇒ concrete prompt is well‑defined.
-* **Short description** (purpose and arguments).
 * **Allowed `Function`s** it may call (task decomposition, sub‑agents, actuators i.e. leaf tools).
 * Opt-in to the built‑in **`RaiseException`** function so the agent can proactively signal failure by raising an `AgentException`.
 
-> **Design note:** *The agent’s logical reasoning replaces a function’s fixed code body. Otherwise, we treat agents and functions uniformly—which is the foundation of netflux.*
+> **Design note:** *The agent’s logical reasoning replaces a function’s fixed code body. Otherwise, we treat agents and code functions uniformly—which is the foundation of netflux.*
 
 ### Example: `find_bug_agent`
 
 `find_bug_agent` is an instance of `AgentFunction` (notice that usually it is not even necessary to subtype `AgentFunction`). It is an agent that inspects one or more source files in a repository, given an error message, searches for likely root causes, and **writes a short report under `/tmp`**. It returns the **absolute path** to the report file it created.
 
-> This is an example of task decomposition: the same agent need not be concerned with both RCA'ing the bug and resolving it, in case either or both tasks require substantial effort. This minimizes the context rot and dilution that one sub-task would have on the other, much like how a human organization would compartmentalize or even delegate these tasks separately.
+> This is an example of task decomposition: the same agent need not be concerned with both RCA'ing the bug and resolving it, in case either or both tasks require substantial effort. This minimizes the context rot and dilution that one sub-task would have on the other, much like how a human organization may delegate these tasks separately.
 
 It uses:
 
@@ -124,10 +133,13 @@ Many frameworks use the word *tool* for what we call **leaf `CodeFunction`s**: f
 
 ### Example: `fix_bug_workflow` (a `CodeFunction` orchestrator)
 
-This orchestrator does three steps deterministically:
+This orchestrator does two steps determinstically in order:
 
 1. Invoke **`find_bug_agent`** (wrapped in an **Ensemble**) to produce a report path under `/tmp`.
 2. Invoke **`bugfixer_agent`** to generate a **unified diff**.
+
+But the second agent does another step one or more times:
+
 3. Agent→agent: have `bugfixer_agent` write the diff to a file and invoke the built‑in **`apply_diff_patch`** agent itself to apply it. If `apply_diff_patch` raises, `bugfixer_agent` sees the exception, can revise the diff, and retry.
 
 First we define another agent needed, the `bugfixer_agent`, and then we complete the workflow.
