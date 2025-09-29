@@ -121,73 +121,80 @@ Many frameworks use the word *tool* for what we call **leaf `CodeFunction`s**: f
 * **Deterministic orchestrators**: fixed logic that fans out work to one or more `AgentFunction`s (or to other `CodeFunction`s via direct call, or via the runtime just for observability).
 * **Decorators/wrappers around agents** that enhance behavior. The prime example is **`Ensemble`** (`func_lib/ensemble.py`): it decorates any `AgentFunction`; when invoked, it launches multiple independent agent runs (optionally across providers) and then forces a follow-up reconciliation of the alternative responses for enhanced results.
 
-### Example: `BugFixWorkflow` (a `CodeFunction` orchestrator)
+### Example: `fix_bug_workflow` (a `CodeFunction` orchestrator)
 
 This orchestrator does three steps deterministically:
 
 1. Invoke **`find_bug_agent`** (wrapped in an **Ensemble**) to produce a report path under `/tmp`.
-2. Invoke **`fix_bug_agent`** to generate a **unified diff**.
-3. Use the built‑in **`apply_diff_patch`** agent to apply that diff.
+2. Invoke **`bugfixer_agent`** to generate a **unified diff**.
+3. Agent→agent: have `bugfixer_agent` write the diff to a file and invoke the built‑in **`apply_diff_patch`** agent itself to apply it. If `apply_diff_patch` raises, `bugfixer_agent` sees the exception, can revise the diff, and retry.
+
+First we define another agent needed, the `bugfixer_agent`, and then we complete the workflow.
 
 ```python
-# Another agent: given the bug report path, produce a unified diff to fix it.
-fix_bug_agent = AgentFunction(
-    name="fix_bug_agent",
-    desc="Given a bug report and project (sub-)dir, emit a minimal unified diff (`git`-like) that fixes the issue.",
+bugfixer_agent = AgentFunction(
+    name="bugfixer_agent",
+    desc=(
+        "Given a bug report and project (sub-)dir, emit a minimal unified diff (`git`-like) that fixes the issue, "
+        "save it to a file, and apply it by calling the built-in `apply_diff_patch` agent."
+    ),
     args=[
         FunctionArg("root", str, "Absolute path to the project or a finer-scoped dir subtree."),
         FunctionArg("bug_report", str, "Absolute path to the bug report."),
     ],
     system_prompt=(
-        # ...
         # Author a prompt that clearly instructs the agent to **plan** a fix
         # and consider alternatives, before proceeding to implement the fix.
         # This usually leads to much better results on difficult problems.
         # Emphasize: no workarounds, minimal changes but keeping cohesive architecture, etc.
+        # Then instruct to use the `apply_diff_patch` as sub-agent to apply the diff.
+        # This lets this agent focus on the implementation instead of getting bogged down
+        # by file editor calls and without needing whitespace perfection (sub-agent handles well).
+        # If `apply_diff_patch` fails, this agent can re-try.
     ),
     user_prompt_template=(
-        # ...
+        "Target project subtree: {root}\n"
+        "Bug report path: {bug_report}\n---\n"
     ),
-    uses=[text_editor, raise_exception],
+    uses=[text_editor, apply_diff_patch, raise_exception],
     default_model=Provider.Anthropic,
 )
 
 # Wrap `find_bug_agent` with an Ensemble-of-Answers for extra reliability.
 find_bug_ensemble = Ensemble(
     agent=find_bug_agent,
-    instances={Provider.Anthropic: 2, Provider.Gemini: 1},
-    allow_fail={Provider.Anthropic: 1, Provider.Gemini: 0},
+    instances={Provider.Anthropic: 1, Provider.Gemini: 3},
+    allow_fail={Provider.Anthropic: 0, Provider.Gemini: 1},
 )
 
-def _bugfix_workflow(ctx: RunContext, *, proj_root: str, error_msg: str) -> str:
+def _fix_bug_workflow(ctx: RunContext, *, root: str, error_message: str) -> str:
     # 1) Find the bug (ensembled)
     report_node = ctx.invoke(find_bug_ensemble, {
-        "proj_root": proj_root,
-        "error_msg": error_msg,
+        "root": root,
+        "error_message": error_message,
     })
     report_path = report_node.result()  # path to report returned by the agent
 
-    # 2) Fix the bug -> unified diff
-    patch_node = ctx.invoke(bugfixer_agent, {
+    # 2) Fix the bug: generate a unified diff, write it to a file, and apply it by invoking `apply_diff_patch`.
+    fix_node = ctx.invoke(bugfixer_agent, {
+        "root": root,
         "bug_report": report_path,
-        "source_path": source_path,
     })
-    diff_text = patch_node.result()
+    summary = fix_node.result()  # e.g. "Target successfully patched N hunks." (and/or patch path)
 
-    # 3) Apply the diff
-    apply_node = ctx.invoke(apply_diff_patch, {"diff_content": diff_text})
-    apply_result = apply_node.result()  # e.g. "Target successfully patched N hunks."
+    return f"{summary}\nReport: {report_path}"
 
-    return f"{apply_result}\nReport: {report_path}"
+# `CodeFunction`s are often just defined as instances, but sometimes it is convenient to define
+# them as subclasses of `CodeFunction` (see `func_lib/text_editor.py` example).
 
-bugfix_workflow = CodeFunction(
-    name="bugfix_workflow",
+fix_bug_workflow = CodeFunction(
+    name="fix_bug_workflow",
     desc="Find the bug (ensembled), generate a minimal diff, and apply it.",
     args=[
         FunctionArg("root", str, "Absolute path to the project or a finer-scoped dir subtree."),
         FunctionArg("error_message", str, "Observed error (stack trace or message)."),
     ],
-    callable=_bugfix_workflow,
+    callable=_fix_bug_workflow,
     # For `CodeFunction`s, the `uses` should still be populated because it
     # helps enforce function hierarchy to prevent risk of agent causing
     # infinite cycles or recursion runaway.
@@ -298,8 +305,8 @@ Below we **reuse** the earlier definitions:
 
 * `find_bug_agent` (AgentFunction)
 * `bugfixer_agent` (AgentFunction)
-* `find_bug_ensemble` (CodeFunction decorator/wrapper)
-* `bugfix_workflow` (CodeFunction orchestrator)
+* `find_bug_ensemble` (CodeFunction as decorator/wrapper around AgentFunction)
+* `fix_bug_workflow` (CodeFunction as simple static workflow orchestrator)
 * built‑ins: `text_editor`, `apply_diff_patch`, `raise_exception`
 
 …and wire them up in a minimal end‑to‑end run. We also show a **simple watcher** using `NodeView` to print progress.
@@ -321,7 +328,7 @@ from netflux.func_lib.ensemble import Ensemble                 # CodeFunction de
 #   - find_bug_agent (AgentFunction)
 #   - bugfixer_agent (AgentFunction)
 #   - find_bug_ensemble = Ensemble(agent=find_bug_agent, ...)
-#   - bugfix_workflow (CodeFunction orchestrator)
+#   - fix_bug_workflow (CodeFunction orchestrator)
 
 # Demo auth factories (reads api keys for Anthropic & Gemini from file).
 # Consumer must always specify the factory functions to create the LLM SDK clients
@@ -332,7 +339,7 @@ from netflux.demos.auth_factory import CLIENT_FACTORIES
 runtime = Runtime(
     specs=[
         # Our app's custom building blocks:
-        repo_search, find_bug_agent, bugfixer_agent, find_bug_ensemble, bugfix_workflow,
+        repo_search, find_bug_agent, bugfixer_agent, find_bug_ensemble, fix_bug_workflow,
         # Built-ins we depend on:
         text_editor, apply_diff_patch, raise_exception
     ],
@@ -342,8 +349,8 @@ runtime = Runtime(
 # Invoke the top-level `CodeFunction` task.
 # We also could directly invoke any of the agents if we wanted.
 root = runtime.get_ctx().invoke(
-    bugfix_workflow,
-    {"source_path": "/repos/my_repo/sub/problem_library", "error_msg": "..."}
+    fix_bug_workflow,
+    {"root": "/repos/my_repo/sub/problem_library", "error_message": "..."}
 )
 
 # Optional: simple watcher to show progress (consistent snapshots via NodeView).
@@ -369,7 +376,8 @@ except Exception as e:
 This refined example shows:
 
 * **agent → code** (`find_bug_agent` and `fix_bug_agent` use `text_editor`, `repo_search`, and `raise_exception`)
-* **code → agent** (the `bugfix_workflow` orchestrator calls both agents and the built-in `apply_diff_patch`)
+* **code → agent** (the `fix_bug_workflow` orchestrator calls both agents and the built-in `apply_diff_patch`)
+* **agent → agent** (`fix_bug_agent` invoking `apply_diff_patch` one or more times)
 * **decorator CodeFunction** (`Ensemble`) wrapping an agent to improve reliability
 * **watcher loop** using `NodeView` to print **consistent** progress updates
 
@@ -399,6 +407,8 @@ This refined example shows:
         a. sign-off at key points
         b. lacking confidence and need guidance on the task
         c. on the verge of raise_exception() and seeking opinion of what to try before doing so.
+
+---
 
 # Entities & Architecture
 
@@ -659,3 +669,5 @@ This is a bucket list of nice-to-haves.
     * Ensure each `Function` has legal references to other `Function`s.
     * Reject if not a DAG.
     * Reject if function type annotations do not match the spec in `CodeFunction`.
+
+---
