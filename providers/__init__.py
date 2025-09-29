@@ -16,12 +16,13 @@ ModelNames: Dict[Provider, str] = {
 }
 
 def get_AgentNode_impl(provider: Provider) -> type:
-    from .anthropic import AnthropicAgentNode
-    from .gemini import GeminiAgentNode
-
+    # Only import the specific AgentNode subtype when needed
+    # to avoid unnecessary dependencies by apps that don't use all providers.
     if provider == Provider.Anthropic:
+        from .anthropic import AnthropicAgentNode
         return AnthropicAgentNode
     elif provider == Provider.Gemini:
+        from .gemini import GeminiAgentNode
         return GeminiAgentNode
     elif provider == Provider.OpenAI:
         raise NotImplementedError("todo: develop the OpenAIAgentNode subtype.")
