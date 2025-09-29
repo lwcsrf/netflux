@@ -3,7 +3,7 @@ from .bash import bash
 from .raise_exception import raise_exception
 from .text_editor import text_editor
 
-ApplyDiffPatch = AgentFunction(
+apply_diff_patch = AgentFunction(
     name="apply_diff_patch",
     desc=("Apply unified diff patches (git-style) to one or more text files. "
           "Input may be either:\n"
