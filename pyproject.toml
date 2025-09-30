@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netflux"
+version = "0.1.0"
+maintainers = [
+  { name="LW Computational Science Research Foundation" },
+]
+description = "Framework for authoring custom agentic applications, treating agents as first-class functions."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "overrides",
+]
+
+[project.optional-dependencies]
+# For developers running unit tests
+test = [
+    "pytest",
+]
+
+# Provider-specific dependencies
+anthropic = ["anthropic>=0.60.0, <1.0.0"]
+gemini = ["google-genai>=1.25.0, <2.0.0"]
+openai = ["openai>=1.109.1, <2.0.0"]
+xai = ["xai-sdk>=1.2.0, <2.0.0"]
+
+# A convenience group to install all provider clients
+# if running the demos or doing E2E integration tests.
+all = [
+    "netflux[anthropic]",
+    "netflux[gemini]",
+    "netflux[openai]",
+    "netflux[xai]",
+]
+
+[tool.setuptools]
+packages = ["netflux"]
+
+[tool.setuptools.package-dir]
+netflux = "."
