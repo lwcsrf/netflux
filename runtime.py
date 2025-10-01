@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import logging
 import time
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Union
 import multiprocessing as mp
 from multiprocessing import Lock
 from multiprocessing.synchronize import Event, Condition
@@ -243,7 +243,7 @@ class Runtime:
 
     def watch(
         self,
-        node: Node | int,
+        node: Union[Node, int],
         as_of_seq: int = 0,
         *,
         timeout: Optional[float] = None,
@@ -283,7 +283,7 @@ class Runtime:
 
             return observable.view
 
-    def _resolve_node(self, node: Node | int) -> int:
+    def _resolve_node(self, node: Union[Node, int]) -> int:
         if isinstance(node, Node):
             return node.id
         return node

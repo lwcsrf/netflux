@@ -3,7 +3,7 @@ import queue
 import threading
 import time
 import unittest
-from typing import Any, Iterable, List
+from typing import Any, Iterable, List, Optional, Union
 from unittest.mock import patch
 import multiprocessing as mp
 from multiprocessing.synchronize import Event
@@ -26,8 +26,8 @@ from ..core import (
 from ..providers import Provider
 
 
-def _make_code_callable(result: Any = None, *, start_event: threading.Event | None = None,
-                        proceed_event: threading.Event | None = None) -> Any:
+def _make_code_callable(result: Any = None, *, start_event: Optional[threading.Event] = None,
+                        proceed_event: Optional[threading.Event] = None) -> Any:
     """Factory for deterministic CodeFunction callables used in tests."""
 
     def _callable(ctx: RunContext) -> Any:
@@ -41,7 +41,7 @@ def _make_code_callable(result: Any = None, *, start_event: threading.Event | No
     return _callable
 
 
-def _make_code_function(name: str, *, callable=None, uses: Iterable[Function] | None = None) -> CodeFunction:
+def _make_code_function(name: str, *, callable=None, uses: Optional[Iterable[Function]] = None) -> CodeFunction:
     if callable is None:
         callable = _make_code_callable()
     return CodeFunction(
@@ -53,7 +53,7 @@ def _make_code_function(name: str, *, callable=None, uses: Iterable[Function] | 
     )
 
 
-def _make_agent_function(name: str, *, uses: Iterable[Function] | None = None) -> AgentFunction:
+def _make_agent_function(name: str, *, uses: Optional[Iterable[Function]] = None) -> AgentFunction:
     return AgentFunction(
         name=name,
         desc=f"agent fn {name}",
@@ -81,7 +81,7 @@ class DummyNode(Node):
         id: int,
         fn: Function,
         inputs: dict[str, Any],
-        parent: Node | None,
+        parent: Optional[Node],
         cancel_event=None,
     ) -> None:
         super().__init__(ctx, id, fn, inputs, parent, cancel_event)
@@ -185,7 +185,7 @@ class TestRuntimeInvocation(unittest.TestCase):
             return factory_result
 
         class FakeAgentNode(AgentNode):
-            last_client: object | None = None
+            last_client: Optional[object] = None
 
             def __init__(
                 self,
@@ -193,7 +193,7 @@ class TestRuntimeInvocation(unittest.TestCase):
                 id: int,
                 fn: Function,
                 inputs: dict[str, Any],
-                parent: Node | None,
+                parent: Optional[Node],
                 cancel_event=None,
                 client_factory=None,
             ) -> None:
@@ -280,7 +280,7 @@ class TestRuntimeInvocation(unittest.TestCase):
 
     def test_invoke_propagates_cancel_event_to_children(self) -> None:
         cancel_event = mp.Event()
-        observed: List[Event | None] = []
+        observed: List[Optional[Event]] = []
 
         def child_callable(ctx: RunContext) -> str:
             observed.append(ctx.cancel_event)
@@ -310,7 +310,7 @@ class TestRuntimeInvocation(unittest.TestCase):
     def test_invoke_allows_cancel_event_override(self) -> None:
         parent_event = mp.Event()
         override_event = mp.Event()
-        observed_child: List[Event | None] = []
+        observed_child: List[Optional[Event]] = []
 
         def child_callable(ctx: RunContext) -> str:
             observed_child.append(ctx.cancel_event)
