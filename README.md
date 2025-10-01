@@ -1,9 +1,11 @@
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Tests](https://github.com/lwcsrf/netflux/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/lwcsrf/netflux/actions/workflows/tests.yml)
+
 <p align="center">
   <img src="assets/banner.png" alt="netflux banner" width="500">
 </p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://github.com/lwcsrf/netflux/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/lwcsrf/netflux/actions/workflows/tests.yml)
 
 **netflux** is a minimalist Python framework for authoring custom agentic applications. Its core idea is simple but powerful: **treat agents exactly like functions** — with **inputs**, **outputs**, **composition** (by calling other functions), and **side‑effects** on stateful structures.
 
