@@ -128,7 +128,8 @@ def main():
         print(str(output))
 
     print("\n=== Execution Tree ===")
-    latest: NodeView = runtime.watch(root)
+    latest = runtime.watch(root)
+    assert latest
     pretty_tree(latest)
 
 if __name__ == "__main__":

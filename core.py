@@ -205,13 +205,13 @@ class AgentFunction(Function):
         args: Sequence[FunctionArg],
         system_prompt: str,
         user_prompt_template: str,
-        uses: Sequence[Function] | None = None,
+        uses: Sequence[Function] = (),
         default_model: Provider = Provider.Anthropic,
     ) -> None:
         super().__init__(name, desc, args)
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
-        self.uses_funcs: List[Function] = list(uses or [])
+        self.uses_funcs: List[Function] = list(uses)
         self.default_model = default_model
 
         # Check if any Functions have dup names.
@@ -232,11 +232,11 @@ class CodeFunction(Function):
         desc: str,
         args: Sequence[FunctionArg],
         callable: Callable[..., Any],
-        uses: Sequence[Function] | None = None,
+        uses: Sequence[Function] = (),
     ) -> None:
         super().__init__(name, desc, args)
         self.callable = callable
-        self._uses: List[Function] = list(uses or [])
+        self._uses: List[Function] = list(uses)
         self._validate_callable_signature()
 
         # Check if any Functions have duplicate names.

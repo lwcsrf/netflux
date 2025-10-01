@@ -102,6 +102,8 @@ class TestNodeLifecycle(unittest.TestCase):
         node = runtime.invoke(None, fn, inputs={})
 
         first_view = node.watch(as_of_seq=0)
+        self.assertIsNotNone(first_view)
+        assert first_view is not None  # type narrowing
         first_seq = first_view.update_seqnum
         self.assertGreater(first_seq, 0)
         self.assertIn(first_view.state, {NodeState.Waiting, NodeState.Running})
@@ -109,6 +111,8 @@ class TestNodeLifecycle(unittest.TestCase):
         release.set()
 
         final_view = node.watch(as_of_seq=first_seq)
+        self.assertIsNotNone(final_view)
+        assert final_view is not None  # type narrowing
         self.assertGreater(final_view.update_seqnum, first_seq)
         self.assertEqual(final_view.state, NodeState.Success)
         self.assertEqual(final_view.outputs, "final")

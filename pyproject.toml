@@ -10,8 +10,8 @@ maintainers = [
 ]
 description = "Framework for authoring custom agentic applications, treating agents as first-class functions."
 readme = "README.md"
-license = "MIT"
-requires-python = ">=3.8"
+license = {text = "MIT"}
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
