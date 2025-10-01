@@ -493,6 +493,9 @@ def monitor_with_nodeview(root: core.Node) -> None:
         while not root.is_done:
             # Watch for updates using NodeView
             view = root.watch(as_of_seq=as_of_seq+1)
+            if not view:
+                # Timeout occurred, continue waiting
+                continue
             as_of_seq = view.update_seqnum
 
             # Compute depths and process the entire tree
@@ -504,6 +507,7 @@ def monitor_with_nodeview(root: core.Node) -> None:
 
     # Final snapshot after completion
     final_view = root.watch(as_of_seq=as_of_seq+1)
+    assert final_view
     depths = compute_depths_from_view(final_view)
     trace("NodeView Monitor: root completed, final snapshot:")
 

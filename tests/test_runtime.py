@@ -385,6 +385,8 @@ class TestRuntimeObservability(unittest.TestCase):
         runtime = Runtime([fn], client_factories={})
         node = runtime.invoke(None, fn, {})
         first_view = node.watch()
+        self.assertIsNotNone(first_view)
+        assert first_view is not None  # type narrowing
         self.assertEqual(first_view.state, NodeState.Running)
 
         results: queue.Queue[NodeView] = queue.Queue()
@@ -393,6 +395,8 @@ class TestRuntimeObservability(unittest.TestCase):
         def watcher() -> None:
             watcher_started.set()
             view = runtime.watch(node, as_of_seq=first_view.update_seqnum)
+            self.assertIsNotNone(view)
+            assert view is not None  # type narrowing
             results.put(view)
 
         thread = threading.Thread(target=watcher, daemon=True)
@@ -429,6 +433,8 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         def watcher() -> None:
             watcher_started.set()
             view = runtime.watch(node.id, as_of_seq=initial_view.update_seqnum)
+            self.assertIsNotNone(view)
+            assert view is not None  # type narrowing
             results.put(view)
 
         thread = threading.Thread(target=watcher, daemon=True)
@@ -524,6 +530,8 @@ class TestRuntimeWatchTimeout(unittest.TestCase):
         node = runtime.invoke(None, fn, {})
 
         first_view = node.watch()
+        self.assertIsNotNone(first_view)
+        assert first_view is not None  # type narrowing
         self.assertIn(first_view.state, {NodeState.Running, NodeState.Waiting})
 
         results: queue.Queue[Any] = queue.Queue()
@@ -553,6 +561,8 @@ class TestRuntimeWatchTimeout(unittest.TestCase):
         node = runtime.invoke(None, fn, {})
 
         first_view = node.watch()
+        self.assertIsNotNone(first_view)
+        assert first_view is not None  # type narrowing
 
         # Zero-timeout behaves like a non-blocking poll: no update => None
         res_none = node.watch(as_of_seq=first_view.update_seqnum, timeout=0)

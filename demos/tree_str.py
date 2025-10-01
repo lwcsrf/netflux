@@ -146,6 +146,9 @@ def start_tree_str_view(
         try:
             while not cancel_event.is_set():
                 view = node.watch(as_of_seq=prev)
+                if view is None:
+                    # Timeout occurred, continue waiting
+                    continue
                 prev = view.update_seqnum
                 # replace any stale snapshot; latest wins
                 try:
