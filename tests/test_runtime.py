@@ -512,6 +512,62 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         self.assertGreater(child_in_parent.update_seqnum, child_view_before.update_seqnum)
 
 
+class TestRuntimeWatchTimeout(unittest.TestCase):
+    def test_watch_timeout_returns_none_without_update(self) -> None:
+        start_event = threading.Event()
+        proceed_event = threading.Event()
+        fn = _make_code_function(
+            "watch_timeout_none",
+            callable=_make_code_callable("done", start_event=start_event, proceed_event=proceed_event),
+        )
+        runtime = Runtime([fn], client_factories={})
+        node = runtime.invoke(None, fn, {})
+
+        first_view = node.watch()
+        self.assertIn(first_view.state, {NodeState.Running, NodeState.Waiting})
+
+        results: queue.Queue[Any] = queue.Queue()
+
+        def watcher() -> None:
+            results.put(runtime.watch(node, as_of_seq=first_view.update_seqnum, timeout=0.05))
+
+        t = threading.Thread(target=watcher, daemon=True)
+        t.start()
+        t.join(timeout=1)
+        self.assertFalse(t.is_alive())
+        res = results.get(timeout=1)
+        self.assertIsNone(res)
+
+        # Cleanup
+        proceed_event.set()
+        node.result()
+
+    def test_watch_timeout_zero_polling_and_fast_path(self) -> None:
+        start_event = threading.Event()
+        proceed_event = threading.Event()
+        fn = _make_code_function(
+            "watch_timeout_zero",
+            callable=_make_code_callable("done", start_event=start_event, proceed_event=proceed_event),
+        )
+        runtime = Runtime([fn], client_factories={})
+        node = runtime.invoke(None, fn, {})
+
+        first_view = node.watch()
+
+        # Zero-timeout behaves like a non-blocking poll: no update => None
+        res_none = node.watch(as_of_seq=first_view.update_seqnum, timeout=0)
+        self.assertIsNone(res_none)
+
+        # Now complete the node to create a newer snapshot
+        proceed_event.set()
+        node.result()
+
+        # Zero-timeout should return immediately with the newer snapshot (fast path)
+        res_now = node.watch(as_of_seq=first_view.update_seqnum, timeout=0)
+        self.assertIsNotNone(res_now)
+        assert res_now is not None  # satisfy type checkers
+        self.assertEqual(res_now.state, NodeState.Success)
+
 class TestNodeViewStructure(unittest.TestCase):
     def test_node_view_children_is_tuple_and_preserves_order(self) -> None:
         invocation_order: List[int] = []

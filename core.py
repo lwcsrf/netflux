@@ -494,9 +494,13 @@ class Node(ABC):
             raise self.exception
         return self.outputs
 
-    def watch(self, as_of_seq: int = 0) -> NodeView:
-        """Return the latest NodeView update (blocking until seq > view.update_seqnum)."""
-        return self.ctx.runtime.watch(self, as_of_seq=as_of_seq)
+    def watch(self, as_of_seq: int = 0, *, timeout: Optional[float] = None) -> Optional[NodeView]:
+        """Return the latest NodeView update (blocking until seq > view.update_seqnum).
+
+        If ``timeout`` (seconds) elapses before a newer snapshot is available,
+        returns ``None`` (mirroring the underlying condition wait semantics).
+        """
+        return self.ctx.runtime.watch(self, as_of_seq=as_of_seq, timeout=timeout)
 
     def is_cancel_requested(self) -> bool:
         if self.cancel_event is None:
