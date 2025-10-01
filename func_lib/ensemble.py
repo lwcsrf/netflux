@@ -125,7 +125,7 @@ class Ensemble(CodeFunction):
             # Fan-out (parallel launch by Runtime).
             launches: List[Tuple[Provider, Node]] = []
             for prov, cnt in self._instances.items():
-                for _ in range(1, cnt + 1):
+                for _ in range(cnt):
                     launches.append((prov, ctx.invoke(self._agent, arg_map, provider=prov)))
 
             captured_ex: Dict[Provider, List[Exception]] = {
