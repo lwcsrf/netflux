@@ -76,6 +76,8 @@ def _state_glyph(state: NodeState, tick: int) -> Tuple[str, str]:
         return ("✔", "green")
     if state is NodeState.Error:
         return ("✖", "red")
+    if state is NodeState.Canceled:
+        return ("⚑", "yellow")
     return ("?", "white")
 
 def render_tree_str(view: NodeView, tick: int = 0, *, width: Optional[int] = None) -> str:
@@ -99,6 +101,12 @@ def render_tree_str(view: NodeView, tick: int = 0, *, width: Optional[int] = Non
             except Exception:
                 msg = nv.exception.__class__.__name__
             header += f" {_color('!!', fg='red', bold=True)} {_short_repr(msg, 50)}"
+        elif nv.state is NodeState.Canceled and nv.exception is not None:
+            try:
+                msg = str(nv.exception)
+            except Exception:
+                msg = nv.exception.__class__.__name__
+            header += f" {_color('×', fg='yellow', bold=True)} {_short_repr(msg, 50)}"
 
         branch = "└─ " if is_last else "├─ "
         lines.append(prefix + branch + header if prefix else header)
@@ -150,7 +158,7 @@ def start_tree_str_view(
                         q.put_nowait(view)
                     except queue.Full:
                         pass
-                if view.state in (NodeState.Success, NodeState.Error):
+                if view.state in (NodeState.Success, NodeState.Error, NodeState.Canceled):
                     # allow renderer to continue until stop_event; watcher can stop
                     break
         except Exception:

@@ -9,6 +9,7 @@ from ..core import (
     Node,
     Provider,
     RunContext,
+    CancellationException,
 )
 
 
@@ -116,10 +117,15 @@ class Ensemble(CodeFunction):
         def __impl(ctx: RunContext, arg_map: Dict[str, Any]) -> Any:
             self._agent.validate_coerce_args(arg_map)
 
+            if ctx.cancel_requested():
+                raise CancellationException()
+
             # Fan-out (parallel launch by Runtime).
             launches: List[Tuple[Provider, Node]] = []
             for prov, cnt in self._instances.items():
                 for i in range(1, cnt + 1):
+                    if ctx.cancel_requested():
+                        raise CancellationException()
                     launches.append((prov, ctx.invoke(self._agent, arg_map, provider=prov)))
 
             captured_ex: Dict[Provider, List[Exception]] = {
@@ -133,6 +139,13 @@ class Ensemble(CodeFunction):
                 try:
                     out = node.result()
                     text = "" if out is None else str(out).strip()
+                except CancellationException as ex:
+                    if ctx.cancel_requested():
+                        raise
+                    text = f"[ERROR] {type(ex).__name__}: {ex}"
+                    captured_ex[prov].append(ex)
+                    if len(captured_ex[prov]) > self._allow_fail[prov]:
+                        excess_fail = True
                 except Exception as ex:
                     text = f"[ERROR] {type(ex).__name__}: {ex}"
                     captured_ex[prov].append(ex)
@@ -145,6 +158,9 @@ class Ensemble(CodeFunction):
                     f"</candidate_answer>")
             ensemble_candidates = "\n\n".join(candidates)
 
+            if ctx.cancel_requested():
+                raise CancellationException()
+
             if excess_fail:
                 raise EnsembleException(captured_ex, self._instances)
 
@@ -154,8 +170,18 @@ class Ensemble(CodeFunction):
                 "ensemble_candidates": ensemble_candidates,
                 "reconciliation_prompt": reconciliation_prompt,
             }
+            if ctx.cancel_requested():
+                raise CancellationException()
             recon_node = ctx.invoke(self._reconcile_agent, recon_inputs, provider=self._reconcile_provider)
-            return recon_node.result()
+            try:
+                result = recon_node.result()
+            except CancellationException:
+                raise
+
+            if ctx.cancel_requested():
+                raise CancellationException()
+
+            return result
 
         # Build a callable whose signature exactly mirrors the wrapped agent's args.
         names = [a.name for a in agent.args]

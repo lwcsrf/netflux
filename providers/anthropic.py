@@ -6,6 +6,7 @@ from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
     UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
+    CancelEvent,
 )
 from . import ModelNames, Provider
 from ..func_lib.text_editor import TextEditor
@@ -134,9 +135,10 @@ class AnthropicAgentNode(AgentNode):
         fn: Function,
         inputs: Dict[str, Any],
         parent: Optional[Node],
+        cancel_event: Optional[CancelEvent],
         client_factory: Callable[[], Any],
     ):
-        super().__init__(ctx, id, fn, inputs, parent, client_factory)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
         client = client_factory()
         if not isinstance(client, anthropic.Anthropic):
             raise TypeError(
@@ -164,6 +166,10 @@ class AnthropicAgentNode(AgentNode):
         system_prompt = self.agent_fn.system_prompt
 
         while True:
+            if self.cancel_requested():
+                self.ctx.post_cancel()
+                return
+
             # Apply watermark to *latest* user message only (just-in-time).
             # The longest prefix cache partial hit wins. We get partial credit for
             # a cached prefix and the rest are new tokens which we incrementally pay to cache.
@@ -191,6 +197,11 @@ class AnthropicAgentNode(AgentNode):
             ]] = []
             tool_uses: List[ToolUseBlock] = []
             final_text_chunks: List[str] = []
+
+            if self.cancel_requested():
+                pending_cancel = True
+            else:
+                pending_cancel = False
 
             for blk in resp.content:
                 if isinstance(blk, ThinkingBlock):
@@ -235,6 +246,9 @@ class AnthropicAgentNode(AgentNode):
             # If no tool uses -> finalize with the accumulated text
             if not tool_uses:
                 final_text = "\n".join(t for t in final_text_chunks if t).strip()
+                if self.cancel_requested():
+                    self.ctx.post_cancel()
+                    return
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
                 return
@@ -315,9 +329,15 @@ class AnthropicAgentNode(AgentNode):
                     )
                 )
 
+                if not pending_cancel and self.cancel_requested():
+                    pending_cancel = True
+
             # Per protocol: next user message contains only tool_result blocks
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
+                return
+            if pending_cancel:
+                self.ctx.post_cancel()
                 return
             self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
 

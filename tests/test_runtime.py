@@ -1,6 +1,7 @@
 import logging
 import queue
 import threading
+import time
 import unittest
 from typing import Any, Iterable, List
 from unittest.mock import patch
@@ -18,6 +19,8 @@ from ..core import (
     RunContext,
     SessionScope,
     TokenUsage,
+    CancelEvent,
+    CancellationException,
 )
 from ..providers import Provider
 
@@ -71,6 +74,17 @@ class DummyFunction(Function):
 
 
 class DummyNode(Node):
+    def __init__(
+        self,
+        ctx: RunContext,
+        id: int,
+        fn: Function,
+        inputs: dict[str, Any],
+        parent: Node | None,
+        cancel_event=None,
+    ) -> None:
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event)
+
     def run(self) -> None:  # pragma: no cover - not executed in these tests
         pass
 
@@ -179,9 +193,10 @@ class TestRuntimeInvocation(unittest.TestCase):
                 fn: Function,
                 inputs: dict[str, Any],
                 parent: Node | None,
-                client_factory,
+                cancel_event=None,
+                client_factory=None,
             ) -> None:
-                super().__init__(ctx, id, fn, inputs, parent, client_factory)
+                super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
                 type(self).last_client = None
 
             def run(self) -> None:
@@ -261,6 +276,87 @@ class TestRuntimeInvocation(unittest.TestCase):
         self.assertIs(child_bags[SessionScope.Self], child_node.session_bag)
         self.assertIs(child_bags[SessionScope.Parent], parent_node.session_bag)
         self.assertIs(child_bags[SessionScope.TopLevel], parent_node.session_bag)
+
+    def test_invoke_propagates_cancel_event_to_children(self) -> None:
+        cancel_event = CancelEvent()
+        observed: List[CancelEvent | None] = []
+
+        def child_callable(ctx: RunContext) -> str:
+            observed.append(ctx.cancel_event)
+            return "child"
+
+        child_fn = _make_code_function("child", callable=child_callable)
+
+        def parent_callable(ctx: RunContext) -> str:
+            observed.append(ctx.cancel_event)
+            node = ctx.invoke(child_fn, {})
+            node.result()
+            return "parent"
+
+        parent_fn = _make_code_function("parent", callable=parent_callable, uses=[child_fn])
+        runtime = Runtime([parent_fn], client_factories={})
+        parent_node = runtime.invoke(None, parent_fn, {}, cancel_event=cancel_event)
+        self.assertEqual(parent_node.result(), "parent")
+
+        self.assertIs(parent_node.ctx.cancel_event, cancel_event)
+        self.assertEqual(len(parent_node.children), 1)
+        child_node = parent_node.children[0]
+        self.assertIs(child_node.ctx.cancel_event, cancel_event)
+        self.assertEqual(len(observed), 2)
+        self.assertIs(observed[0], cancel_event)
+        self.assertIs(observed[1], cancel_event)
+
+    def test_invoke_allows_cancel_event_override(self) -> None:
+        parent_event = CancelEvent()
+        override_event = CancelEvent()
+        observed_child: List[CancelEvent | None] = []
+
+        def child_callable(ctx: RunContext) -> str:
+            observed_child.append(ctx.cancel_event)
+            return "child"
+
+        child_fn = _make_code_function("child", callable=child_callable)
+
+        def parent_callable(ctx: RunContext) -> str:
+            self.assertIs(ctx.cancel_event, parent_event)
+            node = ctx.invoke(child_fn, {}, cancel_event=override_event)
+            node.result()
+            return "parent"
+
+        parent_fn = _make_code_function("parent", callable=parent_callable, uses=[child_fn])
+        runtime = Runtime([parent_fn], client_factories={})
+        node = runtime.invoke(None, parent_fn, {}, cancel_event=parent_event)
+        node.result()
+
+        self.assertEqual(len(observed_child), 1)
+        self.assertIs(observed_child[0], override_event)
+        self.assertEqual(len(node.children), 1)
+        child_node = node.children[0]
+        self.assertIs(child_node.ctx.cancel_event, override_event)
+
+    def test_cancel_event_triggers_cancellation(self) -> None:
+        cancel_event = CancelEvent()
+        started = threading.Event()
+
+        def blocking_callable(ctx: RunContext) -> str:
+            started.set()
+            while not ctx.cancel_requested():
+                time.sleep(0.01)
+            raise CancellationException()
+
+        fn = _make_code_function("blocking", callable=blocking_callable)
+        runtime = Runtime([fn], client_factories={})
+        node = runtime.invoke(None, fn, {}, cancel_event=cancel_event)
+
+        self.assertTrue(started.wait(timeout=1), "code callable did not start")
+        cancel_event.set()
+
+        with self.assertRaises(CancellationException):
+            node.result()
+
+        self.assertEqual(node.state, NodeState.Canceled)
+        self.assertIsNotNone(node.exception)
+        self.assertIsInstance(node.exception, CancellationException)
 
 
 class TestRuntimeObservability(unittest.TestCase):
@@ -370,6 +466,20 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         self.assertEqual(view.state, NodeState.Error)
         self.assertIs(view.exception, exc)
         self.assertTrue(any("boom" in msg for msg in captured.output))
+
+    def test_post_cancel_sets_canceled_state(self) -> None:
+        runtime, node = self._make_runtime_with_dummy_node(node_id=4)
+        runtime.post_cancel(node)
+
+        self.assertEqual(node.state, NodeState.Canceled)
+        self.assertIsNotNone(node.exception)
+        self.assertIsInstance(node.exception, CancellationException)
+        self.assertTrue(node.done.is_set())
+
+        view = runtime.get_view(node.id)
+        self.assertEqual(view.state, NodeState.Canceled)
+        self.assertIsNotNone(view.exception)
+        self.assertIsInstance(view.exception, CancellationException)
 
     def test_publish_tree_update_refreshes_ancestors(self) -> None:
         runtime = Runtime([], client_factories={})

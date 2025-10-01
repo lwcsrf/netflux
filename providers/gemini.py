@@ -5,6 +5,7 @@ from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
     UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
+    CancelEvent,
 )
 from . import ModelNames, Provider
 
@@ -83,9 +84,10 @@ class GeminiAgentNode(AgentNode):
         fn: Function,
         inputs: Dict[str, Any],
         parent: Optional['Node'],
+        cancel_event: Optional[CancelEvent],
         client_factory: Callable[[], Any],
     ):
-        super().__init__(ctx, id, fn, inputs, parent, client_factory)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
         client = client_factory()
         if not isinstance(client, genai.Client):
             raise TypeError(
@@ -218,6 +220,9 @@ class GeminiAgentNode(AgentNode):
         ]
 
         for _ in range(MAX_STEPS):
+            if self.cancel_requested():
+                self.ctx.post_cancel()
+                return
             # TODO: Add retry/backoff for transient Google Generative AI client errors.
             resp = self.client.models.generate_content(
                 model=ModelNames[Provider.Gemini],
@@ -244,6 +249,9 @@ class GeminiAgentNode(AgentNode):
             # No function calls → finalize with assistant text.
             if not calls:
                 final_text: str = self._extract_text(candidate)
+                if self.cancel_requested():
+                    self.ctx.post_cancel()
+                    return
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
                 return
@@ -273,6 +281,7 @@ class GeminiAgentNode(AgentNode):
                     invoke_exceptions.append(ex)
 
             pending_agent_ex: Optional[AgentException] = None
+            pending_cancel = self.cancel_requested()
 
             # WaitAll + transcribe results.
             for fc, child, invoke_ex, tool_use_id in zip(calls, children, invoke_exceptions, tool_use_ids):
@@ -322,9 +331,15 @@ class GeminiAgentNode(AgentNode):
                     )
                 ))
 
+                if not pending_cancel and self.cancel_requested():
+                    pending_cancel = True
+
             # To single aggregated tool results message.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
+                return
+            if pending_cancel:
+                self.ctx.post_cancel()
                 return
             contents.append(types.Content(role="tool", parts=result_parts))
 
