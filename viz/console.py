@@ -33,7 +33,18 @@ def _color(text: str, *, fg: Optional[str] = None, bold: bool = False, dim: bool
     return "".join(parts)
 
 
-_SPINNER_FRAMES = ["|", "/", "-", "\\"]
+_SPINNER_FRAMES = [
+    "⠋",
+    "⠙",
+    "⠹",
+    "⠸",
+    "⠼",
+    "⠴",
+    "⠦",
+    "⠧",
+    "⠇",
+    "⠏",
+]
 
 
 def _short_repr(value, max_len: int = 40) -> str:
@@ -140,4 +151,3 @@ class ConsoleRender(Render[str]):
 
         add_node(self._last_view, prefix="", is_last=True)
         return "\n".join(lines)
-
