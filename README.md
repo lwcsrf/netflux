@@ -503,7 +503,7 @@ This refined example shows:
     * e.g. visualization
     * `list_toplevel_views() -> List[NodeView]`: get consistent snapshot of all root tasks
     * `get_view(node_id: int) -> NodeView`: get latest snapshot for any node without blocking
-    * `watch(node: Node | int, as_of_seq: int = 0) -> NodeView`: block until newer snapshot available (read more about `NodeView`s below).
+    * `watch(node: Node | int, as_of_seq: int = 0, *, timeout: Optional[float] = None) -> Optional[NodeView]`: block until newer snapshot available; if `timeout` elapses, returns `None` (read more about `NodeView`s below).
     * To prevent race conditions, consumers should use `Runtime` to query state via `NodeView`s and do top-level invocations.
 
 ## `RunContext`

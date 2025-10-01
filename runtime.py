@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 import logging
+import time
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence
 import multiprocessing as mp
 from multiprocessing import Lock
@@ -240,12 +241,46 @@ class Runtime:
                 observable.cond.notify_all()
             current = current.parent
 
-    def watch(self, node: Node | int, as_of_seq: int = 0) -> NodeView:
+    def watch(
+        self,
+        node: Node | int,
+        as_of_seq: int = 0,
+        *,
+        timeout: Optional[float] = None,
+    ) -> Optional[NodeView]:
+        """Block until a newer snapshot is available and return it.
+
+        If ``timeout`` (seconds) is provided and elapses before a newer snapshot
+        becomes available (i.e., ``touch_seqno > as_of_seq``), return ``None``.
+        Mirrors the underlying condition semantics (no exception on timeout).
+        """
         node_id = self._resolve_node(node)
         with self._lock:
             observable = self._node_observables[node_id]
+
+            # Fast path: already newer than caller's as_of_seq
+            if observable.touch_seqno > as_of_seq:
+                return observable.view
+
+            # Compute absolute deadline if a timeout is provided
+            deadline: Optional[float] = None
+            if timeout is not None:
+                # Treat non-positive timeout as an immediate poll (no wait)
+                if timeout <= 0:
+                    return None
+                deadline = time.monotonic() + timeout
+
             while observable.touch_seqno <= as_of_seq:
-                observable.cond.wait()
+                remaining: Optional[float] = None
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        return None
+                notified = observable.cond.wait(timeout=remaining)
+                # Even if notified is False (timeout), loop condition above
+                # guards correctness; on timeout the remaining <= 0 branch
+                # will return None on the next iteration.
+
             return observable.view
 
     def _resolve_node(self, node: Node | int) -> int:
