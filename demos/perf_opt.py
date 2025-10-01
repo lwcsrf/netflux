@@ -1,26 +1,18 @@
-#!/usr/bin/env python3
-from __future__ import annotations
-
 import sys
 import os
 import time
 import textwrap
 import tempfile
 import subprocess
-import threading
+import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, Any, List, Set, Tuple, Optional
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Import your framework core (with your own GeminiAgentNode / AnthropicAgentNode)
-# ──────────────────────────────────────────────────────────────────────────────
 from .. import core
 from ..runtime import Runtime
 from .auth_factory import CLIENT_FACTORIES
+from ..viz import ConsoleRender, start_view_loop
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Simple tracing utilities
-# ──────────────────────────────────────────────────────────────────────────────
 def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
@@ -30,10 +22,6 @@ def trace(msg: str) -> None:
 def _indent(depth: int) -> str:
     return "  " * depth
 
-
-# ──────────────────────────────────────────────────────────────────────────────
-# CodeFunctions
-# ──────────────────────────────────────────────────────────────────────────────
 def _read_text_file(ctx: core.RunContext, *, filepath: str) -> str:
     p = Path(filepath)
     if not p.exists():
@@ -547,6 +535,9 @@ def main():
     # Top-level invocation (Gemini by default, handled by your core)
     trace("Creating top-level RunContext and invoking PerfImprovementAgent...")
     ctx = runtime.get_ctx()
+    # Shared cooperative cancellation token for the entire run (UI + runtime).
+    cancel_evt = mp.Event()
+
     root = ctx.invoke(
         PerfImprovementAgent,
         {
@@ -558,35 +549,44 @@ def main():
             "max_iters": 3,
             "improvement_threshold_pct": 10.0,
         },
+        cancel_event=cancel_evt,
     )
 
-    # Start NodeView-based monitoring in a separate thread
-    trace("Starting NodeView-based monitoring...")
-    monitor_thread = threading.Thread(
-        target=monitor_with_nodeview,
-        args=(root,),
-        name="netflux-nodeview-monitor",
-        daemon=True
+    # Live console visualization using ConsoleRender
+    def _writer(frame: str) -> None:
+        sys.stdout.write("\x1b[H\x1b[2J")
+        sys.stdout.write(frame)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    _ = start_view_loop(
+        root,
+        cancel_evt,
+        render=ConsoleRender(spinner_hz=10.0),
+        ui_driver=_writer,
+        update_interval=0.1,
     )
-    monitor_thread.start()
 
     # Wait for completion & show final report
-    trace("Waiting for top-level node to finish...")
-    root.wait()
-    trace("Top-level node finished. Fetching result...")
     try:
         final_report = root.result()
+    except KeyboardInterrupt:
+        cancel_evt.set()
+        trace("\nCancellation requested, waiting for tasks to stop...\n")
+        try:
+            final_report = root.result()
+        except Exception as ex:
+            final_report = f"[ERROR] {type(ex).__name__}: {ex}"
     except Exception as ex:
         final_report = f"[ERROR] {type(ex).__name__}: {ex}"
+    finally:
+        cancel_evt.set()
 
     print("\n" + "=" * 80)
     print("FINAL REPORT FROM PerfImprovementAgent")
     print("=" * 80)
     print(final_report)
     print("=" * 80)
-
-    # Let monitor thread finish its final snapshot
-    monitor_thread.join(timeout=2.0)
     trace("Demo complete.")
 
 
