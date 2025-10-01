@@ -120,13 +120,14 @@ class Ensemble(CodeFunction):
             # Last-minute check for cancellation before we fan-out potentially
             # long-running tasks.
             if ctx.cancel_requested():
-                raise CancellationException()
+                raise CancellationException("Early request to cancel, before fan-out.")
 
             # Fan-out (parallel launch by Runtime).
             launches: List[Tuple[Provider, Node]] = []
             for prov, cnt in self._instances.items():
                 for _ in range(cnt):
                     launches.append((prov, ctx.invoke(self._agent, arg_map, provider=prov)))
+                    # No point checking cancellation again here because invoke() is fast.
 
             captured_ex: Dict[Provider, List[Exception]] = {
                 prov: [] for prov in self._instances
@@ -139,15 +140,10 @@ class Ensemble(CodeFunction):
                 try:
                     out = node.result()
                     text = "" if out is None else str(out).strip()
-                except CancellationException as ex:
-                    # This child is canceled. Is it because we were also canceled?
-                    if ctx.cancel_requested():
-                        raise
-                    text = f"[ERROR] {type(ex).__name__}: {ex}"
-                    captured_ex[prov].append(ex)
-                    if len(captured_ex[prov]) > self._allow_fail[prov]:
-                        excess_fail = True
                 except Exception as ex:
+                    # Could be CancellationException if child was canceled, or the child decided
+                    # to raise for any reason. Both cases are handled the same; we will check if
+                    # we were also canceled after we finish collecting children results.
                     text = f"[ERROR] {type(ex).__name__}: {ex}"
                     captured_ex[prov].append(ex)
                     if len(captured_ex[prov]) > self._allow_fail[prov]:
@@ -159,25 +155,27 @@ class Ensemble(CodeFunction):
                     f"</candidate_answer>")
             ensemble_candidates = "\n\n".join(candidates)
 
+            if ctx.cancel_requested():
+                raise CancellationException(
+                    "Requested to cancel after children fan-out was initiated; before reconciliation.")
+            
             if excess_fail:
                 raise EnsembleException(captured_ex, self._instances)
-            
+
             # Reconcile.
             recon_inputs = {
                 "original_user_prompt": self._agent.user_prompt_template.format(**arg_map),
                 "ensemble_candidates": ensemble_candidates,
                 "reconciliation_prompt": reconciliation_prompt,
             }
-            # One more check for cancellation before invoking reconciliation task.
-            if ctx.cancel_requested():
-                raise CancellationException()
             recon_node = ctx.invoke(self._reconcile_agent, recon_inputs, provider=self._reconcile_provider)
             try:
                 result = recon_node.result()
-            except CancellationException:
-                # If reconciliation was canceled, it doesn't matter if we were too;
-                # we ultimately have failed for the same reason because we need it.
-                raise
+            except CancellationException as ex:
+                # If reconciliation task was canceled, we were probably canceled too, but
+                # that's immaterial as we ultimately have failed for the same reason.
+                raise CancellationException("Reconciliation task was canceled.") from ex
+            # Let any other exception bubble up as-is.
 
             return result
 
