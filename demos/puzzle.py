@@ -13,7 +13,7 @@ from ..core import (
 )
 from ..runtime import Runtime
 from .auth_factory import CLIENT_FACTORIES
-from .tree_str import start_tree_str_view, render_tree_str
+from ..viz import ConsoleRender, start_view_loop
 
 
 PUZZLE_SOLVER_SYSTEM_PROMPT = (
@@ -180,7 +180,7 @@ INTERLEAVE_AGENT, INTERLEAVE_TOOLS = build_interleave_agent(
 )
 
 def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
-    """Execute the shared puzzle with a live tree view (watcher + ticker)."""
+    """Execute the shared puzzle with a live tree view (single loop thread)."""
 
     runtime = Runtime(
         specs=[INTERLEAVE_AGENT, *INTERLEAVE_TOOLS],
@@ -201,12 +201,13 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
         sys.stdout.write("\n")
         sys.stdout.flush()
 
-    start_tree_str_view(
+    # UI: start a single-thread view loop using TextRender
+    _ = start_view_loop(
         node,
         cancel_evt,
-        writer_callback=_writer,
-        render_callback=render_tree_str,
-        hz=10.0,
+        render=ConsoleRender(spinner_hz=10.0),
+        ui_driver=_writer,
+        update_interval=0.1,
     )
 
     try:
