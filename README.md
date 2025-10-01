@@ -320,6 +320,20 @@ See the detailed [Exception Model](#exception-model) below for guidance on when 
 
 ---
 
+## Cooperative Cancellation
+
+**Cooperative Cancellation** uses cancellation token chaining, similar to that seen in languages like C# (`CancellationToken`s) and Go (`Context`s). For now we simply use `mp.Event` for these. Since tasks can be long-running, especially when they are agents, it's imperative to be able to timely interrupt entire trees or sub-trees to save resources when agents are not going in the desired direction or progress is not meeting time deadlines, and also just for responsive user experience.
+
+By "cooperative", we refer to the pattern of cancellation chaining that requires framework consumers to properly adhere to the pattern in order to get the benefit. This means:
+
+* New `providers/` extensions (`AgentNode` subtypes) should check for cancellation at opportune times (before invoking children; before initial remote model invocation or before following up with function results). `AgentNode`s should `post_cancel()` in their agent loops and then simply exit the loop (return), or alternatively they can raise `cancellationException`. See `providers/anthropic.py` for an example.
+* `CodeFunction` callables should similarly be responsive to `self.is_cancel_requested()` and simply raise `cancellationException` as opportune times.
+* Always check for cancellation before invoking children tasks.
+* Always collect running children (e.g. block on each child `node.result()`) before responding to a cancellation request.
+* If an agent loop or callable is able to determine a success/exception outcome at or near the same time it would respond to cancellation, it should always prioritize concluding with success/exception instead of reacting to the cancellation request. This is because the work was done anyway, so you want the transcripts to show whatever was actually done at the time of cancellation.
+
+---
+
 ## Providers
 
 Providers are **subtypes of `AgentNode`** that bridge the framework’s pattern to each model’s SDK (Anthropic, Gemini, etc.). It is the **driver** that runs the agent loop and manages function calls, forwarding them through the framework. Adding a new provider means implementing a new `AgentNode` subtype. See more details below on writing a new `providers/` extension.
@@ -684,11 +698,11 @@ This is a bucket list of nice-to-haves.
 
 * Concurrency control
     * Limit the number of `AgentNode`s in the agent loop concurrently, keyed by `Provider`.
-* Replayability, Pausability, Interruptibility, Cancelation
+* Replayability, Pausability, Interruptibility, cancellation
     * Pre-requisites:
         * Restart-ability of tree from the state where any `Node` was just created.
         * Serializability of `Node` tree state.
-        * Cancelation, Pause `NodeState`.
+        * cancellation, Pause `NodeState`.
 * `NodeState.WaitingOnFunction`
 * Async and Futures
     * `RunContext.invoke()` -> return Future and generally use async chaining.
