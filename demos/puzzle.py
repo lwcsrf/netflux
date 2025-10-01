@@ -9,6 +9,7 @@ from ..core import (
     FunctionArg,
     Provider,
     RunContext,
+    CancellationException,
 )
 from ..runtime import Runtime
 from .auth_factory import CLIENT_FACTORIES
@@ -186,9 +187,12 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
         client_factories=CLIENT_FACTORIES,
     )
     ctx = runtime.get_ctx()
-    node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider)
 
+    # Shared cooperative cancellation token for the entire run (UI + runtime).
     cancel_evt = mp.Event()
+
+    # Ensure the root node participates in cooperative cancellation chaining.
+    node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider, cancel_event=cancel_evt)
 
     def _writer(s: str) -> None:
         # Clear screen and render frame
@@ -207,7 +211,17 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
 
     try:
         result = node.result() or ""
+    except KeyboardInterrupt:
+        # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
+        cancel_evt.set()
+        print("\nCancellation requested, waiting for tasks to stop...\n")
+        # Wait for the node to conclude (may still finish success/exception per guidance).
+        try:
+            result = node.result() or ""
+        except CancellationException:
+            result = ""
     finally:
+        # Ensure UI watcher/ticker threads exit.
         cancel_evt.set()
 
     return result
