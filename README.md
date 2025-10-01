@@ -277,7 +277,7 @@ while True:
     # read view.state / view.outputs / view.exception / view.children safely
     print(f"[{view.update_seqnum}] node={view.id} state={view.state.name}")
     
-    if view.state in (NodeState.Success, NodeState.Error):
+    if view.state in TerminalNodeStates:
         break
 ```
 
@@ -317,6 +317,20 @@ Another core idea is that `Exception`s flow **fluidly** through `Function`s as i
 * Downstream code can catch and handle exceptions, or let them **bubble** to the caller. This is true for both `CodeFunction`s via normal try/catch, and `AgentFunction`s which can be instructed how to handle various problems or not. The smarter models get, the more they can handle exceptions autonomously, provided the messages are sufficiently descriptive.
 
 See the detailed [Exception Model](#exception-model) below for guidance on when agents should raise, bubble, or retry.
+
+---
+
+## Cooperative Cancellation
+
+**Cooperative Cancellation** uses cancellation token chaining, similar to that seen in languages like C# (`CancellationToken`s) and Go (`Context`s). For now we simply use `mp.Event` for these. Since tasks can be long-running, especially when they are agents, it's imperative to be able to timely interrupt entire trees or sub-trees to save resources when agents are not going in the desired direction or progress is not meeting time deadlines, and also just for responsive user experience.
+
+By "cooperative", we refer to the pattern of cancellation chaining that requires framework consumers to properly adhere to the pattern in order to get the benefit. This means:
+
+* New `providers/` extensions (`AgentNode` subtypes) should check for cancellation at opportune times (before invoking children; before initial remote model invocation or before following up with function results). `AgentNode`s should `post_cancel()` in their agent loops and then simply exit the loop (return), or alternatively they can raise `cancellationException`. See `providers/anthropic.py` for an example.
+* `CodeFunction` callables should similarly be responsive to `self.is_cancel_requested()` and simply raise `cancellationException` as opportune times.
+* Always check for cancellation before invoking children tasks.
+* Always collect running children (e.g. block on each child `node.result()`) before responding to a cancellation request.
+* If an agent loop or callable is able to determine a success/exception outcome at or near the same time it would respond to cancellation, it should always prioritize concluding with success/exception instead of reacting to the cancellation request. This is because the work was done anyway, so you want the transcripts to show whatever was actually done at the time of cancellation.
 
 ---
 
@@ -394,7 +408,7 @@ while True:
     for child in view.children:
         print(f"  └─ child id={child.id} fn={child.fn.name} state={child.state.name}")
 
-    if view.state in (NodeState.Success, NodeState.Error):
+    if view.state in TerminalNodeStates:
         break
 
 # Finally, print the result or surface the exception.
@@ -512,11 +526,14 @@ This refined example shows:
     * `node: Optional[Node]`: a reference to the particular `Node` identifying this specific `Function` invocation. `None` for top-level contexts.
     * `runtime: Runtime`: a reference to the shared `Runtime`.
     * `object_bags: Dict[SessionScope, SessionBag]`: references to session bags accessible at different scopes.
+    * `cancel_event: Optional[Event]`: cooperative cancellation token inherited from the caller unless explicitly overridden by the caller.
 * Methods:
-    * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None) -> Node`: invoke a `Function` and return the created `Node`.
+    * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None) -> Node`: invoke a `Function`, optionally overriding the cancellation scope, and return the created `Node`.
     * `post_status_update(state: NodeState)`: update the current node's status.
     * `post_success(outputs: Any)`: mark the current node as successful with given outputs.
     * `post_exception(exception: Exception)`: mark the current node as failed with given exception.
+    * `post_cancel()`: mark the current node as terminally canceled.
+    * `cancel_requested() -> bool`: helper to check whether the associated cancellation token has been triggered. This does not mean that the `Node` is already canceled and in canceled state -- it means there is active signaled *intention* to cancel.
 * Narrow Scope: `RunContext` is just a mechanism to pass on `Function` invocation directives to the `Runtime` to act on them.
 
 ## `Node`
@@ -535,7 +552,7 @@ This refined example shows:
     * Child `Function` invocations are tracked in `node.children: List[Node]` property.
         * Always ordered to reflect the sequence in which `Function`s were invoked. 
         * For consumers outside the framework, use `NodeView.children: tuple[NodeView, ...]` instead to access child information safely.
-    * Has states (Waiting, Running, Success, Error) but also sub-state including tool use (`Function` invocation) that it is waiting on.
+    * Has states (Waiting, Running, Success, Error, Canceled) but also sub-state including tool use (`Function` invocation) that it is waiting on.
     * `AgentNode` is completed once it returns final assistant text or the model decides to `RaiseException` (if it has been given as an option).
     * `TokenUsage` cumulative accounting must be reportable by every `AgentNode` and kept up to date throughout the agent loop (updated on every request/response iteration).
         * Subtype implementations must use the provider SDK's token usage meta to track the accumulation.
@@ -548,7 +565,7 @@ This refined example shows:
     * `inputs: Dict[str, Any]`: What the inputs were for the invocation.
     * `outputs: Optional[Any]`: What the output(s) were from the run (if finished). Usually just an unstructured string.
     * `exception: Optional[Exception]`: the exception, if there was an exception.
-    * `state: NodeState`: (Waiting, Running, Success, Error) enum
+    * `state: NodeState`: (Waiting, Running, Success, Error, Canceled) enum
     * `children: List[Node]`: ordered list of child `Function` invocations made by this `Node`.
     * **Note**: External consumers should access this information through `NodeView` instead of `Node` directly to avoid race conditions.
 
@@ -681,11 +698,11 @@ This is a bucket list of nice-to-haves.
 
 * Concurrency control
     * Limit the number of `AgentNode`s in the agent loop concurrently, keyed by `Provider`.
-* Replayability, Pausability, Interruptibility, Cancelation
+* Replayability, Pausability, Interruptibility, cancellation
     * Pre-requisites:
         * Restart-ability of tree from the state where any `Node` was just created.
         * Serializability of `Node` tree state.
-        * Cancelation, Pause `NodeState`.
+        * cancellation, Pause `NodeState`.
 * `NodeState.WaitingOnFunction`
 * Async and Futures
     * `RunContext.invoke()` -> return Future and generally use async chaining.

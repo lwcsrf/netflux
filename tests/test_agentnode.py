@@ -15,6 +15,18 @@ from ..runtime import Runtime
 class _FakeAgentNode(AgentNode):
     """Minimal AgentNode for tests. Default run() is a no-op; tests can subclass/override."""
 
+    def __init__(
+        self,
+        ctx: RunContext,
+        id: int,
+        fn: AgentFunction,
+        inputs: dict,
+        parent=None,
+        cancel_event=None,
+        client_factory=None,
+    ) -> None:
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
+
     @property
     def token_usage(self) -> TokenUsage:
         return TokenUsage()

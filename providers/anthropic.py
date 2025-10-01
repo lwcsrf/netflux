@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
+from multiprocessing.synchronize import Event
 
 from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
@@ -134,9 +135,10 @@ class AnthropicAgentNode(AgentNode):
         fn: Function,
         inputs: Dict[str, Any],
         parent: Optional[Node],
+        cancel_event: Optional[Event],
         client_factory: Callable[[], Any],
     ):
-        super().__init__(ctx, id, fn, inputs, parent, client_factory)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
         client = client_factory()
         if not isinstance(client, anthropic.Anthropic):
             raise TypeError(
@@ -164,6 +166,10 @@ class AnthropicAgentNode(AgentNode):
         system_prompt = self.agent_fn.system_prompt
 
         while True:
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
+                return
+
             # Apply watermark to *latest* user message only (just-in-time).
             # The longest prefix cache partial hit wins. We get partial credit for
             # a cached prefix and the rest are new tokens which we incrementally pay to cache.
@@ -232,11 +238,17 @@ class AnthropicAgentNode(AgentNode):
                 MessageParam(role="assistant", content=assistant_params)
             )
 
-            # If no tool uses -> finalize with the accumulated text
+            # If no tool uses -> finalize with the accumulated text.
             if not tool_uses:
                 final_text = "\n".join(t for t in final_text_chunks if t).strip()
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
+                return
+
+            # Make sure we check for cancellation right before commencing possibly
+            # lengthy sub-tasks.
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
                 return
 
             # Execute requested tools in parallel and aggregate tool_result blocks.
@@ -315,10 +327,17 @@ class AnthropicAgentNode(AgentNode):
                     )
                 )
 
-            # Per protocol: next user message contains only tool_result blocks
+            # Now that we finished collecting + transcribing children, it's a good time to react
+            # to agent wanting to raise exception, or cancellation request, in that
+            # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
                 return
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
+                return
+            
+            # Per protocol: next user message contains only tool_result blocks
             self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
 
     def _accumulate_usage(self, usage: Usage) -> None:

@@ -1,11 +1,12 @@
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
 from enum import Enum
-import sys
-import traceback
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Union, get_args
 import inspect
-from threading import Thread, Event, Lock
+from threading import Thread
+import multiprocessing as mp
+from multiprocessing import Lock
+from multiprocessing.synchronize import Event
 from overrides import override
 
 AllowedArgTypeUnion = Union[Type[str], Type[int], Type[float], Type[bool]]
@@ -15,11 +16,20 @@ AllowedArgTypeTuple: tuple[type, ...] = tuple(
 
 from .providers import Provider
 
+class CancellationException(Exception):
+    """Raised when a node cooperatively acknowledges a cancellation request."""
+
+    def __init__(self, message: str = "Operation was canceled (no reason provided)"):
+        super().__init__(message)
+
 class NodeState(Enum):
     Waiting = "Waiting"
     Running = "Running"
     Success = "Success"
     Error = "Error"
+    Canceled = "Canceled"
+
+TerminalNodeStates = (NodeState.Success, NodeState.Error, NodeState.Canceled)
 
 class SessionScope(Enum):
     # Refers to the lifetime of the entire top-level invocation tree.
@@ -324,14 +334,33 @@ class RunContext:
     runtime: 'Runtime'      # type: ignore
     node: Optional['Node']  # None outside of any top-level task.
     object_bags: Dict[SessionScope, SessionBag] = field(default_factory=dict)
+    cancel_event: Optional[Event] = None
 
-    def invoke(self, fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None) -> 'Node':
+    def invoke(
+        self,
+        fn: Function,
+        args: Dict[str, Any],
+        provider: Optional[Provider] = None,
+        cancel_event: Optional[Event] = None,
+    ) -> 'Node':
         """
         Proxy to the Runtime to invoke a Function and create associated Node + edges.
-        Returns the created `Node`. For AgentFunction calls only, optionally specify `provider` to override the default
-        model.
+        Returns the created `Node`.
+
+        For AgentFunction calls only, optionally specify `provider` to override the default model.
+
+        Provide `cancel_event` to enforce a particular cancellation scope for the child node.
+        When omitted, the Runtime inherits the caller's CancelEvent (if any). It is correct
+        practice to make sure a custom `cancel_event` has cancelation criteria that includes
+        that of the caller (downward cancelation propagation).
         """
-        return self.runtime.invoke(self.node, fn, args, provider=provider)
+        return self.runtime.invoke(
+            self.node,
+            fn,
+            args,
+            provider=provider,
+            cancel_event=cancel_event,
+        )
 
     def post_status_update(self, state: 'NodeState') -> None:
         if self.node is None:
@@ -347,6 +376,19 @@ class RunContext:
         if self.node is None:
             raise RuntimeError("post_exception may only be called from within a Node execution context")
         self.runtime.post_exception(self.node, exception)
+
+    def post_cancel(self, exception: Optional[CancellationException] = None) -> None:
+        """
+        Inform the Runtime that the current Node is being cooperatively canceled.
+        The `exception` may be provided to indicate the reason for cancellation,
+        otherwise a generic `CancellationException` will be used.
+        """
+        if self.node is None:
+            raise RuntimeError("post_cancel may only be called from within a Node execution context")
+        self.runtime.post_cancel(self.node, exception)
+
+    def cancel_requested(self) -> bool:
+        return bool(self.cancel_event and self.cancel_event.is_set())
 
     def _resolve_bag(self, scope: SessionScope) -> SessionBag:
         if self.node is None:
@@ -384,7 +426,15 @@ class NodeView:
     update_seqnum: int  # Seqnum when this NodeView was generated.
 
 class Node(ABC):
-    def __init__(self, ctx: RunContext, id: int, fn: Function, inputs: Dict[str, Any], parent: Optional['Node']) -> None:
+    def __init__(
+        self,
+        ctx: RunContext,
+        id: int,
+        fn: Function,
+        inputs: Dict[str, Any],
+        parent: Optional['Node'],
+        cancel_event: Optional[Event],
+    ) -> None:
         self.ctx: RunContext = ctx
         self.id: int = id
         self.fn: Function = fn
@@ -394,8 +444,9 @@ class Node(ABC):
         self.parent: Optional[Node] = parent
         self.children: List[Node] = []
         self.thread: Optional[Thread] = None
-        self.done: Event = Event()
+        self.done: Event = mp.Event()
         self.session_bag: SessionBag = SessionBag()
+        self.cancel_event: Optional[Event] = cancel_event
 
         assert isinstance(ctx, RunContext)
         assert isinstance(fn, Function)
@@ -415,9 +466,11 @@ class Node(ABC):
     def run_wrapper(self) -> None:
         try:
             self.run()
+        except CancellationException as ex:
+            self.ctx.post_cancel(ex)
         except Exception as ex:
             self.ctx.post_exception(ex)
-        assert self.state in (NodeState.Success, NodeState.Error)
+        assert self.state in TerminalNodeStates
         assert self.done.is_set()
 
     @abstractmethod
@@ -436,11 +489,19 @@ class Node(ABC):
         if self.state == NodeState.Error:
             assert self.exception
             raise self.exception
+        if self.state == NodeState.Canceled:
+            assert self.exception and isinstance(self.exception, CancellationException)
+            raise self.exception
         return self.outputs
 
     def watch(self, as_of_seq: int = 0) -> NodeView:
         """Return the latest NodeView update (blocking until seq > view.update_seqnum)."""
         return self.ctx.runtime.watch(self, as_of_seq=as_of_seq)
+
+    def is_cancel_requested(self) -> bool:
+        if self.cancel_event is None:
+            return False
+        return self.cancel_event.is_set()
 
 class CodeNode(Node):
     """
@@ -457,8 +518,16 @@ class CodeNode(Node):
     output string. Alternatively, the Callable may raise an Exception, which will be
     propagated upon calling `node.result()`.
     """
-    def __init__(self, ctx: RunContext, id: int, fn: Function, inputs: Dict[str, Any], parent: Optional[Node]):
-        super().__init__(ctx, id, fn, inputs, parent)
+    def __init__(
+        self,
+        ctx: RunContext,
+        id: int,
+        fn: Function,
+        inputs: Dict[str, Any],
+        parent: Optional[Node],
+        cancel_event: Optional[Event],
+    ):
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event)
         assert isinstance(self.fn, CodeFunction)
 
     def run(self) -> None:
@@ -467,6 +536,8 @@ class CodeNode(Node):
         try:
             result = func.callable(self.ctx, **self.inputs)
             self.ctx.post_success(result)
+        except CancellationException as e:
+            self.ctx.post_cancel(e)
         except Exception as e:
             self.ctx.post_exception(e)
 
@@ -488,9 +559,10 @@ class AgentNode(Node):
         fn: Function,
         inputs: Dict[str, Any],
         parent: Optional[Node],
+        cancel_event: Optional[Event],
         client_factory: Callable[[], Any],
     ) -> None:
-        super().__init__(ctx, id, fn, inputs, parent)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event)
         assert isinstance(fn, AgentFunction), "AgentNode must wrap an AgentFunction"
         self.agent_fn: AgentFunction = fn
         self.transcript: List[TranscriptPart] = []
@@ -518,7 +590,12 @@ class AgentNode(Node):
         except AgentException as e:
             # Safety: agents shouldn't bubble this far, but if they do, honor it.
             self.ctx.post_exception(e)
+        except CancellationException as e:
+            # Safety: agents shouldn't bubble this far, as they would have `post_cancel()`
+            # already in their `run()`, but if they do, honor it.
+            self.ctx.post_cancel(e)
         except Exception as ex:
+            # Any other case must be a provider fault.
             mpe = ModelProviderException(
                 message=f"The provider of the agent's model (the driver) faulted due to: "
                         f"{self.stringify_exception(ex)}",
@@ -528,7 +605,7 @@ class AgentNode(Node):
                 inner_exception=ex,
             )
             self.ctx.post_exception(mpe)
-        assert self.state in (NodeState.Success, NodeState.Error)
+        assert self.state in TerminalNodeStates
         assert self.done.is_set()
 
     def build_user_text(self) -> str:

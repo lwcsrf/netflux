@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 import logging
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence
-from threading import Condition, Lock
+import multiprocessing as mp
+from multiprocessing import Lock
+from multiprocessing.synchronize import Event, Condition
 from collections import deque
 
 from .core import (
@@ -16,6 +18,7 @@ from .core import (
     AgentNode,
     SessionScope,
     SessionBag,
+    CancellationException,
 )
 from .providers import Provider, get_AgentNode_impl
 
@@ -108,10 +111,17 @@ class Runtime:
         fn: Function,
         inputs: Dict[str, Any],
         provider: Optional[Provider] = None,
+        cancel_event: Optional[Event] = None,
     ) -> Node:
         """
         Create and start a Node for `fn` with `inputs`, recording parent/child relationships.
         Returns the created Node.
+
+        If `cancel_event` is provided, it defines the cancellation scope for the new
+        child `Node` that will be created. Otherwise the caller's CancelEvent (if any)
+        is inherited automatically. This enables cooperative cancellation chaining,
+        where the caller being canceled also cancels its children, but children can have
+        further customized cancellation scope (e.g. timeouts).
         """
         # Ensure the function is registered.
         reg_fn = self._fn_by_name.get(fn.name)
@@ -129,15 +139,19 @@ class Runtime:
             node_id = self._next_node_id
             self._next_node_id += 1
 
+        # Determine cancellation scope inheritance (per docstring).
+        if not cancel_event and caller:
+            cancel_event = caller.cancel_event
+
         # Create a per-invocation RunContext; node will be injected post-construction
-        ctx = RunContext(runtime=self, node=None)
+        ctx = RunContext(runtime=self, node=None, cancel_event=cancel_event)
 
         # Choose Node subtype
         node: Node
         if isinstance(fn, CodeFunction):
             if provider is not None:
                 raise ValueError(f"Provider override is only valid for AgentFunction; invoking CodeFunction '{fn.name}'.")
-            node = CodeNode(ctx, node_id, fn, inputs, caller)
+            node = CodeNode(ctx, node_id, fn, inputs, caller, cancel_event)
 
         elif isinstance(fn, AgentFunction):
             provider = provider or fn.default_model
@@ -150,7 +164,7 @@ class Runtime:
                     f"No client factory registered for provider '{provider.value}'. "
                     "Update Runtime(client_factories=...) to include this provider."
                 )
-            node = impl(ctx, node_id, fn, inputs, caller, factory)
+            node = impl(ctx, node_id, fn, inputs, caller, cancel_event, factory)
         else:
             raise TypeError(f"Unknown Function subtype: {type(fn).__name__}")
 
@@ -191,7 +205,7 @@ class Runtime:
         observable = self._node_observables.get(node.id)
         if observable is None:
             observable = NodeObservable(
-                cond=Condition(self._lock),
+                cond=mp.Condition(self._lock),
                 touch_seqno=self._global_seqno,
                 view=self._build_node_view(node),
             )
@@ -263,3 +277,17 @@ class Runtime:
 
         # Log immediately so there is trace of it even if consumer never collects .result()
         logging.error(f"Node {node.id} ({node.fn.name}) faulted: {exception}")
+
+    def post_cancel(
+        self,
+        node: Node,
+        exception: Optional[CancellationException] = None,
+    ) -> None:
+        """`exception` can be provided to explain the reason for cancellation
+        otherwise the Node is assigned a no-reason CancellationException."""
+        with self._lock:
+            self._global_seqno += 1
+            node.exception = exception or CancellationException()
+            node.state = NodeState.Canceled
+            self._publish_tree_update(node)
+            node.done.set()

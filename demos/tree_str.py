@@ -1,5 +1,6 @@
 import sys
 import threading
+from multiprocessing.synchronize import Event
 import time
 import queue
 from typing import Callable, Optional, Tuple, List
@@ -76,6 +77,8 @@ def _state_glyph(state: NodeState, tick: int) -> Tuple[str, str]:
         return ("✔", "green")
     if state is NodeState.Error:
         return ("✖", "red")
+    if state is NodeState.Canceled:
+        return ("⚑", "yellow")
     return ("?", "white")
 
 def render_tree_str(view: NodeView, tick: int = 0, *, width: Optional[int] = None) -> str:
@@ -99,6 +102,12 @@ def render_tree_str(view: NodeView, tick: int = 0, *, width: Optional[int] = Non
             except Exception:
                 msg = nv.exception.__class__.__name__
             header += f" {_color('!!', fg='red', bold=True)} {_short_repr(msg, 50)}"
+        elif nv.state is NodeState.Canceled and nv.exception is not None:
+            try:
+                msg = str(nv.exception)
+            except Exception:
+                msg = nv.exception.__class__.__name__
+            header += f" {_color('×', fg='yellow', bold=True)} {_short_repr(msg, 50)}"
 
         branch = "└─ " if is_last else "├─ "
         lines.append(prefix + branch + header if prefix else header)
@@ -112,16 +121,16 @@ def render_tree_str(view: NodeView, tick: int = 0, *, width: Optional[int] = Non
     return "\n".join(lines)
 
 def start_tree_str_view(
-    stop_event: threading.Event,
     node: Node,
+    cancel_event: Event,
+    writer_callback: Callable[[str], None],
     render_callback: Callable[[NodeView, int], str] = render_tree_str,
-    writer_callback: Callable[[str], None] = lambda s: (sys.stdout.write(s + "\n"), sys.stdout.flush()),
     *,
     hz: float = 10.0,
 ) -> tuple[threading.Thread, threading.Thread]:
     """Start watcher and ticker threads for string-based tree visualization.
 
-    - stop_event: when set, both threads exit promptly.
+    - cancel_event: when set, both threads exit promptly.
     - node: the Node to watch.
     - render_callback(view, tick) -> str: returns the full string to display (may include ANSI colors).
     - writer_callback(text): emits the string to terminal (caller decides clearing/overwriting strategy).
@@ -135,7 +144,7 @@ def start_tree_str_view(
     def _watcher() -> None:
         prev = 0
         try:
-            while not stop_event.is_set():
+            while not cancel_event.is_set():
                 view = node.watch(as_of_seq=prev)
                 prev = view.update_seqnum
                 # replace any stale snapshot; latest wins
@@ -150,7 +159,7 @@ def start_tree_str_view(
                         q.put_nowait(view)
                     except queue.Full:
                         pass
-                if view.state in (NodeState.Success, NodeState.Error):
+                if view.state in (NodeState.Success, NodeState.Error, NodeState.Canceled):
                     # allow renderer to continue until stop_event; watcher can stop
                     break
         except Exception:
@@ -164,7 +173,7 @@ def start_tree_str_view(
         last_view: Optional[NodeView] = None
         last_str: Optional[str] = None
         try:
-            while not stop_event.is_set():
+            while not cancel_event.is_set():
                 timeout = max(0.0, next_t - time.monotonic())
                 try:
                     last_view = q.get(timeout=timeout)
