@@ -4,6 +4,8 @@
 #   - Outer    (CodeFunction):  invokes AgentA and returns its text result
 
 import os
+import sys
+import multiprocessing as mp
 from typing import Optional
 
 # Import the framework (unchanged).
@@ -13,10 +15,10 @@ from ..core import (
     AgentFunction,
     Provider,
     RunContext,
-    NodeView,
 )
 from ..runtime import Runtime
 from .auth_factory import CLIENT_FACTORIES
+from ..viz import ConsoleRender, start_view_loop
 
 # This test file is the demo file.
 DEMO_FILE_ABS_PATH: Optional[str] = os.path.abspath(__file__)
@@ -101,12 +103,6 @@ Outer = CodeFunction(
 )
 
 # ------------ Run the end-to-end task ------------
-def pretty_tree(view: NodeView, indent: int = 0) -> None:
-    pad = "  " * indent
-    print(f"{pad}- [{view.state.value}] {view.fn.name} (id={view.id})")
-    for child in view.children:
-        pretty_tree(child, indent + 1)
-
 def main():
     print("=== netflux demo: end-to-end ===")
     print(f"File to analyze: {DEMO_FILE_ABS_PATH}")
@@ -116,10 +112,37 @@ def main():
 
     # Kick off the top-level task (Outer)
     ctx = runtime.get_ctx()
-    root = ctx.invoke(Outer, {})
+    # Shared cooperative cancellation token for the entire run (UI + runtime).
+    cancel_evt = mp.Event()
+    root = ctx.invoke(Outer, {}, cancel_event=cancel_evt)
+
+    # Live console visualization like puzzle demo
+    def _writer(frame: str) -> None:
+        sys.stdout.write("\x1b[H\x1b[2J")
+        sys.stdout.write(frame)
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+    _ = start_view_loop(
+        root,
+        cancel_evt,
+        render=ConsoleRender(spinner_hz=10.0),
+        ui_driver=_writer,
+        update_interval=0.1,
+    )
 
     # Wait and collect result text
-    output = root.result()
+    try:
+        output = root.result()
+    except KeyboardInterrupt:
+        cancel_evt.set()
+        print("\nCancellation requested, waiting for tasks to stop...\n")
+        try:
+            output = root.result()
+        except Exception as ex:
+            output = f"[ERROR] {type(ex).__name__}: {ex}"
+    finally:
+        cancel_evt.set()
 
     print("\n=== AgentA Output ===\n")
     if isinstance(output, str):
@@ -127,10 +150,7 @@ def main():
     else:
         print(str(output))
 
-    print("\n=== Execution Tree ===")
-    latest = runtime.watch(root)
-    assert latest
-    pretty_tree(latest)
+    # (Live tree shown above via ConsoleRender)
 
 if __name__ == "__main__":
     main()
