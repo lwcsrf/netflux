@@ -9,6 +9,7 @@ from ..core import (
     Node,
     Provider,
     RunContext,
+    CancellationException,
 )
 
 
@@ -116,10 +117,15 @@ class Ensemble(CodeFunction):
         def __impl(ctx: RunContext, arg_map: Dict[str, Any]) -> Any:
             self._agent.validate_coerce_args(arg_map)
 
+            # Last-minute check for cancellation before we fan-out potentially
+            # long-running tasks.
+            if ctx.cancel_requested():
+                raise CancellationException()
+
             # Fan-out (parallel launch by Runtime).
             launches: List[Tuple[Provider, Node]] = []
             for prov, cnt in self._instances.items():
-                for i in range(1, cnt + 1):
+                for _ in range(1, cnt + 1):
                     launches.append((prov, ctx.invoke(self._agent, arg_map, provider=prov)))
 
             captured_ex: Dict[Provider, List[Exception]] = {
@@ -133,6 +139,14 @@ class Ensemble(CodeFunction):
                 try:
                     out = node.result()
                     text = "" if out is None else str(out).strip()
+                except CancellationException as ex:
+                    # This child is canceled. Is it because we were also canceled?
+                    if ctx.cancel_requested():
+                        raise
+                    text = f"[ERROR] {type(ex).__name__}: {ex}"
+                    captured_ex[prov].append(ex)
+                    if len(captured_ex[prov]) > self._allow_fail[prov]:
+                        excess_fail = True
                 except Exception as ex:
                     text = f"[ERROR] {type(ex).__name__}: {ex}"
                     captured_ex[prov].append(ex)
@@ -147,15 +161,25 @@ class Ensemble(CodeFunction):
 
             if excess_fail:
                 raise EnsembleException(captured_ex, self._instances)
-
+            
             # Reconcile.
             recon_inputs = {
                 "original_user_prompt": self._agent.user_prompt_template.format(**arg_map),
                 "ensemble_candidates": ensemble_candidates,
                 "reconciliation_prompt": reconciliation_prompt,
             }
+            # One more check for cancellation before invoking reconciliation task.
+            if ctx.cancel_requested():
+                raise CancellationException()
             recon_node = ctx.invoke(self._reconcile_agent, recon_inputs, provider=self._reconcile_provider)
-            return recon_node.result()
+            try:
+                result = recon_node.result()
+            except CancellationException:
+                # If reconciliation was canceled, it doesn't matter if we were too;
+                # we ultimately have failed for the same reason because we need it.
+                raise
+
+            return result
 
         # Build a callable whose signature exactly mirrors the wrapped agent's args.
         names = [a.name for a in agent.args]

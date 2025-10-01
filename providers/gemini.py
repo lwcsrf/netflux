@@ -1,5 +1,6 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 import base64
+from multiprocessing.synchronize import Event
 
 from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
@@ -83,9 +84,10 @@ class GeminiAgentNode(AgentNode):
         fn: Function,
         inputs: Dict[str, Any],
         parent: Optional['Node'],
+        cancel_event: Optional[Event],
         client_factory: Callable[[], Any],
     ):
-        super().__init__(ctx, id, fn, inputs, parent, client_factory)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
         client = client_factory()
         if not isinstance(client, genai.Client):
             raise TypeError(
@@ -218,6 +220,10 @@ class GeminiAgentNode(AgentNode):
         ]
 
         for _ in range(MAX_STEPS):
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
+                return
+
             # TODO: Add retry/backoff for transient Google Generative AI client errors.
             resp = self.client.models.generate_content(
                 model=ModelNames[Provider.Gemini],
@@ -246,6 +252,12 @@ class GeminiAgentNode(AgentNode):
                 final_text: str = self._extract_text(candidate)
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
+                return
+
+            # Make sure we check for cancellation right before commencing possibly
+            # lengthy sub-tasks.
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
                 return
 
             # Execute requested tools in parallel and
@@ -322,13 +334,20 @@ class GeminiAgentNode(AgentNode):
                     )
                 ))
 
-            # To single aggregated tool results message.
+            # Now that we finished collecting + transcribing children, it's a good time to react
+            # to agent wanting to raise exception, or cancellation request, in that
+            # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
                 return
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
+                return
+            
+            # To single aggregated tool results message.
             contents.append(types.Content(role="tool", parts=result_parts))
 
-        raise RuntimeError("Gemini tool loop exceeded MAX_STEPS without producing a final answer.")
+        raise RuntimeError("Gemini agent loop exceeded MAX_STEPS without producing a final answer.")
 
     def _accumulate_usage(self, usage: types.GenerateContentResponseUsageMetadata):
         """For updating TokenUsage after each SDK response in the agent loop."""

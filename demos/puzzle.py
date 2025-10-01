@@ -1,6 +1,6 @@
 import argparse
 import sys
-import threading
+import multiprocessing as mp
 from typing import List, Optional, Sequence
 
 from ..core import (
@@ -188,7 +188,7 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
     ctx = runtime.get_ctx()
     node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider)
 
-    stop_evt = threading.Event()
+    cancel_evt = mp.Event()
 
     def _writer(s: str) -> None:
         # Clear screen and render frame
@@ -198,17 +198,17 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
         sys.stdout.flush()
 
     start_tree_str_view(
-        stop_evt,
         node,
-        render_callback=render_tree_str,
+        cancel_evt,
         writer_callback=_writer,
+        render_callback=render_tree_str,
         hz=10.0,
     )
 
     try:
         result = node.result() or ""
     finally:
-        stop_evt.set()
+        cancel_evt.set()
 
     return result
 
