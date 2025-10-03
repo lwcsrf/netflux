@@ -1,5 +1,10 @@
 import time
+import sys
+import shutil
+import re
 from dataclasses import dataclass
+import multiprocessing as mp
+from multiprocessing.synchronize import Event
 from typing import List, Optional, Tuple
 
 from ..core import NodeState, NodeView
@@ -33,17 +38,9 @@ def _color(text: str, *, fg: Optional[str] = None, bold: bool = False, dim: bool
     return "".join(parts)
 
 
+# Cute Unicode spinner frames (braille)
 _SPINNER_FRAMES = [
-    "⠋",
-    "⠙",
-    "⠹",
-    "⠸",
-    "⠼",
-    "⠴",
-    "⠦",
-    "⠧",
-    "⠇",
-    "⠏",
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 ]
 
 
@@ -53,19 +50,19 @@ def _short_repr(value, max_len: int = 40) -> str:
     except Exception:
         s = str(value)
     if len(s) > max_len:
-        return s[: max_len - 1] + "…"
+        return s[: max_len - 3] + "..."
     return s
 
 
-def _format_args(inputs: dict, max_len: int = 60) -> str:
+def _format_args(inputs: dict, max_len: int = 800, per_val_len: int = 120) -> str:
     if not inputs:
         return ""
     items = []
     for k, v in inputs.items():
-        items.append(f"{k}={_short_repr(v, 20)}")
+        items.append(f"{k}={_short_repr(v, per_val_len)}")
     s = ", ".join(items)
     if len(s) > max_len:
-        s = s[: max_len - 1] + "…"
+        s = s[: max_len - 3] + "..."
     return s
 
 
@@ -85,6 +82,14 @@ def _state_glyph(state: NodeState, tick: int) -> Tuple[str, str]:
     return ("?", "white")
 
 
+def _type_glyph_for_fn(fn) -> str:
+    if fn.is_agent():
+        return "✨"
+    if fn.is_code():
+        return "⚙️"
+    return "•"
+
+
 @dataclass
 class ConsoleRender(Render[str]):
     """Renderer for a `NodeView` tree with lightweight animation that yields
@@ -95,10 +100,16 @@ class ConsoleRender(Render[str]):
     - Uses simple ANSI colors and symbols suitable for terminal UIs.
     - The output is a full frame (no cursor control). The caller typically
       clears the screen in their `ui_driver` before writing the frame.
+
+    Intended usage for a terminal UI:
+    - Call `ConsoleRender.pre_console()` before starting the view loop.
+    - Start the loop with `ui_driver=ConsoleRender.ui_driver`.
+    - On exit (e.g., in `finally:`), call `ConsoleRender.restore_console()`.
     """
 
     width: Optional[int] = None
     spinner_hz: float = 10.0
+    cancel_event: Optional[Event] = None
 
     def __post_init__(self) -> None:
         self._last_view: Optional[NodeView] = None
@@ -117,11 +128,17 @@ class ConsoleRender(Render[str]):
 
         tick = self._tick()
         lines: List[str] = []
+        cancel_pending = bool(self.cancel_event and self.cancel_event.is_set())
 
         def add_node(nv: NodeView, prefix: str, is_last: bool) -> None:
             glyph, color = _state_glyph(nv.state, tick)
+            # If cancellation is pending, visually mark non-terminal states distinctly
+            # to indicate "cancel requested" overlay without implying terminal state.
+            if cancel_pending and nv.state in (NodeState.Waiting, NodeState.Running):
+                color = "magenta"
             args = _format_args(nv.inputs)
-            header = f"{_color(glyph, fg=color, bold=True)} {_color(nv.fn.name, bold=True)}"
+            type_g = _type_glyph_for_fn(nv.fn)
+            header = f"{_color(glyph, fg=color, bold=True)} {_color(type_g, dim=True)} {_color(nv.fn.name, bold=True)}"
             if args:
                 header += f"({_color(args, dim=True)})"
 
@@ -141,8 +158,37 @@ class ConsoleRender(Render[str]):
                     msg = nv.exception.__class__.__name__
                 header += f" {_color('CANCEL', fg='yellow', bold=True)} {_short_repr(msg, 50)}"
 
-            branch = "└─ " if is_last else "├─ "
+            # Unicode box-drawing tree connectors
+            branch = ("└─ " if is_last else "├─ ")
             lines.append(prefix + branch + header if prefix else header)
+
+            # Print TokenUsage directly under the node header (agents only),
+            # preserving tree rails but without a branch marker.
+            if nv.usage:
+                u = nv.usage
+                in_fields = []
+                in_fields.append(f"cache_read={u.input_tokens_cache_read}")
+                if u.input_tokens_cache_write is not None:
+                    in_fields.append(f"cache_write={u.input_tokens_cache_write}")
+                in_fields.append(f"regular={u.input_tokens_regular}")
+                in_fields.append(f"total={u.input_tokens_total}")
+
+                out_fields = []
+                if u.output_tokens_reasoning is not None:
+                    out_fields.append(f"reasoning={u.output_tokens_reasoning}")
+                if u.output_tokens_text is not None:
+                    out_fields.append(f"text={u.output_tokens_text}")
+                out_fields.append(f"total={u.output_tokens_total}")
+
+                segs = []
+                if in_fields:
+                    segs.append(_color(f"In: {{{', '.join(in_fields)}}}", fg="cyan", bold=True))
+                if out_fields:
+                    segs.append(_color(f"Out: {{{', '.join(out_fields)}}}", fg="magenta", bold=True))
+
+                if segs:
+                    detail_prefix = prefix + ("   " if is_last else "│  ")
+                    lines.append(detail_prefix + "│    " + ", ".join(segs))
 
             child_prefix = prefix + ("   " if is_last else "│  ")
             count = len(nv.children)
@@ -150,4 +196,69 @@ class ConsoleRender(Render[str]):
                 add_node(child, child_prefix, idx == count - 1)
 
         add_node(self._last_view, prefix="", is_last=True)
+
+        # Footer: show cancellation overlay only while tree is non-terminal (root state).
+        root_state = self._last_view.state
+        if cancel_pending and root_state not in (NodeState.Success, NodeState.Error, NodeState.Canceled):
+            lines.append("")
+            lines.append(_color("Cancelation pending ...", fg="magenta", bold=True))
+
         return "\n".join(lines)
+
+    @staticmethod
+    def pre_console() -> None:
+        """Enter alt screen, hide cursor, disable wrap, clear scrollback."""
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J")
+        sys.stdout.flush()
+
+    @staticmethod
+    def restore_console() -> None:
+        """Show cursor, re-enable wrap, leave alt screen."""
+        sys.stdout.write("\x1b[?25h\x1b[?7h\x1b[?1049l")
+        sys.stdout.flush()
+
+    @staticmethod
+    def ui_driver(s: str) -> None:
+        """Simple console UI driver: clear and write cropped frame.
+
+        - Clears scrollback and screen and homes cursor before writing.
+        - Crops to a safe viewport (rows-1, cols-1) to avoid scroll/wrap.
+        - Pads with blank lines to overwrite remnants from previous frames.
+        """
+        # Clear scrollback + screen, then home
+        sys.stdout.write("\x1b[3J\x1b[2J\x1b[H")
+
+        # Compute safe viewport and crop to avoid implicit scroll/wrap
+        sz = shutil.get_terminal_size(fallback=(80, 24))
+        rows = max(1, sz.lines)
+        cols = max(1, sz.columns)
+        safe_rows = max(1, rows - 1)
+        safe_cols = max(1, cols - 1)
+
+        def _crop_tail_safe(line: str, max_cols: int, tail_allow: int = 18) -> str:
+            """Crop allowing a small tail to avoid cutting ANSI codes mid-seq.
+
+            Heuristic: overslice by `tail_allow`, then strip any trailing
+            partial CSI (e.g., ESC[ ... with no final byte). Always append
+            RESET to avoid style bleed if we did cut styling.
+            """
+            if len(line) <= max_cols:
+                return line
+            end = min(len(line), max_cols + max(0, tail_allow))
+            chunk = line[:end]
+            # Strip trailing partial CSI sequences like '\x1b[31;1' (no final letter)
+            chunk = re.sub(r"\x1b\[[0-9;?]*$", "", chunk)
+            # Also strip a bare trailing ESC, if any
+            if chunk.endswith("\x1b"):
+                chunk = chunk[:-1]
+            # Add RESET to ensure attributes are closed
+            return chunk + RESET
+
+        lines = s.splitlines()
+        cropped = [_crop_tail_safe(ln, safe_cols) for ln in lines[:safe_rows]]
+        # Pad with blanks to overwrite remnants from previous longer frames
+        if len(cropped) < safe_rows:
+            cropped.extend([""] * (safe_rows - len(cropped)))
+        payload = "\n".join(cropped)
+        sys.stdout.write(payload)
+        sys.stdout.flush()

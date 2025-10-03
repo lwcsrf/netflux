@@ -1,5 +1,6 @@
 import argparse
 import sys
+import shutil
 import multiprocessing as mp
 from typing import List, Optional, Sequence
 
@@ -13,7 +14,7 @@ from ..core import (
 )
 from ..runtime import Runtime
 from .auth_factory import CLIENT_FACTORIES
-from ..viz import ConsoleRender, start_view_loop
+from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
 
 
 PUZZLE_SOLVER_SYSTEM_PROMPT = (
@@ -179,8 +180,10 @@ INTERLEAVE_AGENT, INTERLEAVE_TOOLS = build_interleave_agent(
     desc=PUZZLE_SOLVER_DESC,
 )
 
-def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
+def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     """Execute the shared puzzle with a live tree view (single loop thread)."""
+
+    enable_vt_if_windows()
 
     runtime = Runtime(
         specs=[INTERLEAVE_AGENT, *INTERLEAVE_TOOLS],
@@ -194,38 +197,42 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
     # Ensure the root node participates in cooperative cancellation chaining.
     node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider, cancel_event=cancel_evt)
 
-    def _writer(s: str) -> None:
-        # Clear screen and render frame
-        sys.stdout.write("\x1b[H\x1b[2J")
-        sys.stdout.write(s)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    # Enter alternative screen buffer; hide cursor; disable auto-wrap; clear scrollback
+    ConsoleRender.pre_console()
 
     # UI: start a single-thread view loop using TextRender
-    _ = start_view_loop(
+    render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+    view_thread = start_view_loop(
         node,
-        cancel_evt,
-        render=ConsoleRender(spinner_hz=10.0),
-        ui_driver=_writer,
+        render=render,
+        ui_driver=ConsoleRender.ui_driver,
         update_interval=0.1,
     )
 
     try:
-        result = node.result() or ""
+       # Block until tree finished.
+       node.result()
     except KeyboardInterrupt:
         # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
         cancel_evt.set()
-        print("\nCancellation requested, waiting for tasks to stop...\n")
         # Wait for the node to conclude (may still finish success/exception per guidance).
         try:
-            result = node.result() or ""
+            node.result()
         except CancellationException:
-            result = ""
+            pass
     finally:
         # Ensure UI watcher/ticker threads exit.
         cancel_evt.set()
+        # Synchronize: ensure the view loop has exited
+        try:
+            view_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        # Restore cursor, re-enable auto-wrap and leave alternative screen buffer on exit
+        ConsoleRender.restore_console()    
 
-    return result
+    # Final render to show final state.
+    print(str(render.render(runtime.watch(node))))
 
 def parse_args(
     argv: Optional[List[str]] = None,
@@ -241,13 +248,11 @@ def parse_args(
     )
     return parser.parse_args(argv)
 
-def main(
-    argv: Optional[List[str]] = None
-) -> str:
+def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
     provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
     provider = Provider(provider_value)
-    return run_interleave_experiment_tree(provider)
+    run_interleave_experiment_tree(provider)
 
 if __name__ == "__main__":
     main()

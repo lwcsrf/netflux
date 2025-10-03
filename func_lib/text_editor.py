@@ -45,7 +45,7 @@ class TextEditor(CodeFunction):
         "`insert_line=30` inserts *after* the first 30 lines.\n"
         "Absolute paths are recommended to avoid ambiguity.\n"
         "String output:\n"
-        "• 'Success.' (create, insert, str_replace)\n"
+        "• Success confirmation (create, insert, str_replace)\n"
         "• Content requested (view)\n"
         "• Exception string (with detail; to help debug)\n"
     )
@@ -277,7 +277,7 @@ class TextEditor(CodeFunction):
 
         if updated != content:
             self._atomic_write_text(p, updated)
-        return "Success."
+        return "Replace successful."
 
     def handle_create(
         self,
@@ -313,7 +313,9 @@ class TextEditor(CodeFunction):
         except OSError as exc:
             raise OSError(f"while creating file '{p}': {exc}") from exc
 
-        return "Success."
+        # Count lines consistently with other operations (treat each newline-terminated chunk as a line)
+        line_count = len(file_text.splitlines(keepends=True))
+        return f"Successfully wrote {line_count} lines to new file: {p}."
 
     def handle_insert(
         self,
@@ -356,7 +358,7 @@ class TextEditor(CodeFunction):
 
         if updated != content:
             self._atomic_write_text(p, updated)
-        return "Success."
+        return "Insert successful."
 
     def _check_extraneous_args(self, args_provided: Set[str], command: str) -> None:
         allowed_by_cmd: dict[str, set[str]] = {
