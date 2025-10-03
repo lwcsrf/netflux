@@ -1,5 +1,6 @@
 import argparse
 import sys
+import shutil
 import multiprocessing as mp
 from typing import List, Optional, Sequence
 
@@ -196,19 +197,16 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     # Ensure the root node participates in cooperative cancellation chaining.
     node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider, cancel_event=cancel_evt)
 
-    def _writer(s: str) -> None:
-        # Hide cursor, clear+home, then render frame
-        sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
-        sys.stdout.write(s)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    # Enter alternative screen buffer; hide cursor; disable auto-wrap; clear scrollback
+    ConsoleRender.pre_console()
 
     # UI: start a single-thread view loop using TextRender
-    _ = start_view_loop(
+    render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+    view_thread = start_view_loop(
         node,
         cancel_evt,
-        render=ConsoleRender(spinner_hz=10.0),
-        ui_driver=_writer,
+        render=render,
+        ui_driver=ConsoleRender.ui_driver,
         update_interval=0.1,
     )
 
@@ -218,7 +216,6 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     except KeyboardInterrupt:
         # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
         cancel_evt.set()
-        print("\nCancellation requested, waiting for tasks to stop...\n")
         # Wait for the node to conclude (may still finish success/exception per guidance).
         try:
             node.result()
@@ -227,9 +224,16 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     finally:
         # Ensure UI watcher/ticker threads exit.
         cancel_evt.set()
-        # Show cursor on exit
-        sys.stdout.write("\x1b[?25h")
-        sys.stdout.flush()
+        # Synchronize: ensure the view loop has exited
+        try:
+            view_thread.join(timeout=2.0)
+        except Exception:
+            pass
+        # Restore cursor, re-enable auto-wrap and leave alternative screen buffer on exit
+        ConsoleRender.restore_console()    
+
+    # Final render to show final state.
+    print(str(render.render(runtime.watch(node))))
 
 def parse_args(
     argv: Optional[List[str]] = None,

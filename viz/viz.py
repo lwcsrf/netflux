@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from multiprocessing.synchronize import Event
 from typing import Callable, Generic, Optional, TypeVar
 
-from ..core import Node, NodeView
+from ..core import Node, NodeView, TerminalNodeStates
 
 RenderType = TypeVar("RenderType")
 
@@ -84,16 +84,27 @@ def start_view_loop(
         prev_seq = 0
         next_at = time.monotonic()
         interval = max(0.0, float(update_interval))
+        last_view: Optional[NodeView] = None
 
-        while not cancel_event.is_set():
+        while True:
             now = time.monotonic()
             # ensure periodic wake-ups for animation by using watch timeout
             remaining = max(0.0, next_at - now)
             view = node.watch(as_of_seq=prev_seq, timeout=remaining)
             if view is not None:
                 prev_seq = view.update_seqnum
+                last_view = view
+
             payload = render.render(view)
             ui_driver(payload)
+
+            # Exit condition: once the node reaches a terminal state, stop the loop,
+            # regardless of cancellation. If cancellation is requested earlier,
+            # continue rendering until terminal to visualize graceful shutdown.
+            current = view if view is not None else last_view
+            if current is not None and current.state in TerminalNodeStates:
+                break
+
             next_at += interval
 
     t = threading.Thread(target=_loop, name="netflux-view-loop", daemon=True)

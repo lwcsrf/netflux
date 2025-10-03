@@ -1,5 +1,9 @@
 import time
+import sys
+import shutil
 from dataclasses import dataclass
+import multiprocessing as mp
+from multiprocessing.synchronize import Event
 from typing import List, Optional, Tuple
 
 from ..core import NodeState, NodeView
@@ -87,10 +91,16 @@ class ConsoleRender(Render[str]):
     - Uses simple ANSI colors and symbols suitable for terminal UIs.
     - The output is a full frame (no cursor control). The caller typically
       clears the screen in their `ui_driver` before writing the frame.
+
+    Intended usage for a terminal UI:
+    - Call `ConsoleRender.pre_console()` before starting the view loop.
+    - Start the loop with `ui_driver=ConsoleRender.ui_driver`.
+    - On exit (e.g., in `finally:`), call `ConsoleRender.restore_console()`.
     """
 
     width: Optional[int] = None
     spinner_hz: float = 10.0
+    cancel_event: Optional[Event] = None
 
     def __post_init__(self) -> None:
         self._last_view: Optional[NodeView] = None
@@ -109,9 +119,14 @@ class ConsoleRender(Render[str]):
 
         tick = self._tick()
         lines: List[str] = []
+        cancel_pending = bool(self.cancel_event and self.cancel_event.is_set())
 
         def add_node(nv: NodeView, prefix: str, is_last: bool) -> None:
             glyph, color = _state_glyph(nv.state, tick)
+            # If cancellation is pending, visually mark non-terminal states distinctly
+            # to indicate "cancel requested" overlay without implying terminal state.
+            if cancel_pending and nv.state in (NodeState.Waiting, NodeState.Running):
+                color = "magenta"
             args = _format_args(nv.inputs)
             header = f"{_color(glyph, fg=color, bold=True)} {_color(nv.fn.name, bold=True)}"
             if args:
@@ -143,5 +158,50 @@ class ConsoleRender(Render[str]):
                 add_node(child, child_prefix, idx == count - 1)
 
         add_node(self._last_view, prefix="", is_last=True)
+
+        # Footer: show cancellation overlay only while tree is non-terminal (root state).
+        root_state = self._last_view.state
+        if cancel_pending and root_state not in (NodeState.Success, NodeState.Error, NodeState.Canceled):
+            lines.append("")
+            lines.append(_color("Cancelation pending ...", fg="magenta", bold=True))
+
         return "\n".join(lines)
 
+    @staticmethod
+    def pre_console() -> None:
+        """Enter alt screen, hide cursor, disable wrap, clear scrollback."""
+        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J")
+        sys.stdout.flush()
+
+    @staticmethod
+    def restore_console() -> None:
+        """Show cursor, re-enable wrap, leave alt screen."""
+        sys.stdout.write("\x1b[?25h\x1b[?7h\x1b[?1049l")
+        sys.stdout.flush()
+
+    @staticmethod
+    def ui_driver(s: str) -> None:
+        """Simple console UI driver: clear and write cropped frame.
+
+        - Clears scrollback and screen and homes cursor before writing.
+        - Crops to a safe viewport (rows-1, cols-1) to avoid scroll/wrap.
+        - Pads with blank lines to overwrite remnants from previous frames.
+        """
+        # Clear scrollback + screen, then home
+        sys.stdout.write("\x1b[3J\x1b[2J\x1b[H")
+
+        # Compute safe viewport and crop to avoid implicit scroll/wrap
+        sz = shutil.get_terminal_size(fallback=(80, 24))
+        rows = max(1, sz.lines)
+        cols = max(1, sz.columns)
+        safe_rows = max(1, rows - 1)
+        safe_cols = max(1, cols - 1)
+
+        lines = s.splitlines()
+        cropped = [ln[:safe_cols] for ln in lines[:safe_rows]]
+        # Pad with blanks to overwrite remnants from previous longer frames
+        if len(cropped) < safe_rows:
+            cropped.extend([""] * (safe_rows - len(cropped)))
+        payload = "\n".join(cropped)
+        sys.stdout.write(payload)
+        sys.stdout.flush()

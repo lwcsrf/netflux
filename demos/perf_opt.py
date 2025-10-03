@@ -3,6 +3,7 @@ import io
 import contextlib
 import os
 import sys
+import shutil
 import time
 import platform
 import tempfile
@@ -12,7 +13,7 @@ import multiprocessing as mp
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from ..core import AgentFunction, CodeFunction, FunctionArg, Provider, RunContext, CancellationException
+from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider, RunContext, CancellationException
 from ..runtime import Runtime
 from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
 from .auth_factory import CLIENT_FACTORIES
@@ -300,45 +301,51 @@ perf_optimizer = AgentFunction(
         "- Read both reports. Next, you will spend the bulk of your time thinking super-critically about both reports.\n"
         "- Once you have analyzed the reports, synthesize a new implementation in a new file in `scratch_dir`.\n"
         "- Ensure the new candidate has proper scaffold for profiling.\n"
-        "- Use robust unique filenames for all artifacts to avoid collisions: append a hyphen + hex suffix to\n"
+        "- Use robust unique filenames for all artifacts to avoid collisions: append a hyphen + hex suffix to "
         "  each output filepath you choose (e.g. profile reports, reasoner reports, candidates, final report).\n"
         "- Import/Packaging rules (critical):\n"
-        "  - The file at `input_code_path` may belong to an installed package (editable install). When you create a new\n"
-        "    candidate in `scratch_dir`, executing it with the profiler uses `exec(...)` under `__name__='__main__'`\n"
+        "  - The file at `input_code_path` may belong to an installed package (editable install). When you create a new "
+        "    candidate in `scratch_dir`, executing it with the profiler uses `exec(...)` under `__name__='__main__'` "
         "    and `__package__=None`. Therefore, RELATIVE IMPORTS WILL BREAK (e.g., `from ..parentmodule import a`).\n"
-        "  - You MUST rewrite all relative imports, such as `from .x import y` or\n"
-        "    `from ..parentmodule import a` into ABSOLUTE imports anchored at the original top-level package.\n"
+        "  - You MUST rewrite all relative imports, such as `from .x import y` or "
+        "    `from ..parentmodule import a` into ABSOLUTE imports anchored at the original top-level package. "
         "    The top-level package should be in the venv and thus discoverable on sys.path.\n"
         f" - Fail early using {raise_exception.name} if this is not working out.\n"
-        "  - Example: if `input_code_path` is `/a/b/c/mypkg/subpkg/impl.py`, then `from ..parentmodule import a as a1`\n"
+        "  - Example: if `input_code_path` is `/a/b/c/mypkg/subpkg/impl.py`, then `from ..parentmodule import a as a1` "
         "    MUST become `from mypkg.parentmodule import a as a1`.\n"
         "- Use the perf profile report to also detect source code errors that may cause runtime failures, by looking at "
         "  the captured stderr and exception sections. If you find issues, fix them in the new candidate. "
         "  If a bug was already present and it can't be fixed after some attempts, use {raise_exception.name} to fail.\n"
-        "- Iterate until you hit a clear plateau: once remaining ideas stop improving the profile and it's evident no\n"
+        "- Iterate until you hit a clear plateau: once remaining ideas stop improving the profile and it's evident no "
         "  further material gains are available, stop attempting further improvements, or stop when max_iters is reached.\n"
-        "- Finally, produce a CLEAN file in `scratch_dir`: including:\n"
-        "  - \"Explanation of Changes\" section\n"
-        "    - identify all bottlenecks identified\n"
-        "    - how they were addressed\n"
-        "  - \"Performance Gains\" summary\n"
-        "    - quantify improvements over each iteration.\n"
-        "    - quantify overall improvement from original to final.\n"
-        "  - \"Iteration Log\"\n"
-        "    - summarize what the iterations were"
-        f"      - what input path was used for each function call involved (e.g. {perf_profiler.name}, {perf_reasoner.name})\n"
-        "      - what output path was produced for each function call involved\n"
-        "  - \"New Implementation\"\n"
-        "    - Just the final code to replace the original that was at `input_code_path`.\n\n"
-        "Return its absolute path.\n"
-        "</instructions>\n\n"
-        "<reconciliation_instructions>\n"
+        "<reconciliation>\n"
         "- Parse the paths returned by the functions you invoke and read them to inform your iteration decisions.\n"
         "- Consider both the performance profiling metrics and the critical reasoning analysis when drafting iterations. "
-        " The critical reasoner may identify issues that are not visible in the profile because of the particular input data. "
-        " Thus, weigh its analysis carefully and consider if the next iteration's setup should be adjusted to surface bottlenecks "
-        " currently not visible in the profile.\n"
-        "</reconciliation_instructions>\n"
+        "  The critical reasoner may identify issues that are not visible in the profile because of the particular input data. "
+        "  Thus, weigh its analysis carefully and consider if the next iteration's setup should be adjusted to surface bottlenecks "
+        "  currently not visible in the profile.\n"
+        "</reconciliation>\n"        
+        "<final_deliverable>\n"
+        "- Lastly, PRODUCE A FINAL REPORT IN `scratch_dir` CONTAINING EXACTLY:\n"
+        "  1. \"Explanation of Changes\" section\n"
+        "    - Identify all bottlenecks discovered over the whole process.\n"
+        "    - How they were each addressed.\n"
+        "  2. \"Performance Gains\" numerical summary\n"
+        "    - Quantify improvements over each iteration.\n"
+        "    - Quantify overall improvement from original to final.\n"
+        "  3. \"Iteration Log\"\n"
+        "    - Summarize what the iterations were. For each iteration, include:\n"
+        f"     - What input path was used for each function/tool call involved (e.g. {perf_profiler.name}, {perf_reasoner.name}).\n"
+        "      - What output path was produced for each function/tool call involved.\n"
+        "  - \"New Implementation\"\n"
+        "    - The final code to replace the original code that was at `input_code_path` (not including scaffold additions).\n\n"
+        "</final_deliverable>\n"
+        "<final_output>\n"
+        "Return a string containing the absolute filepath of your final report.\n"
+        "Your final completion text should be only this filepath, nothing else. Save commentary for the report.\n"
+        "</final_output>\n"
+        "</instructions>\n\n"
+
     ),
     user_prompt_template=(
         "## Inputs\n"
@@ -381,7 +388,7 @@ def make_demo_workspace() -> Dict[str, str]:
     }
 
 
-def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> str:
+def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> Optional[str]:
     enable_vt_if_windows()
     ws = make_demo_workspace()
 
@@ -411,33 +418,53 @@ def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> str:
         cancel_event=cancel_evt,
     )
 
-    def _writer(frame: str) -> None:
-        sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
-        sys.stdout.write(frame)
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    # Enter alternate screen buffer, hide cursor, disable wrap, clear scrollback
+    ConsoleRender.pre_console()
 
-    _ = start_view_loop(
+    # UI: start a single-thread background view loop to console.
+    render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+    view_thread = start_view_loop(
         node,
         cancel_evt,
-        render=ConsoleRender(spinner_hz=10.0),
-        ui_driver=_writer,
+        render=render,
+        ui_driver=ConsoleRender.ui_driver,
         update_interval=0.1,
     )
 
+    final_path: Optional[str] = None
     try:
-        final_path = node.result()
+       # Block until tree finished.
+       final_path = str(node.result())
     except KeyboardInterrupt:
+        # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
         cancel_evt.set()
-        print("\nCancellation requested, waiting for tasks to stop...\n")
-        # Will raise CancellationException to terminal.
-        final_path = node.result()
-    finally:
-        cancel_evt.set()
-        sys.stdout.write("\x1b[?25h")
-        sys.stdout.flush()
+    except:
+        # Handle below.
+        pass
+    
+    # Wait for terminal state.
+    node.wait()
+    # Ensure UI watcher/ticker threads exit.
+    cancel_evt.set()
+    # Synchronize: ensure the view loop has exited
+    try:
+        view_thread.join(timeout=2.0)
+    except Exception:
+        pass
+    # Restore cursor, re-enable auto-wrap and leave alternative screen buffer on exit
+    ConsoleRender.restore_console()
 
-    return str(final_path)
+    # Final render to show final state (regardless of success, error, canceled).
+    print(str(render.render(runtime.watch(node))))
+
+    if node.state == NodeState.Error:
+        print(f"\nError: {node.exception}")
+    elif node.state == NodeState.Canceled:
+        print("\nCanceled.")
+    elif node.state == NodeState.Success:
+        print(f"\nSuccess. Final report at: {final_path}")
+
+    return final_path
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
@@ -458,17 +485,14 @@ def main(argv: Optional[List[str]] = None) -> None:
     provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
     provider = Provider(provider_value)
     report_path = run_perf_optimizer_tree(provider)
-    
-    # Read and print the content of the final report
+    if not report_path:
+        return
+
     try:
         report_file = Path(report_path)
         if report_file.exists():
             report_content = report_file.read_text(encoding="utf-8")
             print(f"""
-{'=' * 80}
-FINAL REPORT PATH
-{'=' * 80}
-{report_path}
 {'=' * 80}
 FINAL REPORT CONTENT
 {'=' * 80}
