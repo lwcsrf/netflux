@@ -179,16 +179,21 @@ class Ensemble(CodeFunction):
 
             return result
 
-        # Build a callable whose signature exactly mirrors the wrapped agent's args.
+        # Build a callable whose signature exactly mirrors the wrapped agent's args,
+        # while enforcing keyword-only params after RunContext to satisfy CodeFunction contract.
         names = [a.name for a in agent.args]
-        params_sig = ", ".join(names)
         dict_kv = ", ".join([f"'{n}': {n}" for n in names])
-        src = (
-            f"def _ensemble_call(ctx{', ' + params_sig if params_sig else ''}):\n"
-            f"    args = {{{dict_kv}}}\n" if dict_kv else
-            f"def _ensemble_call(ctx):\n"
-            f"    args = {{}}\n"
-        )
+        if names:
+            params_sig = "*, " + ", ".join(names)
+            src = (
+                f"def _ensemble_call(ctx, {params_sig}):\n"
+                f"    args = {{{dict_kv}}}\n"
+            )
+        else:
+            src = (
+                f"def _ensemble_call(ctx):\n"
+                f"    args = {{}}\n"
+            )
         src += "    return __impl(ctx, args)\n"
         ns: Dict[str, Any] = {"__impl": __impl}
         exec(src, ns)

@@ -1,558 +1,337 @@
+import argparse
+import io
 import sys
-import os
 import time
-import textwrap
+import traceback
+import platform
 import tempfile
-import subprocess
 import multiprocessing as mp
 from pathlib import Path
-from typing import Dict, Any, List, Set, Tuple, Optional
+from typing import Any, Dict, List, Optional
 
-from .. import core
+from ..core import AgentFunction, CancellationException, CodeFunction, FunctionArg, Provider, RunContext
 from ..runtime import Runtime
-from .auth_factory import CLIENT_FACTORIES
 from ..viz import ConsoleRender, start_view_loop
+from .auth_factory import CLIENT_FACTORIES
+from ..func_lib.text_editor import text_editor
+from ..func_lib.ensemble import Ensemble
 
-def _ts() -> str:
-    return time.strftime("%H:%M:%S")
-
-def trace(msg: str) -> None:
-    print(f"[{_ts()}] {msg}", flush=True)
-
-def _indent(depth: int) -> str:
-    return "  " * depth
-
-def _read_text_file(ctx: core.RunContext, *, filepath: str) -> str:
-    p = Path(filepath)
-    if not p.exists():
-        raise FileNotFoundError(str(p))
-    s = p.read_text(encoding="utf-8", errors="replace")
-    trace(f"CodeFunction read_text_file: read {len(s)} chars from {p}")
-    return s
-
-ReadTextFile = core.CodeFunction(
-    name="read_text_file",
-    desc="Read a UTF-8 text file and return its contents.",
-    args=[core.FunctionArg("filepath", str, "Absolute path to a text file")],
-    callable=_read_text_file,
+ULTRATHINK_PROMPT = (
+"""
+You are part of an expert applied science team working on a component that will run on a spacecraft
+during missions where human lives are at stake. Thus, please be extremely thorough,
+critical, meticulous, and thoughtful in your work, as we have zero failure tolerance.
+You should be extremely liberal in reasoning tokens and take as much time as needed
+to carry out exhaustive analysis. <thinking_level>**Think ultra-hard.**</thinking_level>
+"""
 )
 
-def _write_text_file(ctx: core.RunContext, *, filepath: str, content: str, overwrite: bool) -> str:
-    p = Path(filepath)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    if p.exists() and not overwrite:
-        raise FileExistsError(f"Refusing to overwrite existing file: {p}")
-    p.write_text(content, encoding="utf-8")
-    trace(f"CodeFunction write_text_file: wrote {len(content)} chars to {p}")
-    return str(p.resolve())
+class PerfProfiler(CodeFunction):
+    def __init__(self):
+        super().__init__(
+            name="profile_perf",
+            desc=(
+"""Execute and profile a self-contained Python file using cProfile, then write a
+plaintext report (path is returned). The file must include both:
+- setup for representative test data
+- invocation of the target entrypoint using that data
 
-WriteTextFile = core.CodeFunction(
-    name="write_text_file",
-    desc="Write text content to a file. Returns the absolute path.",
-    args=[
-        core.FunctionArg("filepath", str, "Absolute output file path"),
-        core.FunctionArg("content", str, "Text content to write"),
-        core.FunctionArg("overwrite", bool, "Set true to overwrite if the file exists"),
-    ],
-    callable=_write_text_file,
-)
+Behavior:
+- Sets up the profiler wrapper.
+- Uses exec() on the file's contents.
+- Captures wall clock time and cProfile stats (sorted by cumulative time).
+- Writes a human-readable report including top hot spots.
 
-def _venv_python(venv_path: str) -> str:
-    vp = Path(venv_path)
-    if sys.platform.startswith("win"):
-        py = vp / "Scripts" / "python.exe"
-    else:
-        py = vp / "bin" / "python"
-    if not py.exists():
-        raise FileNotFoundError(f"Python interpreter not found in venv: {py}")
-    return str(py)
+Assume profiling and execution is done using the relevant project's venv.
+For example, if the code uses numpy, pandas, or any non-stdlib dependency at all,
+assume it will be run in a venv where those are installed."""
+            ),
+            args=[
+                FunctionArg("code_path", str, 
+                            "Absolute path to python file under profiling (contains setup + invocation)."),
+                FunctionArg("report_path", str, 
+                            "Absolute filepath for the output report."),
+            ],
+            callable=self._profile_perf,
+        )
 
-def _perf_profile_tool(ctx: core.RunContext, *, test_script: str, venv_path: str, target: str) -> str:
-    """
-    - Syntax-checks the test_script in the venv
-    - Profiles it with cProfile in the venv
-    - Filters stats to the target function and its callees
-    - Writes a rich plaintext report to /tmp/... and returns that path (string)
-    """
-    py = _venv_python(venv_path)
-    test_script_path = Path(test_script).resolve()
-    if not test_script_path.exists():
-        raise FileNotFoundError(f"test_script not found: {test_script_path}")
+    def _profile_perf(
+        self,
+        ctx: RunContext, *,
+        code_path: str,
+        report_path: str,
+    ) -> str:
+        """
+        Execute and profile a self-contained Python file using cProfile, then write a
+        plaintext report (path is returned). The file must include both:
+        - setup for representative test data
+        - invocation of the target entrypoint on that data
 
-    out_txt = Path(tempfile.mkstemp(prefix="netflux_profile_", suffix=".txt")[1])
-    trace(f"CodeFunction PerfProfileTool: compile-check {test_script_path}")
-    comp = subprocess.run(
-        [py, "-m", "py_compile", str(test_script_path)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        cwd=str(test_script_path.parent),
-    )
-    if comp.returncode != 0:
-        report = []
-        report.append("# PERF PROFILE REPORT (COMPILE ERROR)")
-        report.append(f"TEST_SCRIPT: {test_script_path}")
-        report.append(f"TARGET_FUNC: {target}")
-        report.append("")
-        report.append("== PY_COMPILE STDERR ==")
-        report.append(comp.stderr.rstrip())
-        out_txt.write_text("\n".join(report), encoding="utf-8")
-        trace(f"CodeFunction PerfProfileTool: compile error, wrote report {out_txt}")
-        return str(out_txt)
+        Behavior:
+        - Starts the profiler, then execs the file's contents (like `python file.py`).
+        - Captures wall clock time and cProfile stats (sorted by cumulative time).
+        - Writes a human-readable report including top hot spots.
 
-    wrapper = r"""
-import sys, runpy, cProfile, pstats, io, time, traceback, platform
-from pathlib import Path
+        Notes:
+        - No subprocess or venv is used; runs in-process. If your code requires isolation
+        or a specific interpreter, use a wrapper file that shells out, then point here.
+        """
+        import cProfile
+        import pstats
 
-def main():
-    test_script = Path(sys.argv[1]).resolve()
-    target_name = sys.argv[2]
-    out_path = Path(sys.argv[3]).resolve()
-    try:
+        p = Path(code_path).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"code_path not found: {p}")
+        try:
+            src = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            raise RuntimeError(f"Unable to read code_path: {p}: {e}")
+
+        # Prepare output path
+        out_file = Path(report_path).expanduser().resolve()
+        out_file.parent.mkdir(parents=True, exist_ok=True)
+
         pr = cProfile.Profile()
         wall_t0 = time.perf_counter()
-        pr.enable()
-        runpy.run_path(str(test_script), run_name="__main__")
-        pr.disable()
+
+        # Isolate globals for exec; emulate module run
+        g: Dict[str, Any] = {
+            "__file__": str(p),
+            "__name__": "__main__",
+            "__package__": None,
+            "__cached__": None,
+        }
+
+        # Capture stdout/stderr produced by the program to surface in the report
+        stdout_cap = io.StringIO()
+        stderr_cap = io.StringIO()
+        real_stdout, real_stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = stdout_cap, stderr_cap
+        exec_exception: Optional[str] = None
+
+        try:
+            pr.enable()
+            code_obj = compile(src, str(p), "exec")
+            exec(code_obj, g, g)
+            pr.disable()
+        except SystemExit as e:  # if the code calls sys.exit(), treat as normal completion
+            pr.disable()
+            exec_exception = f"SystemExit: {e}"
+        except Exception:
+            pr.disable()
+            exec_exception = traceback.format_exc()
+        finally:
+            sys.stdout, sys.stderr = real_stdout, real_stderr
+
         wall_elapsed = time.perf_counter() - wall_t0
 
+        # Build report
         s = io.StringIO()
-        ps = pstats.Stats(pr, stream=s)
-        ps.strip_dirs()
-        stats = ps.stats  # func -> (cc, nc, tt, ct, callers)
+        s.write("# PERF PROFILE REPORT\n")
+        s.write(f"CODE_PATH: {p}\n")
+        s.write(f"PYTHON: {platform.python_version()} ({sys.executable})\n")
+        s.write(f"PLATFORM: {platform.platform()}\n")
+        s.write(f"SCRIPT_WALL_CLOCK_S: {wall_elapsed:.6f}\n")
+        if exec_exception:
+            s.write("\n== PROGRAM EXCEPTION ==\n")
+            s.write(exec_exception.rstrip() + "\n")
 
-        call_graph = {}
-        for callee, (_, _, _, _, callers) in stats.items():
-            for caller in callers.keys():
-                call_graph.setdefault(caller, set()).add(callee)
+        # cProfile stats
+        s.write("\n== CPROFILE (top 50 by cumulative time) ==\n")
+        ps_io = io.StringIO()
+        ps = pstats.Stats(pr, stream=ps_io)
+        ps.strip_dirs().sort_stats("cumulative").print_stats(50)
+        s.write(ps_io.getvalue())
 
-        target_candidates = [f for f in stats.keys() if f[2] == target_name]
-        target_key, best_ct = None, -1.0
-        for f in target_candidates:
-            ct = stats[f][3]
-            if ct > best_ct:
-                target_key, best_ct = f, ct
+        # Hotspots table (func key -> (cc, nc, tt, ct))
+        s.write("\n== HOTSPOTS (cumtime desc) ==\n")
+        stats = ps.stats  # type: ignore[attr-defined]
+        rows: List[tuple[str, float, float, int, int]] = []
+        for (filename, line, func_name), (cc, nc, tt, ct, _callers) in stats.items():
+            rows.append((f"{func_name} ({filename}:{line})", ct, tt, cc, nc))
+        rows.sort(key=lambda r: r[1], reverse=True)
+        for name, ct, tt, cc, nc in rows[:50]:
+            s.write(f"- {name}: cum={ct:.6f}s, tot={tt:.6f}s, calls={nc}/{cc}\n")
 
-        with out_path.open("w", encoding="utf-8") as fh:
-            fh.write("# PERF PROFILE REPORT\n")
-            fh.write(f"HOST: {platform.node()}  PY: {sys.version.split()[0]}  PLATFORM: {platform.platform()}\n")
-            fh.write(f"TEST_SCRIPT: {test_script}\n")
-            fh.write(f"TARGET_FUNC: {target_name}\n")
-            fh.write(f"SCRIPT_WALL_CLOCK_S: {wall_elapsed:.6f}\n")
-            fh.write("\n")
+        # Program stdout/stderr
+        out = stdout_cap.getvalue()
+        err = stderr_cap.getvalue()
+        if out:
+            s.write("\n== PROGRAM STDOUT ==\n")
+            s.write(out.rstrip() + "\n")
+        if err:
+            s.write("\n== PROGRAM STDERR ==\n")
+            s.write(err.rstrip() + "\n")
 
-            if not target_key:
-                fh.write("TARGET_STATUS: NOT_FOUND\n")
-                fh.write("NOTE: Target name not found in cProfile stats. Showing global top by CUMTIME.\n\n")
-                rows = []
-                for f, (cc, nc, tt, ct, callers) in stats.items():
-                    rows.append((ct, tt, nc, cc, f))
-                rows.sort(reverse=True)
-                fh.write("GLOBAL_TOP_BY_CUMTIME:\n")
-                fh.write("ct_s  tt_s  nc  cc  file:line func\n")
-                for (ct, tt, nc, cc, f) in rows[:50]:
-                    fh.write(f"{ct:8.6f}  {tt:8.6f}  {nc:6d} {cc:6d}  {f[0]}:{f[1]} {f[2]}\n")
-                return
+        out_file.write_text(s.getvalue(), encoding="utf-8")
+        return f"Report written to: {out_file}"
 
-            fh.write("TARGET_STATUS: FOUND\n")
-            tgt_cc, tgt_nc, tgt_tt, tgt_ct, _ = stats[target_key]
-            fh.write("METRICS:\n")
-            fh.write(f"  target.cumtime_s: {tgt_ct:.6f}\n")
-            fh.write(f"  target.tottime_s: {tgt_tt:.6f}\n")
-            fh.write(f"  target.calls: {tgt_nc}\n")
-            fh.write("\n")
+perf_profiler = PerfProfiler()
 
-            reachable = set()
-            stack = [target_key]
-            while stack:
-                cur = stack.pop()
-                if cur in reachable: continue
-                reachable.add(cur)
-                for callee in call_graph.get(cur, ()):
-                    if callee not in reachable:
-                        stack.append(callee)
 
-            rows = []
-            for f in reachable:
-                cc, nc, tt, ct, _ = stats[f]
-                rows.append((ct, tt, nc, cc, f))
-            rows.sort(reverse=True)
-
-            fh.write("REACHABLE_TOP_BY_CUMTIME (TARGET and callees):\n")
-            fh.write("ct_s     tt_s     nc     cc     file:line func\n")
-            for (ct, tt, nc, cc, f) in rows[:80]:
-                fh.write(f"{ct:8.6f} {tt:8.6f} {nc:6d} {cc:6d}  {f[0]}:{f[1]} {f[2]}\n")
-
-            fh.write("\nRAW_PSTATS_SUMMARY:\n")
-            ps.sort_stats('cumulative').print_stats(40)
-            fh.write(s.getvalue())
-
-    except SystemExit:
-        raise
-    except Exception:
-        with out_path.open("w", encoding="utf-8") as fh:
-            fh.write("# PERF PROFILE REPORT (RUNTIME ERROR)\n")
-            fh.write(f"TEST_SCRIPT: {test_script}\n")
-            fh.write(f"TARGET_FUNC: {target_name}\n\n")
-            fh.write(traceback.format_exc())
-
-if __name__ == "__main__":
-    main()
-"""
-    wrapper_path = Path(tempfile.mkstemp(prefix="netflux_profwrap_", suffix=".py")[1])
-    wrapper_path.write_text(wrapper, encoding="utf-8")
-
-    trace("CodeFunction PerfProfileTool: running profiler wrapper in venv")
-    run = subprocess.run(
-        [_venv_python(venv_path), str(wrapper_path), str(test_script_path), str(target), str(out_txt)],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-        cwd=str(test_script_path.parent),
-    )
-    if run.stdout.strip():
-        trace("CodeFunction PerfProfileTool (stdout): " + run.stdout.strip())
-    if run.stderr.strip():
-        trace("CodeFunction PerfProfileTool (stderr): " + run.stderr.strip())
-    trace(f"CodeFunction PerfProfileTool: wrote report {out_txt}")
-    return str(out_txt)
-
-PerfProfileTool = core.CodeFunction(
-    name="PerfProfileTool",
-    desc=("Profiles a Python test script inside the given venv; filters stats to the target function "
-          "and its callees; writes a rich plaintext report to /tmp and returns its absolute path."),
+perf_reasoner = AgentFunction(
+    name="perf_reasoner",
+    desc=(
+        "Analyze a Python implementation and propose performance improvements. Reads the file, then writes a "
+        "detailed theoretical bottleneck analysis and optimization plan to a report file."
+    ),
     args=[
-        core.FunctionArg("test_script", str, "Absolute path to a self-contained test script"),
-        core.FunctionArg("venv_path", str, "Absolute path to a Python virtual environment"),
-        core.FunctionArg("target", str, "Name of the function to profile"),
+        FunctionArg("code_path", str, "Absolute path to implementation to review."),
+        FunctionArg("report_path", str, "Absolute path to write the analysis report (new file)."),
     ],
-    callable=_perf_profile_tool,
+    system_prompt=(
+        f"{ULTRATHINK_PROMPT}\n"
+        "You are a critical performance engineer.\n"
+        "- Identify algorithmic and data-structure inefficiencies, hot loops, I/O hotspots, and Pythonism issues.\n"
+        "- Recommend concrete code-level changes with rationale and expected impact.\n"
+        "- Propose a quick micro-benchmark or representative input for validation.\n"
+        "Return exactly: 'See the report here: <report_path>'.\n"
+    ),
+    user_prompt_template=(
+        "INPUTS:\n"
+        "code_path: {code_path}\n"
+        "report_path: {report_path}\n"
+        "---\n"
+        "Task: produce an extremely thorough analysis and write it to `report_path`. "
+        "Provide the final confirmation message when done.\n"
+    ),
+    uses=[text_editor],
+    default_model=Provider.Anthropic,
+)
+
+perf_critical_reasoner = Ensemble(
+    agent=perf_reasoner,
+    instances={
+        Provider.Anthropic: 1,
+        Provider.Gemini: 2,
+    },
+    allow_fail={
+        Provider.Anthropic: 0,
+        Provider.Gemini: 1,
+    },
+    name="perf_critical_reasoner",
+)
+
+perf_optimizer = AgentFunction(
+    name="perf_optimizer",
+    desc=(
+        "Iteratively optimize a Python implementation using profiling and critical reasoning. "
+        "Adds a test scaffold (if missing), empirically profiles, analytically reasons, and rewrites the code for performance. "
+        "Re-evaluates to measure improvements, and repeats the process until exhaustion or plateau. "
+        "Produces a final report with the optimized implementation, analysis of changes, and performance gains."
+    ),
+    args=[
+        FunctionArg("input_code_path", str, "Absolute path to the initial implementation to optimize."),
+        FunctionArg("scope_instruction", str, "Scope of optimization, e.g. 'optimize expensive_compute() and associated code'."),
+        FunctionArg("scratch_dir", str, "Working dir to store intermediate artifacts, candidate code iterations, and intermediate/final reports."),
+        FunctionArg("max_iters", int, "Maximum optimization iterations."),
+    ],
+    system_prompt=(
+        f"{ULTRATHINK_PROMPT}\n"
+        "ROLE: You are a critical performance engineer.\n\n"
+        "CONTRACT:\n"
+        "- All inputs and outputs are file paths. Write every artifact to `scratch_dir`.\n"
+        "- For profiling, the `code_path` must include setup + invocation of the target on representative data. Include\n"
+        "  enough input volume and repeated calls to yield rich and stable profiling (good stack/call stats).\n"
+        "- If the original `input_code_path` content lacks scaffold, create a new scaffolded file in `scratch_dir` by appending a bottom section:\n"
+        "  `if __name__ == '__main__':  # setup test data -> call target -> maybe print result`.\n"
+        "- On each iteration, maintain a candidate file that is ready-to-profile (implementation + scaffold). The scaffold\n"
+        "  should generate substantial data or loop over varied inputs to increase sample size.\n"
+        "- In parallel at the start of each iteration: call {profile_perf.name} and {perf_critical_reasoner.name} "
+        "  on the latest iteration candidate to collect ideas for how to make it more performant.\n"
+        "- Read both reports. Next, you will spend the bulk of your time thinking super-critically about both reports.\n"
+        "- Once you have analyzed the reports, synthesize a new implementation in a new file in `scratch_dir`.\n"
+        "- Ensure the new candidate has proper scaffold for profiling.\n"
+        "- Use robust unique filenames for all artifacts to avoid collisions: append a hyphen + hex suffix to\n"
+        "  each output filepath you choose (e.g. profile reports, reasoner reports, candidates, final report).\n"
+        "- Iterate until you hit a clear plateau: once remaining ideas stop improving the profile and it's evident no\n"
+        "  further material gains are available, stop attempting further improvements, or stop when max_iters is reached.\n"
+        "- Finally, produce a CLEAN file in `scratch_dir`: including:\n"
+        "  - \"Explanation of Changes\" section\n"
+        "    - identify all bottlenecks identified\n"
+        "    - how they were addressed\n"
+        "  - \"Performance Gains\" summary\n"
+        "    - quantify improvements over each iteration.\n"
+        "    - quantify overall improvement from original to final.\n"
+        "  - \"Iteration Log\"\n"
+        "    - summarize what the iterations were"
+        "      - what input path was used for each function call involved (e.g. {profile_perf.name}, {perf_critical_reasoner.name})\n"
+        "      - what output path was produced for each function call involved\n"
+        "  - \"New Implementation\"\n"
+        "    - Just the final code to replace the original that was at `input_code_path`.\n\n"
+        "Return its absolute path.\n\n"
+        "MEASUREMENT & RECONCILIATION:\n"
+        "- Parse the paths returned by the functions you invoke and read them to inform your iteration decisions.\n"
+        "- Consider both the performance profiling metrics and the critical reasoning analysis when drafting iterations. "
+        " The critical reasoner may identify issues that are not visible in the profile because of the particular input data. "
+        " Thus, weigh its analysis carefully and consider if the next iteration's setup should be adjusted to surface bottlenecks "
+        " currently not visible in the profile.\n"
+    ),
+    user_prompt_template=(
+        "INPUTS\n"
+        "input_code_path: {input_code_path}\n"
+        "scope_instruction: {scope_instruction}\n"
+        "scratch_dir: {scratch_dir}\n"
+        "max_iters: {max_iters}\n"
+        "Execute the plan now.\n"
+    ),
+    uses=[text_editor, perf_profiler, perf_critical_reasoner],
+    default_model=Provider.Anthropic,
 )
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# AgentFunctions
-# ──────────────────────────────────────────────────────────────────────────────
-PerfReasoningAgent = core.AgentFunction(
-    name="PerfReasoningAgent",
-    desc="Analyze profiling text and/or source code to identify bottlenecks and propose concrete edits.",
-    args=[
-        core.FunctionArg("profile_text", str, "Plaintext profile report contents ('' if unavailable)"),
-        core.FunctionArg("source_text", str, "Function source code ('' if unavailable)"),
-    ],
-    system_prompt=textwrap.dedent("""
-        You are a performance engineer. Be surgical and specific.
-        Extract hard insights from the profile and/or source: name exact hot functions/loops/lines,
-        and propose small, testable code edits that preserve semantics. Explain why each change helps
-        and how to measure it. Avoid vague tips.
-    """).strip(),
-    user_prompt_template=textwrap.dedent("""
-        PROFILE REPORT:
-        ---------------
-        {profile_text}
-
-        SOURCE:
-        -------
-        {source_text}
-
-        TASK:
-        - Identify the dominant bottlenecks (precise, grounded in numbers).
-        - Recommend concrete edits and why they help.
-        - Suggest how to verify improvements (metrics).
-    """).strip(),
-    uses=[ReadTextFile],
-    default_model=core.Provider.Anthropic,
-)
-
-PerfImprovementAgent = core.AgentFunction(
-    name="PerfImprovementAgent",
-    desc="Iteratively profile → reason → rewrite → re-profile until gains taper off.",
-    args=[
-        core.FunctionArg("function_name", str, "Name of the function under optimization"),
-        core.FunctionArg("initial_source", str, "Initial source code for that function"),
-        core.FunctionArg("function_file_path", str, "Path to write the function code"),
-        core.FunctionArg("test_script_path", str, "Path to the bench/test script"),
-        core.FunctionArg("venv_path", str, "Path to the Python virtual environment"),
-        core.FunctionArg("max_iters", int, "Maximum iterations"),
-        core.FunctionArg("improvement_threshold_pct", float, "Stop if speedup < this percent vs previous"),
-    ],
-    system_prompt=textwrap.dedent("""
-        ROLE: Performance Orchestrator.
-
-        LOOP UNTIL DONE:
-          1) Ensure the current function is written to {function_file_path} using write_text_file(..., overwrite=True).
-          2) Call PerfProfileTool(test_script={test_script_path}, venv_path={venv_path}, target={function_name});
-             it returns a PATH STRING to a plaintext report.
-          3) Call read_text_file(filepath=that_path) to load the report text.
-          4) Call PerfReasoningAgent(profile_text=<report>, source_text=read_text_file({function_file_path}))
-             to decide concrete code edits.
-          5) Overwrite {function_file_path} with your improved version using write_text_file(overwrite=True).
-          6) Re-profile and compare "target.cumtime_s" and "SCRIPT_WALL_CLOCK_S" to the prior iteration.
-
-        STOPPING RULES:
-          - Stop if you've reached the iteration budget.
-          - Stop if speedup vs previous iteration is less than improvement_threshold_pct.
-          - If the profile shows errors or target not found, explain and stop gracefully.
-
-        OUTPUT EACH ITERATION:
-          - Iteration header
-          - Old vs new metrics (target.cumtime_s, SCRIPT_WALL_CLOCK_S)
-          - Edits applied (short bullet list)
-
-        FINAL OUTPUT:
-          - Baseline vs final metrics
-          - Total speedup
-          - Key edits that mattered
-    """).strip(),
-    user_prompt_template=textwrap.dedent("""
-        INPUTS
-        ------
-        function_name: {function_name}
-        function_file_path: {function_file_path}
-        test_script_path: {test_script_path}
-        venv_path: {venv_path}
-        max_iters: {max_iters}
-        improvement_threshold_pct: {improvement_threshold_pct}
-
-        INITIAL BASELINE SOURCE
-        -----------------------
-        {initial_source}
-
-        Begin now. Follow the tool calling plan exactly.
-    """).strip(),
-    uses=[PerfProfileTool, ReadTextFile, WriteTextFile, PerfReasoningAgent],
-    default_model=core.Provider.Anthropic,
-)
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Demo workspace
-# ──────────────────────────────────────────────────────────────────────────────
 def make_demo_workspace() -> Dict[str, str]:
-    """
-    Creates a temporary workspace with:
-      - venv
-      - a 'work' directory
-      - placeholder path for the function module (agent will write it)
-      - a bench script that imports the function and runs it once
-    Returns a dict with paths and the baseline function source.
-    """
-    root = Path(tempfile.mkdtemp(prefix="netflux_demo_")).resolve()
-    trace(f"Workspace: {root}")
+    scratch_dir = Path(tempfile.mkdtemp(prefix="netflux_perf_opt_")).resolve()
+    scratch_dir.mkdir(parents=True, exist_ok=True)
 
-    venv_dir = root / "venv"
-    trace("Creating venv...")
-    subprocess.check_call([sys.executable, "-m", "venv", str(venv_dir)])
-    trace(f"Venv ready: {venv_dir}")
-
-    workdir = root / "work"
-    workdir.mkdir(parents=True, exist_ok=True)
-    trace(f"Workdir: {workdir}")
-
-    function_file_path = workdir / "target_module.py"  # the agent overwrites this each iter
-
-    baseline_function = textwrap.dedent("""
-        def is_prime(x: int) -> bool:
-            if x < 2:
-                return False
-            for d in range(2, x):
-                if x % d == 0:
-                    return False
-            return True
-
-        def sum_primes(n: int = 7000) -> int:
-            s = 0
-            for i in range(2, n):
-                if is_prime(i):
-                    s += i
-            return s
-    """).strip()
-
-    bench_script = textwrap.dedent(f"""
-        import sys, time
-        from pathlib import Path
-
-        target_dir = Path("{function_file_path.parent.as_posix()}")
-        if str(target_dir) not in sys.path:
-            sys.path.insert(0, str(target_dir))
-
-        import target_module  # must define sum_primes()
-
-        if __name__ == "__main__":
-            t0 = time.perf_counter()
-            val = target_module.sum_primes(7000)
-            elapsed = time.perf_counter() - t0
-            print(f"RESULT={{val}}  ELAPSED_S={{elapsed:.6f}}")
-    """).strip()
-
-    bench_path = workdir / "bench_sum_primes.py"
-    bench_path.write_text(bench_script, encoding="utf-8")
-    trace(f"Wrote bench script: {bench_path}")
-
-    return dict(
-        venv_path=str(venv_dir),
-        workdir=str(workdir),
-        function_file_path=str(function_file_path),
-        test_script_path=str(bench_path),
-        baseline_function=baseline_function,
+    # Baseline implementation without scaffold
+    baseline_code = (
+        "def is_prime(x: int) -> bool:\n"
+        "    if x < 2:\n"
+        "        return False\n"
+        "    for d in range(2, x):\n"
+        "        if x % d == 0:\n"
+        "            return False\n"
+        "    return True\n\n"
+        "def sum_primes(n: int = 15000) -> int:\n"
+        "    s = 0\n"
+        "    for i in range(2, n):\n"
+        "        if is_prime(i):\n"
+        "            s += i\n"
+        "    return s\n"
     )
+    impl_path = scratch_dir / "impl_baseline.py"
+    impl_path.write_text(baseline_code, encoding="utf-8")
+
+    return {
+        "scratch_dir": str(scratch_dir),
+        "input_code_path": str(impl_path),
+    }
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# NodeView-based runtime monitor
-# ──────────────────────────────────────────────────────────────────────────────
-def monitor_with_nodeview(root: core.Node) -> None:
-    """
-    Uses NodeView.watch() to monitor the runtime tree and prints:
-      - Node state transitions and updates
-      - New children as they are created
-      - Agent transcript changes
-    """
-    # Track what we've already seen and reported
-    seen_nodes: Set[int] = set()
-    prev_states: Dict[int, core.NodeState] = {}
-    prev_child_counts: Dict[int, int] = {}
-    prev_transcript_sizes: Dict[int, int] = {}
-
-    def summarize_transcript_part(p: core.TranscriptPart) -> str:
-        cls = p.__class__.__name__
-        if isinstance(p, core.UserTextPart):
-            return f"UserTextPart: {p.text[:140].replace(chr(10),' ')}..."
-        if isinstance(p, core.ModelTextPart):
-            return f"ModelTextPart: {p.text[:140].replace(chr(10),' ')}..."
-        if isinstance(p, core.ToolUsePart):
-            keys = ", ".join(p.args.keys())
-            return f"ToolUsePart: {p.tool_name} (args: {keys})"
-        if isinstance(p, core.ToolResultPart):
-            out = str(p.outputs)
-            if isinstance(p.outputs, str):
-                out = p.outputs[:140].replace(chr(10), ' ')
-            return f"ToolResultPart: {p.tool_name} (error={p.is_error}) -> {out}..."
-        if isinstance(p, core.ThinkingBlockPart):
-            kind = "redacted" if p.redacted else "visible"
-            return f"ThinkingBlockPart ({kind}) len={len(p.content)} sig={p.signature[:12]}..."
-        return cls
-
-    def compute_depths_from_view(view: core.NodeView, depths: Optional[Dict[int, int]] = None, current_depth: int = 0) -> Dict[int, int]:
-        if depths is None:
-            depths = {}
-        depths[view.id] = current_depth
-        for child_view in view.children:
-            compute_depths_from_view(child_view, depths, current_depth + 1)
-        return depths
-
-    def process_view(view: core.NodeView, depths: Dict[int, int]) -> None:
-        """Process a single NodeView and log any changes."""
-        nid = view.id
-        depth = depths.get(nid, 0)
-
-        # Check if this is a new node we haven't seen
-        if nid not in seen_nodes:
-            seen_nodes.add(nid)
-            prev_states[nid] = view.state
-            prev_child_counts[nid] = len(view.children)
-            trace(_indent(depth) + f"Node #{nid} CREATED: fn={view.fn.name} state={view.state.value}")
-
-        # Check for state transitions
-        last_state = prev_states.get(nid)
-        if last_state != view.state:
-            prev_states[nid] = view.state
-            trace(_indent(depth) + f"Node #{nid} STATE: {last_state.value if last_state else 'N/A'} -> {view.state.value}")
-
-        # Check for new children
-        cur_child_count = len(view.children)
-        prev_count = prev_child_counts.get(nid, 0)
-        if cur_child_count != prev_count:
-            new_count = cur_child_count - prev_count
-            prev_child_counts[nid] = cur_child_count
-            if new_count > 0:
-                # Report new children
-                for child_view in view.children[-new_count:]:
-                    trace(_indent(depth) + f"Node #{nid} CHILD ADDED -> Node #{child_view.id} (fn={child_view.fn.name})")
-
-        # Check transcript updates for AgentNodes (if we can access the actual node)
-        # For now, we'll skip transcript monitoring since NodeView doesn't include transcript info
-        # This could be enhanced if needed by accessing the actual node
-
-        # Recursively process children
-        for child_view in view.children:
-            process_view(child_view, depths)
-
-    trace("NodeView Monitor: started")
-    as_of_seq = 0
-
-    try:
-        while not root.is_done:
-            # Watch for updates using NodeView
-            view = root.watch(as_of_seq=as_of_seq+1)
-            if not view:
-                # Timeout occurred, continue waiting
-                continue
-            as_of_seq = view.update_seqnum
-
-            # Compute depths and process the entire tree
-            depths = compute_depths_from_view(view)
-            process_view(view, depths)
-
-    except Exception as e:
-        trace(f"NodeView Monitor: error while monitoring: {e}")
-
-    # Final snapshot after completion
-    final_view = root.watch(as_of_seq=as_of_seq+1)
-    assert final_view
-    depths = compute_depths_from_view(final_view)
-    trace("NodeView Monitor: root completed, final snapshot:")
-
-    def final_walk(view: core.NodeView, depths: Dict[int, int]):
-        d = depths.get(view.id, 0)
-        trace(_indent(d) + f"Node #{view.id} FINAL state={view.state.value} fn={view.fn.name}")
-        for child_view in view.children:
-            final_walk(child_view, depths)
-
-    final_walk(final_view, depths)
-    trace("NodeView Monitor: stopped")
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Main
-# ──────────────────────────────────────────────────────────────────────────────
-def main():
-    # Workspace
+def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> str:
     ws = make_demo_workspace()
 
-    # Runtime + registration
-    trace("Registering Functions/Agents in Runtime...")
     runtime = Runtime(
-        specs=[
-            # Tools
-            ReadTextFile,
-            WriteTextFile,
-            PerfProfileTool,
-            # Agents
-            PerfReasoningAgent,
-            PerfImprovementAgent,
-        ],
+        specs=[perf_optimizer, perf_critical_reasoner, perf_profiler, text_editor],
         client_factories=CLIENT_FACTORIES,
     )
-    trace("Registration complete.")
 
-    # Top-level invocation (Gemini by default, handled by your core)
-    trace("Creating top-level RunContext and invoking PerfImprovementAgent...")
     ctx = runtime.get_ctx()
-    # Shared cooperative cancellation token for the entire run (UI + runtime).
     cancel_evt = mp.Event()
 
-    root = ctx.invoke(
-        PerfImprovementAgent,
+    node = ctx.invoke(
+        perf_optimizer,
         {
-            "function_name": "sum_primes",
-            "initial_source": ws["baseline_function"],
-            "function_file_path": ws["function_file_path"],
-            "test_script_path": ws["test_script_path"],
-            "venv_path": ws["venv_path"],
-            "max_iters": 3,
-            "improvement_threshold_pct": 10.0,
+            "input_code_path": ws["input_code_path"],
+            "scope_instruction": "Optimize sum_primes() including helpers if beneficial.",
+            "scratch_dir": ws["scratch_dir"],
+            "max_iters": 5,
         },
+        provider=provider,
         cancel_event=cancel_evt,
     )
 
-    # Live console visualization using ConsoleRender
     def _writer(frame: str) -> None:
         sys.stdout.write("\x1b[H\x1b[2J")
         sys.stdout.write(frame)
@@ -560,34 +339,65 @@ def main():
         sys.stdout.flush()
 
     _ = start_view_loop(
-        root,
+        node,
         cancel_evt,
         render=ConsoleRender(spinner_hz=10.0),
         ui_driver=_writer,
         update_interval=0.1,
     )
 
-    # Wait for completion & show final report
     try:
-        final_report = root.result()
+        final_path = node.result()
     except KeyboardInterrupt:
         cancel_evt.set()
-        trace("\nCancellation requested, waiting for tasks to stop...\n")
-        try:
-            final_report = root.result()
-        except Exception as ex:
-            final_report = f"[ERROR] {type(ex).__name__}: {ex}"
-    except Exception as ex:
-        final_report = f"[ERROR] {type(ex).__name__}: {ex}"
+        print("\nCancellation requested, waiting for tasks to stop...\n")
+        # Will raise CancellationException to terminal.
+        final_path = node.result()
     finally:
         cancel_evt.set()
 
-    print("\n" + "=" * 80)
-    print("FINAL REPORT FROM PerfImprovementAgent")
-    print("=" * 80)
-    print(final_report)
-    print("=" * 80)
-    trace("Demo complete.")
+    return str(final_path)
+
+
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the performance optimizer demo.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=[p.value.lower() for p in Provider],
+        required=True,
+        help="Choose the provider to use for this run.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Optional[List[str]] = None) -> None:
+    args = parse_args(argv)
+    provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
+    provider = Provider(provider_value)
+    report_path = run_perf_optimizer_tree(provider)
+    
+    # Read and print the content of the final report
+    try:
+        report_file = Path(report_path)
+        if report_file.exists():
+            report_content = report_file.read_text(encoding="utf-8")
+            print(f"""
+{'=' * 80}
+FINAL REPORT PATH
+{'=' * 80}
+{report_path}
+{'=' * 80}
+FINAL REPORT CONTENT
+{'=' * 80}
+{report_content}
+{'=' * 80}
+""")
+        else:
+            print(f"\nWarning: Report file not found at {report_path}")
+    except Exception as e:
+        print(f"\nError reading report file: {e}")
 
 
 if __name__ == "__main__":
