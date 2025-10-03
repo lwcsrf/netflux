@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import copy
 import logging
 import time
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Union
@@ -20,6 +21,7 @@ from .core import (
     SessionScope,
     SessionBag,
     CancellationException,
+    TokenUsage,
 )
 from .providers import Provider, get_AgentNode_impl
 
@@ -218,6 +220,10 @@ class Runtime:
         child_views = tuple(
             self._ensure_observable(child).view for child in node.children
         )
+        usage: Optional[TokenUsage] = None
+        if isinstance(node, AgentNode):
+            usage = copy.deepcopy(node.token_usage)
+
         return NodeView(
             id=node.id,
             fn=node.fn,
@@ -226,6 +232,7 @@ class Runtime:
             outputs=node.outputs,      # Safe to share ref to immutable outputs (once created and set).
             exception=node.exception,  # Ditto.
             children=child_views,
+            usage=usage,
             update_seqnum=self._global_seqno,
         )
 

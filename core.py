@@ -423,6 +423,7 @@ class NodeView:
     outputs: Optional[Any]
     exception: Optional[Exception]
     children: tuple['NodeView', ...]
+    usage: Optional[TokenUsage]
     update_seqnum: int  # Seqnum when this NodeView was generated.
 
 class Node(ABC):

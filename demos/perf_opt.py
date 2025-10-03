@@ -257,6 +257,7 @@ perf_reasoner = AgentFunction(
         f"{ULTRATHINK_PROMPT}\n"
         "You are a critical performance engineer.\n"
         "## Task\n"
+        "- Read the full contents of the file at `code_path`. You do not need to list or explore any directories.\n"
         "- Identify algorithmic and data-structure inefficiencies, hot loops, I/O hotspots, "
         "cache or working set inefficiencies, and Pythonism issues.\n"
         "- Recommend concrete code-level changes with rationale and expected impact.\n"

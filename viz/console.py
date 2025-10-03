@@ -82,6 +82,14 @@ def _state_glyph(state: NodeState, tick: int) -> Tuple[str, str]:
     return ("?", "white")
 
 
+def _type_glyph_for_fn(fn) -> str:
+    if fn.is_agent():
+        return "✨"
+    if fn.is_code():
+        return "⚙️"
+    return "•"
+
+
 @dataclass
 class ConsoleRender(Render[str]):
     """Renderer for a `NodeView` tree with lightweight animation that yields
@@ -129,7 +137,8 @@ class ConsoleRender(Render[str]):
             if cancel_pending and nv.state in (NodeState.Waiting, NodeState.Running):
                 color = "magenta"
             args = _format_args(nv.inputs)
-            header = f"{_color(glyph, fg=color, bold=True)} {_color(nv.fn.name, bold=True)}"
+            type_g = _type_glyph_for_fn(nv.fn)
+            header = f"{_color(glyph, fg=color, bold=True)} {_color(type_g, dim=True)} {_color(nv.fn.name, bold=True)}"
             if args:
                 header += f"({_color(args, dim=True)})"
 
@@ -152,6 +161,34 @@ class ConsoleRender(Render[str]):
             # Unicode box-drawing tree connectors
             branch = ("└─ " if is_last else "├─ ")
             lines.append(prefix + branch + header if prefix else header)
+
+            # Print TokenUsage directly under the node header (agents only),
+            # preserving tree rails but without a branch marker.
+            if nv.usage:
+                u = nv.usage
+                in_fields = []
+                in_fields.append(f"cache_read={u.input_tokens_cache_read}")
+                if u.input_tokens_cache_write is not None:
+                    in_fields.append(f"cache_write={u.input_tokens_cache_write}")
+                in_fields.append(f"regular={u.input_tokens_regular}")
+                in_fields.append(f"total={u.input_tokens_total}")
+
+                out_fields = []
+                if u.output_tokens_reasoning is not None:
+                    out_fields.append(f"reasoning={u.output_tokens_reasoning}")
+                if u.output_tokens_text is not None:
+                    out_fields.append(f"text={u.output_tokens_text}")
+                out_fields.append(f"total={u.output_tokens_total}")
+
+                segs = []
+                if in_fields:
+                    segs.append(_color(f"In: {{{', '.join(in_fields)}}}", fg="blue", dim=True))
+                if out_fields:
+                    segs.append(_color(f"Out: {{{', '.join(out_fields)}}}", fg="magenta", dim=True))
+
+                if segs:
+                    detail_prefix = prefix + ("   " if is_last else "│  ")
+                    lines.append(detail_prefix + "    " + ", ".join(segs))
 
             child_prefix = prefix + ("   " if is_last else "│  ")
             count = len(nv.children)
