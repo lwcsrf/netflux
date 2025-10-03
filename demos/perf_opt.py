@@ -23,18 +23,24 @@ from ..func_lib.raise_exception import raise_exception
 
 ULTRATHINK_PROMPT = (
 """
+<specify_task_importance>
 You are part of an expert applied science team working on a component that will run on a spacecraft
 during missions where human lives are at stake. Thus, please be extremely thorough,
 critical, meticulous, and thoughtful in your work, as we have zero failure tolerance.
-You should be extremely liberal in reasoning tokens and take as much time as needed
-to carry out exhaustive analysis. <thinking_level>**Think ultra-hard.**</thinking_level>
+Your analysis should show both breadth and depth. Consider all the trade-offs and alternatives
+that could be made.
+</specify_task_importance>
+
+<specify_thinking_level>
+**Think ultra-hard.**
+</specify_thinking_level>
 """
 )
 
 class PerfProfiler(CodeFunction):
     def __init__(self):
         super().__init__(
-            name="profile_perf",
+            name="perf_profile",
             desc=(
 """Execute and profile a self-contained Python file using cProfile, then write a
 plaintext report (path is returned). The file must include both:
@@ -57,10 +63,10 @@ assume it will be run in a venv where those are installed."""
                 FunctionArg("report_path", str, 
                             "Absolute filepath for the output report."),
             ],
-            callable=self._profile_perf,
+            callable=self._perf_profile,
         )
 
-    def _profile_perf(
+    def _perf_profile(
         self,
         ctx: RunContext, *,
         code_path: str,
@@ -250,21 +256,29 @@ perf_reasoner = AgentFunction(
     system_prompt=(
         f"{ULTRATHINK_PROMPT}\n"
         "You are a critical performance engineer.\n"
-        "- Identify algorithmic and data-structure inefficiencies, hot loops, I/O hotspots, and Pythonism issues.\n"
+        "## Task\n"
+        "- Identify algorithmic and data-structure inefficiencies, hot loops, I/O hotspots, "
+        "cache or working set inefficiencies, and Pythonism issues.\n"
         "- Recommend concrete code-level changes with rationale and expected impact.\n"
         "- Propose a quick micro-benchmark or representative input for validation.\n"
         "- Write your report to a new file at the provided `report_path`.\n"
-        "Return exactly: 'Critical Analysis Report written to: <report_path>'.\n"
+        "- Only open the `code_path` file to do your analysis. "
+        "**Do not read any other files in the same scratch directory or you might get confused by unrelated task artifacts**."
+        " ## Return\n"
+        "Return final message: 'Critical Analysis Report written to: {report_path}'.\n"
+        " ## Exceptions\n"
+        "Only raise an exception via the {raise_exception.name} function if the `code_path` file is: "
+        "unreadable; missing; clearly corrupt; non-sensical; unrelated to code."
     ),
     user_prompt_template=(
         "INPUTS:\n"
         "code_path: {code_path}\n"
         "report_path: {report_path}\n"
         "---\n"
-        "Task: produce an extremely thorough analysis and write it to `report_path`. "
-        "Provide the final confirmation message when done.\n"
+        "Task: produce an extremely thorough analysis, as per above instructions, and write it to `report_path`. "
+        "Finish with the final confirmation message (confirming your report's absolute filepath) when you're done.\n"
     ),
-    uses=[text_editor],
+    uses=[text_editor, raise_exception],
     default_model=Provider.Anthropic,
 )
 
@@ -288,6 +302,7 @@ perf_optimizer = AgentFunction(
         "<role>You are a critical performance engineer.</role>\n\n"
         "<instructions>\n"
         "- All inputs and outputs are file paths. Write every artifact to `scratch_dir`.\n"
+        "- Take care to not have off-by-one symbol errors when passing filepaths.\n"
         "- For profiling, the `code_path` must include setup + invocation of the target on representative data. Include\n"
         "  enough input volume and repeated calls to yield rich and stable profiling (good stack/call stats).\n"
         "- If the original `input_code_path` content lacks scaffold, create a new scaffolded file in `scratch_dir` by appending a bottom section:\n"
@@ -315,7 +330,9 @@ perf_optimizer = AgentFunction(
         "    MUST become `from mypkg.parentmodule import a as a1`.\n"
         "- Use the perf profile report to also detect source code errors that may cause runtime failures, by looking at "
         "  the captured stderr and exception sections. If you find issues, fix them in the new candidate. "
-        "  If a bug was already present and it can't be fixed after some attempts, use {raise_exception.name} to fail.\n"
+        "- If a bug was already present in the original code and it can't be fixed after some attempts, use {raise_exception.name} to fail.\n"
+        "- If you encounter a new bug in your candidate code, iterate to fix it by using the stderr of the profiler (read its report) as an executor. "
+        " You can do that multiple times in a row if necessary, otherwise consider backtracking on your current direction.\n"
         "- Iterate until you hit a clear plateau: once remaining ideas stop improving the profile and it's evident no "
         "  further material gains are available, stop attempting further improvements, or stop when max_iters is reached.\n"
         "<reconciliation>\n"
@@ -327,9 +344,11 @@ perf_optimizer = AgentFunction(
         "</reconciliation>\n"        
         "<final_deliverable>\n"
         "- Lastly, PRODUCE A FINAL REPORT IN `scratch_dir` CONTAINING EXACTLY:\n"
-        "  1. \"Explanation of Changes\" section\n"
+        "  1. \"Analysis & Explanation of Changes\" section\n"
         "    - Identify all bottlenecks discovered over the whole process.\n"
-        "    - How they were each addressed.\n"
+        "    - How they were each addressed (changes in algorithm / data structures / libraries used; "
+        " cache efficiency; working set reduction; refactoring, etc).\n"
+        "    - Ground all claims in both sound reasoning and empirical evidence from the profiling reports.\n"
         "  2. \"Performance Gains\" numerical summary\n"
         "    - Quantify improvements over each iteration.\n"
         "    - Quantify overall improvement from original to final.\n"

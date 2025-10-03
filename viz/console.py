@@ -1,6 +1,7 @@
 import time
 import sys
 import shutil
+import re
 from dataclasses import dataclass
 import multiprocessing as mp
 from multiprocessing.synchronize import Event
@@ -53,12 +54,12 @@ def _short_repr(value, max_len: int = 40) -> str:
     return s
 
 
-def _format_args(inputs: dict, max_len: int = 60) -> str:
+def _format_args(inputs: dict, max_len: int = 800, per_val_len: int = 120) -> str:
     if not inputs:
         return ""
     items = []
     for k, v in inputs.items():
-        items.append(f"{k}={_short_repr(v, 20)}")
+        items.append(f"{k}={_short_repr(v, per_val_len)}")
     s = ", ".join(items)
     if len(s) > max_len:
         s = s[: max_len - 3] + "..."
@@ -197,8 +198,27 @@ class ConsoleRender(Render[str]):
         safe_rows = max(1, rows - 1)
         safe_cols = max(1, cols - 1)
 
+        def _crop_tail_safe(line: str, max_cols: int, tail_allow: int = 18) -> str:
+            """Crop allowing a small tail to avoid cutting ANSI codes mid-seq.
+
+            Heuristic: overslice by `tail_allow`, then strip any trailing
+            partial CSI (e.g., ESC[ ... with no final byte). Always append
+            RESET to avoid style bleed if we did cut styling.
+            """
+            if len(line) <= max_cols:
+                return line
+            end = min(len(line), max_cols + max(0, tail_allow))
+            chunk = line[:end]
+            # Strip trailing partial CSI sequences like '\x1b[31;1' (no final letter)
+            chunk = re.sub(r"\x1b\[[0-9;?]*$", "", chunk)
+            # Also strip a bare trailing ESC, if any
+            if chunk.endswith("\x1b"):
+                chunk = chunk[:-1]
+            # Add RESET to ensure attributes are closed
+            return chunk + RESET
+
         lines = s.splitlines()
-        cropped = [ln[:safe_cols] for ln in lines[:safe_rows]]
+        cropped = [_crop_tail_safe(ln, safe_cols) for ln in lines[:safe_rows]]
         # Pad with blanks to overwrite remnants from previous longer frames
         if len(cropped) < safe_rows:
             cropped.extend([""] * (safe_rows - len(cropped)))
