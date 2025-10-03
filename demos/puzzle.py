@@ -13,7 +13,7 @@ from ..core import (
 )
 from ..runtime import Runtime
 from .auth_factory import CLIENT_FACTORIES
-from ..viz import ConsoleRender, start_view_loop
+from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
 
 
 PUZZLE_SOLVER_SYSTEM_PROMPT = (
@@ -182,6 +182,8 @@ INTERLEAVE_AGENT, INTERLEAVE_TOOLS = build_interleave_agent(
 def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     """Execute the shared puzzle with a live tree view (single loop thread)."""
 
+    enable_vt_if_windows()
+
     runtime = Runtime(
         specs=[INTERLEAVE_AGENT, *INTERLEAVE_TOOLS],
         client_factories=CLIENT_FACTORIES,
@@ -195,8 +197,8 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider, cancel_event=cancel_evt)
 
     def _writer(s: str) -> None:
-        # Clear screen and render frame
-        sys.stdout.write("\x1b[H\x1b[2J")
+        # Hide cursor, clear+home, then render frame
+        sys.stdout.write("\x1b[?25l\x1b[2J\x1b[H")
         sys.stdout.write(s)
         sys.stdout.write("\n")
         sys.stdout.flush()
@@ -225,6 +227,9 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     finally:
         # Ensure UI watcher/ticker threads exit.
         cancel_evt.set()
+        # Show cursor on exit
+        sys.stdout.write("\x1b[?25h")
+        sys.stdout.flush()
 
 def parse_args(
     argv: Optional[List[str]] = None,
