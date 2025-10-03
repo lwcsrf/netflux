@@ -47,3 +47,26 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+
+# VS Code: ignore folder but allow safe, shareable configs
+.vscode/*
+!.vscode/extensions.json
+
+# Python tooling caches
+.mypy_cache/
+.ruff_cache/
+.nox/
+.tox/
+.hypothesis/
+.pyre/
+.pytype/
+
+# Coverage & test artifacts
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# OS-specific junk
+.DS_Store
+Thumbs.db
