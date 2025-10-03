@@ -204,7 +204,6 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
     view_thread = start_view_loop(
         node,
-        cancel_evt,
         render=render,
         ui_driver=ConsoleRender.ui_driver,
         update_interval=0.1,

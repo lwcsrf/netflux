@@ -36,7 +36,6 @@ class Render(ABC, Generic[RenderType]):
 
 def start_view_loop(
     node: Node,
-    cancel_event: Event,
     *,
     render: Render[RenderType],
     ui_driver: Callable[[RenderType], None],
@@ -47,11 +46,10 @@ def start_view_loop(
     method to get visualization updates about the task tree progression for UI purpose.
     The pattern is:
 
-    - Consumer thread responds to signals or UI directives and can cancel_event.set() to
-      cancel the task.
+    - Consumer thread responds to signals or UI directives and can cancel the top-level task.
     - Consumer uses `node: Node = Runtime.invoke(func, cancel_event)` to launch the
       top-level task.
-    - Consumer invokes this method with the `node` and `cancel_event`, plus:
+    - Consumer invokes this method with the `node`, plus:
         1. `render` is the pluggable way in which the NodeView and its subtree would get
            rendered. You instantiate the desired Render (e.g. TexRenderType) and give
            this instance to this method. Render[RenderType].render(NodeView) will return
@@ -66,10 +64,8 @@ def start_view_loop(
     - A thread is created to watch the Node and its subtree. Each time `node.watch()`
       returns a new NodeView or the watch expires, it will invoke
       `ui_driver(Render.render(node_view))`.
-    - The thread is responsive to the same cancelation (cancel_event) as the task itself,
-      as long as the cancel_event is used for both the Runtime.invoke() and this method.
-      The app can trigger cancelation by whatever criteria it wants, e.g. user cancels
-      the request or timeout.
+    - The thread is responsive to the top-level task reaching a terminal state (success,
+      failure, or cancellation). In that case, the loop exits and the thread exits.
     - A reference to the `Thread` is returned so that the loop-invoking thread may join
       it for clean-up synchronization.
 
