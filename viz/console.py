@@ -182,13 +182,13 @@ class ConsoleRender(Render[str]):
 
                 segs = []
                 if in_fields:
-                    segs.append(_color(f"In: {{{', '.join(in_fields)}}}", fg="blue", dim=True))
+                    segs.append(_color(f"In: {{{', '.join(in_fields)}}}", fg="cyan", bold=True))
                 if out_fields:
-                    segs.append(_color(f"Out: {{{', '.join(out_fields)}}}", fg="magenta", dim=True))
+                    segs.append(_color(f"Out: {{{', '.join(out_fields)}}}", fg="magenta", bold=True))
 
                 if segs:
                     detail_prefix = prefix + ("   " if is_last else "│  ")
-                    lines.append(detail_prefix + "    " + ", ".join(segs))
+                    lines.append(detail_prefix + "│    " + ", ".join(segs))
 
             child_prefix = prefix + ("   " if is_last else "│  ")
             count = len(nv.children)
