@@ -230,7 +230,7 @@ class GeminiAgentNode(AgentNode):
                 contents=contents,
                 config=config,
             )
-            assert resp.usage_metadata is not None
+            assert resp.usage_metadata is not None, "Gemini response missing usage metadata"
             self._accumulate_usage(resp.usage_metadata)
             if not resp.candidates:
                 raise RuntimeError("Gemini returned no candidates.")
@@ -240,7 +240,7 @@ class GeminiAgentNode(AgentNode):
             self._append_thought_signatures(candidate)
 
             # Always append sanitized model content (keeps history complete) for replay.
-            assert candidate.content
+            assert candidate.content is not None, "Gemini response missing content"
             self._check_sanity(candidate.content)
             contents.append(candidate.content)
 
