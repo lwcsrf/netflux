@@ -179,7 +179,7 @@ INTERLEAVE_AGENT, INTERLEAVE_TOOLS = build_interleave_agent(
     desc=PUZZLE_SOLVER_DESC,
 )
 
-def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
+def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     """Execute the shared puzzle with a live tree view (single loop thread)."""
 
     runtime = Runtime(
@@ -211,21 +211,20 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None) -> str:
     )
 
     try:
-        result = node.result() or ""
+       # Block until tree finished.
+       node.result()
     except KeyboardInterrupt:
         # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
         cancel_evt.set()
         print("\nCancellation requested, waiting for tasks to stop...\n")
         # Wait for the node to conclude (may still finish success/exception per guidance).
         try:
-            result = node.result() or ""
+            node.result()
         except CancellationException:
-            result = ""
+            pass
     finally:
         # Ensure UI watcher/ticker threads exit.
         cancel_evt.set()
-
-    return result
 
 def parse_args(
     argv: Optional[List[str]] = None,
@@ -241,13 +240,11 @@ def parse_args(
     )
     return parser.parse_args(argv)
 
-def main(
-    argv: Optional[List[str]] = None
-) -> str:
+def main(argv: Optional[List[str]] = None):
     args = parse_args(argv)
     provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
     provider = Provider(provider_value)
-    return run_interleave_experiment_tree(provider)
+    run_interleave_experiment_tree(provider)
 
 if __name__ == "__main__":
     main()
