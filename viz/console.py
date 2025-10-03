@@ -33,17 +33,9 @@ def _color(text: str, *, fg: Optional[str] = None, bold: bool = False, dim: bool
     return "".join(parts)
 
 
+# Cute Unicode spinner frames (braille)
 _SPINNER_FRAMES = [
-    "⠋",
-    "⠙",
-    "⠹",
-    "⠸",
-    "⠼",
-    "⠴",
-    "⠦",
-    "⠧",
-    "⠇",
-    "⠏",
+    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
 ]
 
 
@@ -53,7 +45,7 @@ def _short_repr(value, max_len: int = 40) -> str:
     except Exception:
         s = str(value)
     if len(s) > max_len:
-        return s[: max_len - 1] + "…"
+        return s[: max_len - 3] + "..."
     return s
 
 
@@ -65,7 +57,7 @@ def _format_args(inputs: dict, max_len: int = 60) -> str:
         items.append(f"{k}={_short_repr(v, 20)}")
     s = ", ".join(items)
     if len(s) > max_len:
-        s = s[: max_len - 1] + "…"
+        s = s[: max_len - 3] + "..."
     return s
 
 
@@ -141,7 +133,8 @@ class ConsoleRender(Render[str]):
                     msg = nv.exception.__class__.__name__
                 header += f" {_color('CANCEL', fg='yellow', bold=True)} {_short_repr(msg, 50)}"
 
-            branch = "└─ " if is_last else "├─ "
+            # Unicode box-drawing tree connectors
+            branch = ("└─ " if is_last else "├─ ")
             lines.append(prefix + branch + header if prefix else header)
 
             child_prefix = prefix + ("   " if is_last else "│  ")
@@ -151,3 +144,4 @@ class ConsoleRender(Render[str]):
 
         add_node(self._last_view, prefix="", is_last=True)
         return "\n".join(lines)
+
