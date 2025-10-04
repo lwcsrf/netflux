@@ -2,9 +2,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
 from multiprocessing.synchronize import Event
+import time
+import random
+from overrides import override
 
 from ..core import (
-    Node, RunContext, Function, AgentNode, AgentException,
+    Node, RunContext, Function, AgentNode, AgentException, ModelProviderException,
     UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
@@ -28,7 +31,6 @@ from anthropic.types import (
 
 )
 from anthropic.types.tool_param import InputSchemaTyped
-from overrides import override
 
 """
 ## Misc Research Notes (applicable to Claude 4 models)
@@ -165,6 +167,7 @@ class AnthropicAgentNode(AgentNode):
     def run(self) -> None:
         system_prompt = self.agent_fn.system_prompt
 
+        # Agent loop.
         while True:
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
@@ -175,20 +178,68 @@ class AnthropicAgentNode(AgentNode):
             # a cached prefix and the rest are new tokens which we incrementally pay to cache.
             msgs = self._messages_with_latest_cache_ttl(self._history, CACHE_TTL)
 
-            # One interleaved-thinking turn (streaming for correctness; we just take final message)
-            # TODO: Implement retry/backoff for known transient Anthropic SDK exceptions.
-            with self.client.messages.stream(
-                model=self.model,
-                system=system_prompt,
-                messages=msgs,
-                tools=self._tools,
-                tool_choice=TOOL_CHOICE,
-                max_tokens=MAX_TOKENS,
-                thinking=THINKING_CFG,
-                extra_headers=INTERLEAVED_BETA,
-            ) as stream:
-                resp: Message = stream.get_final_message()
-                self._accumulate_usage(resp.usage)
+            # One thinking-tool turn.
+            resp: Message
+            max_attempts = 8
+            base_delay = 3  # seconds
+            attempt = 1
+            # Retry logic.
+            while True:
+                try:
+                    with self.client.messages.stream(
+                        model=self.model,
+                        system=system_prompt,
+                        messages=msgs,
+                        tools=self._tools,
+                        tool_choice=TOOL_CHOICE,
+                        max_tokens=MAX_TOKENS,
+                        thinking=THINKING_CFG,
+                        extra_headers=INTERLEAVED_BETA,
+                    ) as stream:
+                        resp = stream.get_final_message()
+                        break
+
+                except (
+                    anthropic.APIConnectionError, 
+                    anthropic.RateLimitError, 
+                    anthropic.APIStatusError
+                ) as e:
+                    # Retry on known transient conditions: connection issues, rate limits, or 5xx responses.
+                    is_rate_limited = isinstance(e, anthropic.RateLimitError)
+                    is_transient_status = isinstance(e, anthropic.APIStatusError) and (
+                        e.status_code == 429 or e.status_code >= 500
+                    )
+                    is_connection = isinstance(e, anthropic.APIConnectionError)
+                    if not (is_rate_limited or is_transient_status or is_connection):
+                        raise
+
+                    if attempt >= max_attempts:
+                        raise
+                    if self.is_cancel_requested():
+                        self.ctx.post_cancel()
+                        return
+
+                    delay = base_delay * (2 ** (attempt - 1))
+                    delay = min(delay, 30)
+                    # Add small jitter to prevent thundering herd.
+                    delay += random.uniform(0, delay * 0.1)
+
+                    # Sleep unless canceled.
+                    if self.cancel_event:
+                        if self.cancel_event.wait(delay):
+                            self.ctx.post_cancel()
+                            return
+                    else:
+                        time.sleep(delay)
+                    attempt +=1
+                    continue
+
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
+                return
+
+            # Incremental token accounting.
+            self._accumulate_usage(resp.usage)
 
             # Map response ContentBlocks -> *Param blocks for strict replay,
             # while also projecting into our framework transcript.
@@ -240,6 +291,17 @@ class AnthropicAgentNode(AgentNode):
 
             # If no tool uses -> finalize with the accumulated text.
             if not tool_uses:
+                # Assert expectation that the protocol is the way we think:
+                # model is finishing the turn with final text completion.
+                if resp.stop_reason != "end_turn":
+                    raise ModelProviderException(
+                        message=f"Expected stop_reason 'end_turn' for final text, got "
+                                f"'{resp.stop_reason!r}'; debug protocol adherence.",
+                        provider=type(self),
+                        agent_name=self.agent_fn.name,
+                        node_id=self.id,
+                    )
+                
                 final_text = "\n".join(t for t in final_text_chunks if t).strip()
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
@@ -250,6 +312,16 @@ class AnthropicAgentNode(AgentNode):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
                 return
+
+            # Assert expectation: model requested tool use in this turn.
+            if resp.stop_reason != "tool_use":
+                raise ModelProviderException(
+                    message=f"Expected stop_reason 'tool_use' before tool execution, got "
+                            f"'{resp.stop_reason!r}'; debug protocol adherence.",
+                    provider=type(self),
+                    agent_name=self.agent_fn.name,
+                    node_id=self.id,
+                )
 
             # Execute requested tools in parallel and aggregate tool_result blocks.
             # Even if some tool invocations fail early, continue processing others.
