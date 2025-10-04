@@ -16,6 +16,7 @@ from ..func_lib.text_editor import TextEditor
 from ..func_lib.bash import Bash
 
 import anthropic
+import httpx
 from anthropic.types import (
     Message, MessageParam,
     Usage,
@@ -200,16 +201,18 @@ class AnthropicAgentNode(AgentNode):
                         break
 
                 except (
-                    anthropic.APIConnectionError, 
-                    anthropic.RateLimitError, 
-                    anthropic.APIStatusError
+                    anthropic.APIConnectionError,
+                    anthropic.RateLimitError,
+                    anthropic.APIStatusError,
+                    httpx.TransportError,
                 ) as e:
                     # Retry on known transient conditions: connection issues, rate limits, or 5xx responses.
                     is_rate_limited = isinstance(e, anthropic.RateLimitError)
                     is_transient_status = isinstance(e, anthropic.APIStatusError) and (
                         e.status_code == 429 or e.status_code >= 500
                     )
-                    is_connection = isinstance(e, anthropic.APIConnectionError)
+                    # httpx.TransportError includes RemoteProtocolError, ReadTimeout, ConnectError, etc.
+                    is_connection = isinstance(e, (anthropic.APIConnectionError, httpx.TransportError))
                     if not (is_rate_limited or is_transient_status or is_connection):
                         raise
 
@@ -231,6 +234,11 @@ class AnthropicAgentNode(AgentNode):
                             return
                     else:
                         time.sleep(delay)
+
+                    # Rebuild the client if transport issue.
+                    if is_connection:
+                        self.client = self.client_factory()
+
                     attempt +=1
                     continue
 
