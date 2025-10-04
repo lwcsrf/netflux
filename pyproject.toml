@@ -27,7 +27,10 @@ test = [
 ]
 
 # Provider-specific dependencies
-anthropic = ["anthropic>=0.60.0, <1.0.0"]
+anthropic = [
+    "anthropic>=0.60.0, <1.0.0",
+    "httpx[http2]",
+]
 gemini = ["google-genai>=1.25.0, <2.0.0"]
 openai = ["openai>=1.109.1, <2.0.0"]
 xai = ["xai-sdk>=1.2.0, <2.0.0"]

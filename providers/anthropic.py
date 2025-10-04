@@ -142,12 +142,11 @@ class AnthropicAgentNode(AgentNode):
         client_factory: Callable[[], Any],
     ):
         super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
-        client = client_factory()
-        if not isinstance(client, anthropic.Anthropic):
+        self.client = client_factory()
+        if not isinstance(self.client, anthropic.Anthropic):
             raise TypeError(
                 "AnthropicAgentNode expected client_factory to return anthropic.Anthropic"
             )
-        self.client = client
         self.model = ModelNames[Provider.Anthropic]
         self._history: List[MessageParam] = []   # Typed conversation history we replay every turn
         self._tools: List[ToolUnionParam] = self._build_tool_params(self.agent_fn.uses)
