@@ -155,7 +155,7 @@ class GeminiAgentNode(AgentNode):
                 sig_b64 = str(sig)
             self.transcript.append(ThinkingBlockPart(content="", signature=sig_b64))
 
-    def _check_sanity(self, content: types.Content):
+    def _check_thoughts_sanity(self, content: types.Content):
         # Ensure empty `thought` text.
         # For Gemini, thoughts are currently hidden. Only thought signatures are used for replay.
         # It would be very ambiguous if we somehow replay partial thoughts, or api behavior changes.
@@ -225,7 +225,7 @@ class GeminiAgentNode(AgentNode):
                 return
 
             # TODO: Add retry/backoff for transient Google Generative AI client errors.
-            resp = self.client.models.generate_content(
+            resp: types.GenerateContentResponse = self.client.models.generate_content(
                 model=ModelNames[Provider.Gemini],
                 contents=contents,
                 config=config,
@@ -234,14 +234,14 @@ class GeminiAgentNode(AgentNode):
             self._accumulate_usage(resp.usage_metadata)
             if not resp.candidates:
                 raise RuntimeError("Gemini returned no candidates.")
-            candidate = resp.candidates[0]
+            candidate: types.Candidate = resp.candidates[0]
 
             # Record thought signatures (never summaries) in framework-type transcript.
             self._append_thought_signatures(candidate)
 
             # Always append sanitized model content (keeps history complete) for replay.
             assert candidate.content is not None, "Gemini response missing content"
-            self._check_sanity(candidate.content)
+            self._check_thoughts_sanity(candidate.content)
             contents.append(candidate.content)
 
             # Gather function calls requested.
