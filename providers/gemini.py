@@ -64,7 +64,14 @@ from overrides import override
       to provide the full tool specs unlike Anthropic.
 """
 
-# Max tool call + response cycles before giving up.
+MAX_TOKENS = 64000
+THINKING_CFG = types.ThinkingConfig(
+    thinking_budget=32768,
+    # Disable Thought Summaries always: they are not useful, and we don't want to
+    # accidentally allow them to be included as past thinking content ever.
+    include_thoughts=False,
+)
+# Prevent agent loop runaway. Max tool call + response cycles before giving up.
 MAX_STEPS = 64
 
 class GeminiAgentNode(AgentNode):
@@ -88,57 +95,30 @@ class GeminiAgentNode(AgentNode):
         client_factory: Callable[[], Any],
     ):
         super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
-        client = client_factory()
+        client: Any = client_factory()
         if not isinstance(client, genai.Client):
             raise TypeError(
                 "GeminiAgentNode expected client_factory to return google.genai.Client"
             )
-        self.client = client
+        self.client: genai.Client = client
+        self.model = ModelNames[Provider.Gemini]
+        self._history: types.ContentListUnionDict = []   # Typed conversation history we replay every turn
         self._tool_call_counter = 0
+        self._tools: List[types.Tool] = self._build_tool_params()
         self._token_usage = TokenUsage()
+
+        # Seed initial user message.
+        # Substitute inputs into the templated user prompt.
+        user_text = self.build_user_text()
+        self.transcript.append(UserTextPart(text=user_text))
+        self._history.append(
+            types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
+        )
 
     @property
     @override
     def token_usage(self) -> TokenUsage:
         return self._token_usage
-
-    @staticmethod
-    def _gemini_type_enum(py_t: type) -> types.Type:
-        if py_t is str:   return types.Type.STRING
-        if py_t is int:   return types.Type.INTEGER
-        if py_t is float: return types.Type.NUMBER
-        if py_t is bool:  return types.Type.BOOLEAN
-        return types.Type.STRING
-
-    def _make_function_declaration(self, fn: Function) -> types.FunctionDeclaration:
-        params_props: Dict[str, types.Schema] = {}
-        for arg in fn.args:
-            enum: Union[List[str], None] = None
-            if arg.argtype is str and arg.enum is not None:
-                enum = sorted(list(arg.enum))
-
-            arg_schema = types.Schema(
-                type=self._gemini_type_enum(arg.argtype),
-                description=arg.desc,
-                enum=enum,
-            )
-            params_props[arg.name] = arg_schema
-
-        params_required = [arg.name for arg in fn.args if not arg.optional]
-
-        return types.FunctionDeclaration(
-            name=fn.name,
-            description=fn.desc,
-            parameters=types.Schema(
-                type=types.Type.OBJECT,
-                properties=params_props,
-                required=params_required,
-            ),
-        )
-
-    def _build_gemini_tools(self) -> list[types.Tool]:
-        decls = [self._make_function_declaration(t) for t in self.agent_fn.uses]
-        return [types.Tool(function_declarations=decls)] if decls else []
 
     def _append_thought_signatures(self, candidate: types.Candidate):
         """Append all thought signatures in the candidate as ThinkingBlockPart
@@ -188,14 +168,13 @@ class GeminiAgentNode(AgentNode):
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
 
     def run(self) -> None:
-        tools = self._build_gemini_tools()
         config = types.GenerateContentConfig(
-            system_instruction=self.agent_fn.system_prompt or "",
-            tools=tools,
+            system_instruction=self.agent_fn.system_prompt,
+            tools=self._tools,
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(
                     mode=types.FunctionCallingConfigMode.AUTO
-                )
+                ),
             ),
             # We should only use manual function call loop, never auto function calling (incompatible
             # with our transcripts, event posting, exceptions model, etc).
@@ -203,22 +182,11 @@ class GeminiAgentNode(AgentNode):
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True
             ),
-            thinking_config=types.ThinkingConfig(
-                thinking_budget=32768,
-                # Disable Thought Summaries always: they are not useful, and we don't want to
-                # accidentally allow them to be included as past thinking content ever.
-                include_thoughts=False,
-            ),
-            max_output_tokens=64000,
+            thinking_config=THINKING_CFG,
+            max_output_tokens=MAX_TOKENS,
         )
 
-        # Substitute inputs into the templated user prompt.
-        user_text = self.build_user_text()
-        self.transcript.append(UserTextPart(text=user_text))
-        contents: types.ContentListUnionDict = [
-            types.Content(role="user", parts=[types.Part.from_text(text=user_text)])
-        ]
-
+        # Agent loop.
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
@@ -226,8 +194,8 @@ class GeminiAgentNode(AgentNode):
 
             # TODO: Add retry/backoff for transient Google Generative AI client errors.
             resp: types.GenerateContentResponse = self.client.models.generate_content(
-                model=ModelNames[Provider.Gemini],
-                contents=contents,
+                model=self.model,
+                contents=self._history,
                 config=config,
             )
             assert resp.usage_metadata is not None, "Gemini response missing usage metadata"
@@ -242,7 +210,7 @@ class GeminiAgentNode(AgentNode):
             # Always append sanitized model content (keeps history complete) for replay.
             assert candidate.content is not None, "Gemini response missing content"
             self._check_thoughts_sanity(candidate.content)
-            contents.append(candidate.content)
+            self._history.append(candidate.content)
 
             # Gather function calls requested.
             calls: List[types.FunctionCall] = self._collect_function_calls(candidate)
@@ -260,8 +228,8 @@ class GeminiAgentNode(AgentNode):
                 self.ctx.post_cancel()
                 return
 
-            # Execute requested tools in parallel and
-            # aggregate all function responses into one tool message.
+            # Execute requested tools in parallel and aggregate all function responses.
+            # Even if some tool invocations fail early, continue processing others.
             result_parts: list[types.Part] = []
             children: List[Optional[Node]] = []                  # Index to match `calls` 1:1.
             invoke_exceptions: List[Optional[Exception]] = []    # Index to match `calls` 1:1.
@@ -293,10 +261,13 @@ class GeminiAgentNode(AgentNode):
                 out_text: str
                 is_error: bool
 
+                # Did the invocation itself fail-fast? (e.g. bad args)
                 if invoke_ex:
                     out_text = AgentNode.stringify_exception(invoke_ex)
                     is_error = True
                     response["error"] = out_text
+
+                # Check if the child Node is success / error.
                 else:
                     assert child
                     try:
@@ -306,8 +277,8 @@ class GeminiAgentNode(AgentNode):
                         is_error = False
                         response["output"] = out_text
                     except AgentException as ex:
-                        # Special case where agent decided to RaiseException. Record and
-                        # finish processing the rest of the batch before surfacing.
+                        # Agent decided to raise an exception. Keep processing the rest of the batch
+                        # per spec before propagating the exception outside the loop.
                         pending_agent_ex = ex
                         continue
                     except Exception as ex:
@@ -344,10 +315,12 @@ class GeminiAgentNode(AgentNode):
                 self.ctx.post_cancel()
                 return
             
-            # To single aggregated tool results message.
-            contents.append(types.Content(role="tool", parts=result_parts))
+            # Per protocol: next user message contains only function results.
+            # Aggregated function results to single Content message.
+            self._history.append(types.Content(role="tool", parts=result_parts))
 
-        raise RuntimeError("Gemini agent loop exceeded MAX_STEPS without producing a final answer.")
+        raise RuntimeError(f"Gemini agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
+                           "without producing a final response.")
 
     def _accumulate_usage(self, usage: types.GenerateContentResponseUsageMetadata):
         """For updating TokenUsage after each SDK response in the agent loop."""
@@ -366,3 +339,41 @@ class GeminiAgentNode(AgentNode):
         token_usage.output_tokens_reasoning = (token_usage.output_tokens_reasoning or 0) + reasoning_tokens
         token_usage.output_tokens_text = (token_usage.output_tokens_text or 0) + text_tokens
         token_usage.output_tokens_total += reasoning_tokens + text_tokens
+
+    def _build_tool_params(self) -> list[types.Tool]:
+        decls = [self._make_function_declaration(t) for t in self.agent_fn.uses]
+        return [types.Tool(function_declarations=decls)] if decls else []
+
+    def _make_function_declaration(self, fn: Function) -> types.FunctionDeclaration:
+        params_props: Dict[str, types.Schema] = {}
+        for arg in fn.args:
+            enum: Union[List[str], None] = None
+            if arg.argtype is str and arg.enum is not None:
+                enum = sorted(list(arg.enum))
+
+            arg_schema = types.Schema(
+                type=self._gemini_type_for_arg(arg.argtype),
+                description=arg.desc,
+                enum=enum,
+            )
+            params_props[arg.name] = arg_schema
+
+        params_required = [arg.name for arg in fn.args if not arg.optional]
+
+        return types.FunctionDeclaration(
+            name=fn.name,
+            description=fn.desc,
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties=params_props,
+                required=params_required,
+            ),
+        )
+
+    @staticmethod
+    def _gemini_type_for_arg(py_t: type) -> types.Type:
+        if py_t is str:   return types.Type.STRING
+        if py_t is int:   return types.Type.INTEGER
+        if py_t is float: return types.Type.NUMBER
+        if py_t is bool:  return types.Type.BOOLEAN
+        return types.Type.STRING

@@ -111,13 +111,14 @@ from anthropic.types.tool_param import InputSchemaTyped
 # Since we want agentic task completion end to end, we must always add the
 # header on each of our requests.
 INTERLEAVED_BETA = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
-TOOL_CHOICE = ToolChoiceAutoParam(type="auto")
 # "With interleaved thinking, the budget_tokens can exceed the max_tokens parameter,
 # as it represents the total budget across all thinking blocks within one assistant turn."
 MAX_TOKENS = 32_000
 THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=80_000)
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
+# Prevent agent loop runaway. Max tool call + response cycles before giving up.
+MAX_STEPS = 64
 
 
 class AnthropicAgentNode(AgentNode):
@@ -142,17 +143,19 @@ class AnthropicAgentNode(AgentNode):
         client_factory: Callable[[], Any],
     ):
         super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
-        self.client = client_factory()
-        if not isinstance(self.client, anthropic.Anthropic):
+        client: Any = client_factory()
+        if not isinstance(client, anthropic.Anthropic):
             raise TypeError(
                 "AnthropicAgentNode expected client_factory to return anthropic.Anthropic"
             )
+        self.client: anthropic.Anthropic = client
         self.model = ModelNames[Provider.Anthropic]
         self._history: List[MessageParam] = []   # Typed conversation history we replay every turn
-        self._tools: List[ToolUnionParam] = self._build_tool_params(self.agent_fn.uses)
+        self._tools: List[ToolUnionParam] = self._build_tool_params()
         self._token_usage = TokenUsage()
 
-        # Seed initial user message (cache watermark will be added pre-send)
+        # Seed initial user message (cache watermark will be added pre-send).
+        # Substitute inputs into the templated user prompt.
         user_text = self.build_user_text()
         self.transcript.append(UserTextPart(text=user_text))
         self._history.append(
@@ -165,10 +168,8 @@ class AnthropicAgentNode(AgentNode):
         return self._token_usage
 
     def run(self) -> None:
-        system_prompt = self.agent_fn.system_prompt
-
         # Agent loop.
-        while True:
+        for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
                 return
@@ -176,7 +177,7 @@ class AnthropicAgentNode(AgentNode):
             # Apply watermark to *latest* user message only (just-in-time).
             # The longest prefix cache partial hit wins. We get partial credit for
             # a cached prefix and the rest are new tokens which we incrementally pay to cache.
-            msgs = self._messages_with_latest_cache_ttl(self._history, CACHE_TTL)
+            msgs: List[MessageParam] = self._messages_with_latest_cache_ttl(self._history, CACHE_TTL)
 
             # One thinking-tool turn.
             resp: Message
@@ -188,10 +189,10 @@ class AnthropicAgentNode(AgentNode):
                 try:
                     with self.client.messages.stream(
                         model=self.model,
-                        system=system_prompt,
+                        system=self.agent_fn.system_prompt,
                         messages=msgs,
                         tools=self._tools,
-                        tool_choice=TOOL_CHOICE,
+                        tool_choice=ToolChoiceAutoParam(type="auto"),
                         max_tokens=MAX_TOKENS,
                         thinking=THINKING_CFG,
                         extra_headers=INTERLEAVED_BETA,
@@ -366,7 +367,7 @@ class AnthropicAgentNode(AgentNode):
                 out_text: str
                 is_error: bool
 
-                # Did the invocation itself fail-fast?
+                # Did the invocation itself fail-fast? (e.g. bad args)
                 if invoke_ex:
                     out_text = AgentNode.stringify_exception(invoke_ex)
                     is_error = True
@@ -419,6 +420,9 @@ class AnthropicAgentNode(AgentNode):
             # Per protocol: next user message contains only tool_result blocks
             self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
 
+        raise RuntimeError(f"Anthropic agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
+                           "without producing a final response.")
+
     def _accumulate_usage(self, usage: Usage) -> None:
         cache_read = usage.cache_read_input_tokens or 0
         cache_write = usage.cache_creation_input_tokens or 0
@@ -432,7 +436,8 @@ class AnthropicAgentNode(AgentNode):
         token_usage.input_tokens_total += input_tokens + cache_write + cache_read
         token_usage.output_tokens_total += output_tokens
 
-    def _build_tool_params(self, funcs: Sequence[Function]) -> List[ToolUnionParam]:
+    def _build_tool_params(self) -> List[ToolUnionParam]:
+        funcs: Sequence[Function] = self.agent_fn.uses
         tools: List[ToolUnionParam] = []
         for f in funcs:
             # Anthropic's training harness includes some common tools for which it
