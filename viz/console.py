@@ -57,9 +57,14 @@ def _short_repr(value, max_len: int = 40) -> str:
 def _format_args(inputs: dict, max_len: int = 800, per_val_len: int = 120) -> str:
     if not inputs:
         return ""
-    items = []
+    # Render values first to sort by their displayed length (ascending).
+    rendered: List[tuple[str, str]] = []
     for k, v in inputs.items():
-        items.append(f"{k}={_short_repr(v, per_val_len)}")
+        rendered_val = _short_repr(v, per_val_len)
+        rendered.append((k, rendered_val))
+    rendered.sort(key=lambda kv: len(kv[1]))  # stable sort by value length
+
+    items = [f"{k}={val}" for k, val in rendered]
     s = ", ".join(items)
     if len(s) > max_len:
         s = s[: max_len - 3] + "..."
