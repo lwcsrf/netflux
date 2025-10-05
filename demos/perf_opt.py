@@ -381,7 +381,7 @@ perf_optimizer = AgentFunction(
 
 
 def make_demo_workspace() -> Dict[str, str]:
-    scratch_dir = Path(tempfile.mkdtemp(prefix="netflux_perf_opt_")).resolve()
+    scratch_dir = Path(tempfile.mkdtemp(prefix="perf_opt_")).resolve()
 
     # Baseline implementation without scaffold
     baseline_code = (
