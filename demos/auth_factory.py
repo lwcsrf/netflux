@@ -53,7 +53,11 @@ def anthropic_client_factory() -> anthropic.Anthropic:
         # Optionally disable env proxies if they’re flaky:
         # trust_env=False,
     )
-    return anthropic.Anthropic(api_key=key, http_client=http_client, max_retries=4)
+    # We have our own retry layer, but Anthropic may have different
+    # or more informed retry criteria, so also use a small number of retries here.
+    max_retries = 2
+    
+    return anthropic.Anthropic(api_key=key, http_client=http_client, max_retries=max_retries)
 
 
 def gemini_client_factory() -> genai.Client:

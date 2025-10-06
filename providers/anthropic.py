@@ -205,19 +205,31 @@ class AnthropicAgentNode(AgentNode):
                     anthropic.RateLimitError,
                     anthropic.APIStatusError,
                     httpx.TransportError,
+                    httpx.HTTPStatusError,
                 ) as e:
+                    is_retriable: bool = False
+                    is_connection: bool = False
+
                     # Retry on known transient conditions: connection issues, rate limits, or 5xx responses.
-                    is_rate_limited = isinstance(e, anthropic.RateLimitError)
-                    is_transient_status = isinstance(e, anthropic.APIStatusError) and (
-                        e.status_code == 429 or e.status_code >= 500
-                    )
-                    # httpx.TransportError includes RemoteProtocolError, ReadTimeout, ConnectError, etc.
-                    is_connection = isinstance(e, (anthropic.APIConnectionError, httpx.TransportError))
-                    if not (is_rate_limited or is_transient_status or is_connection):
+                    if isinstance(e, anthropic.RateLimitError):
+                        is_retriable = True
+                    if isinstance(e, anthropic.APIStatusError):
+                        if e.status_code in (408, 409, 429) or e.status_code >= 500:
+                            is_retriable = True
+                    if isinstance(e, httpx.HTTPStatusError):
+                        status_code = e.response.status_code
+                        if status_code in (408, 409, 429) or status_code >= 500:
+                            is_retriable = True
+                    if isinstance(e, anthropic.APIConnectionError):
+                        is_retriable = True
+                        is_connection = True
+                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
+                        is_retriable = True
+                        is_connection = True
+                    
+                    if not is_retriable or attempt >= max_attempts:
                         raise
 
-                    if attempt >= max_attempts:
-                        raise
                     if self.is_cancel_requested():
                         self.ctx.post_cancel()
                         return
@@ -235,11 +247,11 @@ class AnthropicAgentNode(AgentNode):
                     else:
                         time.sleep(delay)
 
-                    # Rebuild the client if transport issue.
+                    # Rebuild client on transport errors to reset broken sessions/sockets.
                     if is_connection:
                         self.client = self.client_factory()
 
-                    attempt +=1
+                    attempt += 1
                     continue
 
             if self.is_cancel_requested():
