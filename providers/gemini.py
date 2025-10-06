@@ -272,6 +272,12 @@ class GeminiAgentNode(AgentNode):
                 assert candidate.finish_reason == types.FinishReason.STOP, (
                     f"finish_reason != STOP and no content is present. "
                     f"Got: {candidate.finish_reason} {candidate.finish_message}")
+                # No new content and we are done.
+                # Finalize with whatever is in the transcript.
+                self.ctx.post_success(self._final_text())
+                self.client.close()
+                return
+            
             # Thoughts are supposed to be empty (hidden) or we want to know of API change.
             self._check_thoughts_sanity(candidate.content)           
 
