@@ -190,11 +190,13 @@ class GeminiAgentNode(AgentNode):
                     ):
                         # Force retry below. Burn one attempt.
                         force_retry = True
+                        raise RuntimeError(f"Candidate finish_reason is: {candidate.finish_reason}.")
 
                     # Workaround for an empirical issue solved by retry (observed Oct 2025).
                     if not candidate.content and not candidate.finish_reason:
                         # Force retry below. Burn one attempt.
                         force_retry = True
+                        raise RuntimeError(f"Response has no content and no finish_reason.")
 
                     break
                 except (
@@ -202,6 +204,7 @@ class GeminiAgentNode(AgentNode):
                     genai_errors.UnknownApiResponseError,
                     httpx.HTTPStatusError,
                     httpx.TransportError,
+                    RuntimeError,
                 ) as e:
                     # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
                     is_retriable: bool = force_retry
