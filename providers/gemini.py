@@ -262,9 +262,13 @@ class GeminiAgentNode(AgentNode):
             self._accumulate_usage(resp.usage_metadata)
 
             # Sanity checks.
-            assert candidate.content is not None, "Gemini response missing content"
-            assert candidate.content.role == "model", (
-                f"Last response role must be 'model'. Got: {candidate.content.role}")            
+            if candidate.content:
+                assert candidate.content.role == "model", (
+                    f"Last response role must be 'model'. Got: {candidate.content.role}") 
+            else:
+                assert candidate.finish_reason == types.FinishReason.STOP, (
+                    f"finish_reason != STOP and no content is present. "
+                    f"Got: {candidate.finish_reason} {candidate.finish_message}")
             # Thoughts are supposed to be empty (hidden) or we want to know of API change.
             self._check_thoughts_sanity(candidate.content)           
 
@@ -305,6 +309,7 @@ class GeminiAgentNode(AgentNode):
                 self.client.close()
                 return
 
+            # At this point, there are function calls to process. First, sanity check:
             assert candidate.finish_reason in (None, types.FinishReason.STOP), (
                 f"Expected finish_reason STOP or None when function calls are present. Got: {candidate.finish_reason}")
 
