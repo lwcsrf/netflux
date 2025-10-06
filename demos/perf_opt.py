@@ -506,7 +506,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
     provider = Provider(provider_value)
-    report_path = run_perf_optimizer_tree(provider)
+    report_path = run_perf_optimizer_tree(provider).strip()
     if not report_path:
         return
 
