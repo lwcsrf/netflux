@@ -517,8 +517,9 @@ class AnthropicAgentNode(AgentNode):
     @staticmethod
     def _messages_with_latest_cache_ttl(msgs: List[MessageParam], ttl: Literal['5m', '1h']) -> List[MessageParam]:
         """
-        Deep-copy and attach CacheControlEphemeralParam(ttl) to the *latest* user message’s
-        parent blocks (text/tool_result). This is applied pre-send every turn.
+        Deep-copy and attach CacheControlEphemeralParam(ttl) only to the last element of the
+        latest user message's (text or function response) content list.
+        Leave earlier content blocks untouched.
         """
         out: List[MessageParam] = copy.deepcopy(msgs)
 
@@ -532,19 +533,22 @@ class AnthropicAgentNode(AgentNode):
             return out
 
         cc = CacheControlEphemeralParam(type="ephemeral", ttl=ttl)
+        orig_blocks = cast(List[Any], out[idx]["content"])
+        assert orig_blocks, "User message content is empty"
         new_blocks: List[Any] = []
 
         to_obj = lambda x: x if not isinstance(x, dict) else SimpleNamespace(**x)
 
-        for blk in cast(List[Any], out[idx]["content"]):
+        last_block_idx = len(orig_blocks) - 1
+        for i, blk in enumerate(orig_blocks):
+            if i != last_block_idx:
+                new_blocks.append(blk)
+                continue
+
             b = to_obj(blk)
-
-            if b.type == "text":
-                new_blocks.append(
-                    TextBlockParam(text=b.text, type="text", cache_control=cc)
-                )
-
-            elif b.type == "tool_result":
+            if getattr(b, "type", None) == "text":
+                new_blocks.append(TextBlockParam(text=b.text, type="text", cache_control=cc))
+            elif getattr(b, "type", None) == "tool_result":
                 new_blocks.append(
                     ToolResultBlockParam(
                         tool_use_id=b.tool_use_id,
@@ -554,8 +558,8 @@ class AnthropicAgentNode(AgentNode):
                         cache_control=cc,
                     )
                 )
-
             else:
+                # Unknown block type; leave untouched (no cache control).
                 new_blocks.append(blk)
 
         out[idx] = cast(MessageParam, {"role": "user", "content": new_blocks})
