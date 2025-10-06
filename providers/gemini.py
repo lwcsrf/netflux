@@ -124,49 +124,6 @@ class GeminiAgentNode(AgentNode):
     def token_usage(self) -> TokenUsage:
         return self._token_usage
 
-    def _append_thought_signatures(self, candidate: types.Candidate):
-        """Append all thought signatures in the candidate as ThinkingBlockPart
-        in the framework transcript (not the SDK replay transcript)."""
-        if not candidate.content or not candidate.content.parts:
-            return
-        for part in candidate.content.parts:
-            sig = part.thought_signature  # bytes | None
-            if sig is None:
-                continue
-            if isinstance(sig, (bytes, bytearray)):
-                sig_b64 = base64.b64encode(sig).decode("utf-8")
-            else:
-                sig_b64 = str(sig)
-            self.transcript.append(ThinkingBlockPart(content="", signature=sig_b64))
-
-    def _check_thoughts_sanity(self, content: types.Content):
-        # Ensure empty `thought` text.
-        # For Gemini, thoughts are currently hidden. Only thought signatures are used for replay.
-        # It would be very ambiguous if we somehow replay partial thoughts, or api behavior changes.
-        # This is a sanity check to eliminate any such uncertainty.
-        parts = content.parts or []
-        for p in parts:
-            if p.thought is None:
-                continue
-            if isinstance(p.thought, str):
-                assert p.thought.strip() == "", "Gemini thought text is supposed to be empty."
-            if isinstance(p.thought, bool):
-                if p.thought:
-                    assert p.text is None or p.text.strip() == "", "Gemini thought text is supposed to be empty."
-
-    def _collect_function_calls(self, candidate: types.Candidate) -> list[types.FunctionCall]:
-        if not candidate.content:
-            return []
-        parts = candidate.content.parts or []
-        return [p.function_call for p in parts if p.function_call is not None]
-
-    def _extract_text(self, candidate: types.Candidate) -> str:
-        if not candidate.content:
-            return ""
-        parts = candidate.content.parts or []
-        chunks = [p.text for p in parts if p.text is not None]
-        return "\n".join([t for t in chunks if isinstance(t, str) and t.strip()]).strip()
-
     def _new_tool_use_id(self, tool_name: str) -> str:
         self._tool_call_counter += 1
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
@@ -304,24 +261,52 @@ class GeminiAgentNode(AgentNode):
             assert resp.usage_metadata is not None, "Gemini response missing usage metadata"
             self._accumulate_usage(resp.usage_metadata)
 
-            # Record thought signatures (never summaries) in framework-type transcript.
-            self._append_thought_signatures(candidate)
+            # Sanity checks.
+            assert candidate.content is not None, "Gemini response missing content"
+            assert candidate.content.role == "model", (
+                f"Last response role must be 'model'. Got: {candidate.content.role}")            
+            # Thoughts are supposed to be empty (hidden) or we want to know of API change.
+            self._check_thoughts_sanity(candidate.content)           
 
             # Always append sanitized model content (keeps history complete) for replay.
-            assert candidate.content is not None, "Gemini response missing content"
-            self._check_thoughts_sanity(candidate.content)
             self._history.append(candidate.content)
 
-            # Gather function calls requested.
-            calls: List[types.FunctionCall] = self._collect_function_calls(candidate)
+            part: types.Part
+            calls: List[types.FunctionCall] = []
+            for part in candidate.content.parts:
+                thought_sig: Optional[bytes] = part.thought_signature
+                if thought_sig:
+                    # Thought signatures are always recorded in transcript as ThinkingBlockPart
+                    # without the "though" text for Gemini (since it's empty/hidden by policy right now).
+                    if isinstance(thought_sig, (bytes, bytearray)):
+                        sig_b64 = base64.b64encode(thought_sig).decode("utf-8")
+                    else:
+                        sig_b64 = str(thought_sig)
+                    self.transcript.append(ThinkingBlockPart(content="", signature=sig_b64))
+                    # Ensure our understanding of the protocol is correct that function calls come last.
+                    assert not calls, "Gemini thought_signature parts should precede function_call parts."
+
+                func_call: Optional[types.FunctionCall] = part.function_call
+                if func_call:
+                    calls.append(func_call)
+                    # Append to transcript later in the loop below.
+
+                text: Optional[str] = part.text
+                if text:
+                    self.transcript.append(ModelTextPart(text=text))
+                    # Ensure our understanding of the protocol is correct that function calls come last.
+                    assert not calls, "Gemini text parts should precede function_call parts."
 
             # No function calls → finalize with assistant text.
             if not calls:
-                final_text: str = self._extract_text(candidate)
-                self.transcript.append(ModelTextPart(text=final_text))
-                self.ctx.post_success(final_text)
+                assert candidate.finish_reason == types.FinishReason.STOP, (
+                    "Expected finish_reason=STOP when no function calls")
+                self.ctx.post_success(self._final_text())
                 self.client.close()
                 return
+
+            assert candidate.finish_reason in (None, types.FinishReason.STOP), (
+                f"Expected finish_reason STOP or None when function calls are present. Got: {candidate.finish_reason}")
 
             # Make sure we check for cancellation right before commencing possibly
             # lengthy sub-tasks.
@@ -473,6 +458,42 @@ class GeminiAgentNode(AgentNode):
                 required=params_required,
             ),
         )
+
+    def _check_thoughts_sanity(self, content: types.Content):
+        # Ensure empty `thought` text.
+        # For Gemini, thoughts are currently hidden. Only thought signatures are used for replay.
+        # It would be very ambiguous if we somehow replay partial thoughts, or api behavior changes.
+        # This is a sanity check to eliminate any such uncertainty.
+        if not content:
+            return
+        parts = content.parts or []
+        for p in parts:
+            if p.thought is None:
+                continue
+            if isinstance(p.thought, str):
+                assert p.thought.strip() == "", "Gemini thought text is supposed to be empty."
+            if isinstance(p.thought, bool):
+                if p.thought:
+                    assert p.text is None or p.text.strip() == "", "Gemini thought text is supposed to be empty."
+
+    def _final_text(self) -> str:
+        """
+        Extract final text from transcript: concatenate all ModelTextPart text
+        that comes after the last function call found (ToolResultPart).
+        """
+        last_func_idx = -1
+        for i, part in enumerate(self.transcript):
+            if isinstance(part, ToolResultPart):
+                last_func_idx = i
+
+        final_text_chunks: List[str] = []
+        for i in range(last_func_idx + 1, len(self.transcript)):
+            part = self.transcript[i]
+            if isinstance(part, ModelTextPart):
+                if part.text.strip():
+                    final_text_chunks.append(part.text)
+       
+        return "\n".join(final_text_chunks)
 
     @staticmethod
     def _gemini_type_for_arg(py_t: type) -> types.Type:
