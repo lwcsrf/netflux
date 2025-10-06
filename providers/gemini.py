@@ -1,6 +1,10 @@
 from typing import Any, Callable, Dict, List, Optional, Union
 import base64
+import time
+import random
 from multiprocessing.synchronize import Event
+import httpx
+from overrides import override
 
 from ..core import (
     Node, RunContext, Function, AgentNode, AgentException,
@@ -11,7 +15,7 @@ from . import ModelNames, Provider
 
 import google.genai as genai
 from google.genai import types
-from overrides import override
+from google.genai import errors as genai_errors
 
 """
 ## Misc Research Notes.
@@ -192,17 +196,109 @@ class GeminiAgentNode(AgentNode):
                 self.ctx.post_cancel()
                 return
 
-            # TODO: Add retry/backoff for transient Google Generative AI client errors.
-            resp: types.GenerateContentResponse = self.client.models.generate_content(
-                model=self.model,
-                contents=self._history,
-                config=config,
-            )
+            # One thinking-tool turn.
+            resp: types.GenerateContentResponse
+            candidate: types.Candidate
+            max_attempts = 8
+            base_delay = 3  # seconds
+            attempt = 1
+            # Retry logic.
+            while True:
+                force_retry: bool = False
+                try:
+                    resp = self.client.models.generate_content(
+                        model=self.model,
+                        contents=self._history,
+                        config=config,
+                    )
+
+                    # Should never happen in practice. If it does, will not be retried below.
+                    if not resp.candidates:
+                        # Will be converted by wrapper to ModelProviderException with more context.
+                        raise RuntimeError("Gemini returned no candidates.")
+                    candidate = resp.candidates[0]
+
+                    # False positive for safety block or SDK proactively detecting malformed
+                    # function call.
+                    if candidate.finish_reason and candidate.finish_reason in (
+                        types.FinishReason.SAFETY,
+                        types.FinishReason.RECITATION,
+                        types.FinishReason.LANGUAGE,
+                        types.FinishReason.BLOCKLIST,
+                        types.FinishReason.PROHIBITED_CONTENT,
+                        types.FinishReason.SPII,
+                        types.FinishReason.MALFORMED_FUNCTION_CALL,
+                        types.FinishReason.UNEXPECTED_TOOL_CALL,
+                    ):
+                        # Force retry below. Burn one attempt.
+                        force_retry = True
+
+                    # Workaround for an empirical issue solved by retry (observed Oct 2025).
+                    if not candidate.content and not candidate.finish_reason:
+                        # Force retry below. Burn one attempt.
+                        force_retry = True
+
+                    break
+                except (
+                    genai_errors.APIError,
+                    genai_errors.UnknownApiResponseError,
+                    httpx.HTTPStatusError,
+                    httpx.TransportError,
+                ) as e:
+                    # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
+                    is_retriable: bool = force_retry
+                    is_connection: bool = False
+
+                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
+                        is_retriable = True
+                        is_connection = True
+
+                    if isinstance(e, httpx.HTTPStatusError):
+                        status_code = e.response.status_code
+                        if status_code in (408, 409, 429) or status_code >= 500:
+                            is_retriable = True
+
+                    if isinstance(e, genai_errors.APIError):
+                        if e.code in (408, 409, 429) or e.code >= 500:
+                            is_retriable = True
+
+                    if isinstance(e, genai_errors.UnknownApiResponseError):
+                        is_retriable = True
+
+                    if not is_retriable or attempt >= max_attempts:
+                        raise
+
+                    if self.is_cancel_requested():
+                        self.ctx.post_cancel()
+                        return
+
+                    delay = base_delay * (2 ** (attempt - 1))
+                    delay = min(delay, 30)
+                    # Add small jitter to prevent thundering herd.
+                    delay += random.uniform(0, delay * 0.1)
+
+                    # Sleep unless/until canceled.
+                    if self.cancel_event:
+                        if self.cancel_event.wait(delay):
+                            self.ctx.post_cancel()
+                            return
+                    else:
+                        time.sleep(delay)
+
+                    # Rebuild client on transport errors to reset broken sessions/sockets.
+                    if is_connection:
+                        self.client = self.client_factory()
+
+                    attempt += 1
+                    continue
+            
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
+                return
+
+            # Incremental token accounting.
             assert resp.usage_metadata is not None, "Gemini response missing usage metadata"
             self._accumulate_usage(resp.usage_metadata)
-            if not resp.candidates:
-                raise RuntimeError("Gemini returned no candidates.")
-            candidate: types.Candidate = resp.candidates[0]
 
             # Record thought signatures (never summaries) in framework-type transcript.
             self._append_thought_signatures(candidate)
