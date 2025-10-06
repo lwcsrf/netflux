@@ -172,6 +172,7 @@ class AnthropicAgentNode(AgentNode):
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
 
             # Apply watermark to *latest* user message only (just-in-time).
@@ -232,6 +233,7 @@ class AnthropicAgentNode(AgentNode):
 
                     if self.is_cancel_requested():
                         self.ctx.post_cancel()
+                        self.client.close()
                         return
 
                     delay = base_delay * (2 ** (attempt - 1))
@@ -243,12 +245,14 @@ class AnthropicAgentNode(AgentNode):
                     if self.cancel_event:
                         if self.cancel_event.wait(delay):
                             self.ctx.post_cancel()
+                            self.client.close()
                             return
                     else:
                         time.sleep(delay)
 
                     # Rebuild client on transport errors to reset broken sessions/sockets.
                     if is_connection:
+                        self.client.close()
                         self.client = self.client_factory()
 
                     attempt += 1
@@ -256,6 +260,7 @@ class AnthropicAgentNode(AgentNode):
 
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
 
             # Incremental token accounting.
@@ -325,12 +330,14 @@ class AnthropicAgentNode(AgentNode):
                 final_text = "\n".join(t for t in final_text_chunks if t).strip()
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
+                self.client.close()
                 return
 
             # Make sure we check for cancellation right before commencing possibly
             # lengthy sub-tasks.
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
 
             # Assert expectation: model requested tool use in this turn.
@@ -424,9 +431,11 @@ class AnthropicAgentNode(AgentNode):
             # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
+                self.client.close()
                 return
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
             
             # Per protocol: next user message contains only tool_result blocks

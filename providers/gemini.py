@@ -194,6 +194,7 @@ class GeminiAgentNode(AgentNode):
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
 
             # One thinking-tool turn.
@@ -270,6 +271,7 @@ class GeminiAgentNode(AgentNode):
 
                     if self.is_cancel_requested():
                         self.ctx.post_cancel()
+                        self.client.close()
                         return
 
                     delay = base_delay * (2 ** (attempt - 1))
@@ -281,6 +283,7 @@ class GeminiAgentNode(AgentNode):
                     if self.cancel_event:
                         if self.cancel_event.wait(delay):
                             self.ctx.post_cancel()
+                            self.client.close()
                             return
                     else:
                         time.sleep(delay)
@@ -294,6 +297,7 @@ class GeminiAgentNode(AgentNode):
             
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
 
             # Incremental token accounting.
@@ -316,12 +320,14 @@ class GeminiAgentNode(AgentNode):
                 final_text: str = self._extract_text(candidate)
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
+                self.client.close()
                 return
 
             # Make sure we check for cancellation right before commencing possibly
             # lengthy sub-tasks.
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
 
             # Execute requested tools in parallel and aggregate all function responses.
@@ -406,9 +412,11 @@ class GeminiAgentNode(AgentNode):
             # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
+                self.client.close()
                 return
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
             
             # Per protocol: next user message contains only function results.
