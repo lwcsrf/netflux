@@ -363,6 +363,7 @@ perf_optimizer = AgentFunction(
         "<final_output>\n"
         "Return a string containing the absolute filepath of your final report.\n"
         "Your final completion text should be only this filepath, nothing else. Save commentary for the report.\n"
+        "Example final completion text: '/{scratch_dir}/FINAL_REPORT-3f5e2a9c.md'. Not even a message, just a path.\n"
         "</final_output>\n"
         "</instructions>\n\n"
 
