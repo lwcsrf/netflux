@@ -25,3 +25,12 @@ Uses a combination of cProfile and critical reasoning. Produces intermediate pro
 reports, and a final report summarizing changes and measured performance gains.
 
 `python3 -m netflux.demos.perf_opt --provider={gemini,anthropic}`
+
+### Apply Diff (`apply_diff.py`)
+
+Applies a multi-file unified diff (within a markdown changes doc) to a temporary workspace using the built-in `apply_diff_patch` agent. The patch exercises multiple operations: multi-hunk edits, add, delete, and rename, plus a filename containing spaces. Optionally, it can first run an intentionally failing patch to exercise rollback semantics.
+The script prints the workspace path, streams a live view of the agent’s work, and then verifies that all expected file changes were applied.
+
+Run:
+
+`python3 -m netflux.demos.apply_diff --provider={gemini,anthropic} [--fail-first]`

@@ -111,8 +111,9 @@ Valid changeset content may be:
 
 * You will need to use `{text_editor.name}` and `{bash.name}`, and only `{raise_exception.name}` if things go wrong.
 * Token Efficiency is important
-    * Try to avoid reading/writing entire files.
+    * Try to avoid reading/writing entire files. The files may be large and you want to be token efficient.
     * Use the various modes of `{text_editor.name}` to do targeted reads/writes/replace.
+    * Recall that you cannot use the same bash session concurrently (must be sequenced).
     * When debugging match failures, consider using `grep` with params (e.g. surrounding text, line numbers) on smaller patterns to narrow down the issue, and you can also use `{text_editor.name}` to read particular line ranges of files with line number annotations. Be aware of changes you already applied, and consider using the `.bak` files you created for rollbacks as a stable reference when debugging.
 * If you choose to use bash tools for hunk debugging, don't use things like `perl`, `awk`, or `python` as you probably won't be given access to those in your sandbox and you have a higher chance of making an error. Instead, use simple tools like `ls`, `cat`, `grep`, `stat`, `cmp`, `head`, `tail`, `wc` with params you are confident about.
 """,
