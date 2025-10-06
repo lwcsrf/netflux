@@ -3,9 +3,10 @@
 from pathlib import Path
 from typing import Any, Callable, Dict
 
-import anthropic
 import httpx
+import anthropic
 import google.genai as genai
+from google.genai import types
 
 from ..providers import Provider
 
@@ -50,19 +51,55 @@ def anthropic_client_factory() -> anthropic.Anthropic:
             write=120.0,
             pool=10.0,
         ),
-        # Optionally disable env proxies if they’re flaky:
+        # default in httpx; leave unless you need to disable env proxies:
         # trust_env=False,
     )
     # We have our own retry layer, but Anthropic may have different
     # or more informed retry criteria, so also use a small number of retries here.
-    max_retries = 2
-    
+    max_retries = 1
+
     return anthropic.Anthropic(api_key=key, http_client=http_client, max_retries=max_retries)
 
 
 def gemini_client_factory() -> genai.Client:
     key = _read_key("gemini.key")
-    return genai.Client(api_key=key)
+
+    # We have our own retry layer, but Gemini SDK may have different
+    # or more informed retry criteria, so also use a small number of retries here.
+    sdk_retry = types.HttpRetryOptions(
+        attempts=2,             # total attempts = (1 original + 1 retry)
+        initial_delay=1.0,      # seconds
+        max_delay=5.0,          # seconds (our provider retry layer has longer max)
+        exp_base=2.0,
+        jitter=1.0,
+    )
+    httpx_limits = httpx.Limits(
+        max_connections=4,
+        max_keepalive_connections=2,
+        keepalive_expiry=20.0,
+    )
+    httpx_timeout = httpx.Timeout(
+        connect=10.0,
+        read=900.0,  # tolerate very long gaps between streamed chunks
+        write=120.0,
+        pool=10.0,
+    )
+    http_options = types.HttpOptions(
+        # Choose api_version if you want only GA endpoints; by default SDK uses v1beta for preview features.
+        # api_version="v1",  # uncomment to pin to stable
+        client_args={
+            "http2": True,
+            "limits": httpx_limits,
+            "timeout": httpx_timeout,
+            # default in httpx; leave unless you need to disable env proxies
+            # "trust_env": True,
+        },
+        retry_options=sdk_retry,
+        # Avoid setting HttpOptions.timeout here so we don't override the fine-grained HTTPX timeouts.
+        # If you *do* set it, it will be used as the request timeout AND send X-Server-Timeout.
+    )
+
+    return genai.Client(api_key=key, http_options=http_options)
 
 
 CLIENT_FACTORIES: Dict[Provider, Callable[[], Any]] = {

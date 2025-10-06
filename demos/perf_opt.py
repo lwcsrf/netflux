@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider, RunContext, CancellationException
 from ..runtime import Runtime
 from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
-from .auth_factory import CLIENT_FACTORIES
+from .client_factory import CLIENT_FACTORIES
 from ..func_lib.text_editor import text_editor
 from ..func_lib.raise_exception import raise_exception
  

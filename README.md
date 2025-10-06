@@ -383,7 +383,7 @@ from netflux.func_lib.ensemble import Ensemble                 # CodeFunction de
 # Demo auth factories (reads api keys for Anthropic & Gemini from file).
 # Consumer must always specify the factory functions to create the LLM SDK clients
 # since this configures endpoint, authorization mechanism, etc.
-from netflux.demos.auth_factory import CLIENT_FACTORIES
+from netflux.demos.client_factory import CLIENT_FACTORIES
 
 # Register everything we intend to use.
 runtime = Runtime(

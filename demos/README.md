@@ -1,13 +1,13 @@
 ### Authentication setup
 
-The demos use client factories defined in `netflux/demos/auth_factory.py`.
+The demos use client factories defined in `netflux/demos/client_factory.py`.
 By default it reads API keys from the following files in this directory:
 
 - `anthropic.key`
 - `gemini.key`
 
 Create each file and paste your API key as the only line of text. If you use a different
-authentication flow, update the callables in `auth_factory.py` before running the demos.
+authentication flow, update the callables in `client_factory.py` before running the demos.
 
 ### Gauntlet (`puzzle.py`)
 
