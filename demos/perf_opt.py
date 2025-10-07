@@ -457,7 +457,7 @@ def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> Optional[str
             "input_code_path": ws["input_code_path"],
             "scope_instruction": "Optimize sum_primes() including helpers if beneficial.",
             "scratch_dir": ws["scratch_dir"],
-            "max_iters": 5,
+            "max_iters": 3,
         },
         provider=provider,
         cancel_event=cancel_evt,
