@@ -243,6 +243,24 @@ assume it will be run in a venv where those are installed."""
 perf_profiler = PerfProfiler()
 
 
+def _thinking_scratchpad_impl(ctx: RunContext, *, thinking: str) -> str:
+    return ""
+
+thinking_scratchpad = CodeFunction(
+    name="thinking_scratchpad",
+    desc=(
+        "Use this function's input arg as a thinking scratchpad like you usually do with <think> ... </think> sections. "
+        "This function will not do anything; it simply provides you the opportunity to do a thinking (reasoning) block "
+        "before your next action. Use this function as much as necessary before you decide what to do next, "
+        "especially if you were asked to ultra-think, or need to do analysis before writing a report or code, etc."
+    ),
+    args=[
+        FunctionArg("thinking", str, "Use this arg as your thinking scratchpad to think about the problem."),
+    ],
+    callable=_thinking_scratchpad_impl,
+    uses=[],
+)
+
 perf_reasoner = AgentFunction(
     name="perf_reasoner",
     desc=(
@@ -255,6 +273,8 @@ perf_reasoner = AgentFunction(
     ],
     system_prompt=(
         f"{ULTRATHINK_PROMPT}\n"
+        "Do interleaved reasoning between your function calls. "
+        f"Use the {thinking_scratchpad.name} function's `thinking` argument as a scratchpad if you need thinking space.\n"
         "You are a critical performance engineer.\n"
         "## Task\n"
         "- Read the full contents of the file at `code_path`. You do not need to list or explore any directories.\n"
@@ -268,7 +288,7 @@ perf_reasoner = AgentFunction(
         " ## Return\n"
         "Return final message: 'Critical Analysis Report written to: {report_path}'.\n"
         " ## Exceptions\n"
-        "Only raise an exception via the {raise_exception.name} function if the `code_path` file is: "
+        f"Only raise an exception via the {raise_exception.name} function if the `code_path` file is: "
         "unreadable; missing; clearly corrupt; non-sensical; unrelated to code."
     ),
     user_prompt_template=(
@@ -279,7 +299,7 @@ perf_reasoner = AgentFunction(
         "Task: produce an extremely thorough analysis, as per above instructions, and write it to `report_path`. "
         "Finish with the final confirmation message (confirming your report's absolute filepath) when you're done.\n"
     ),
-    uses=[text_editor, raise_exception],
+    uses=[text_editor, raise_exception, thinking_scratchpad],
     default_model=Provider.Anthropic,
 )
 
@@ -300,6 +320,8 @@ perf_optimizer = AgentFunction(
     ],
     system_prompt=(
         f"{ULTRATHINK_PROMPT}\n"
+        "Do interleaved reasoning between your function calls. "
+        f"Use the {thinking_scratchpad.name} function's `thinking` argument as a scratchpad if you need thinking space.\n"
         "<role>You are a critical performance engineer.</role>\n\n"
         "<instructions>\n"
         "- All inputs and outputs are file paths. Write every artifact to `scratch_dir`.\n"
@@ -378,7 +400,7 @@ perf_optimizer = AgentFunction(
         "max_iters: {max_iters}\n"
         "Execute the plan now.\n"
     ),
-    uses=[text_editor, perf_profiler, perf_reasoner, raise_exception],
+    uses=[text_editor, perf_profiler, perf_reasoner, raise_exception, thinking_scratchpad],
     default_model=Provider.Anthropic,
 )
 
@@ -506,9 +528,10 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
     provider = Provider(provider_value)
-    report_path = run_perf_optimizer_tree(provider).strip()
+    report_path = run_perf_optimizer_tree(provider)
     if not report_path:
         return
+    report_path = report_path.strip()
 
     try:
         report_file = Path(report_path)
