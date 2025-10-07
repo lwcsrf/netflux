@@ -57,9 +57,14 @@ def _short_repr(value, max_len: int = 40) -> str:
 def _format_args(inputs: dict, max_len: int = 800, per_val_len: int = 120) -> str:
     if not inputs:
         return ""
-    items = []
+    # Render values first to sort by their displayed length (ascending).
+    rendered: List[tuple[str, str]] = []
     for k, v in inputs.items():
-        items.append(f"{k}={_short_repr(v, per_val_len)}")
+        rendered_val = _short_repr(v, per_val_len)
+        rendered.append((k, rendered_val))
+    rendered.sort(key=lambda kv: len(kv[1]))  # stable sort by value length
+
+    items = [f"{k}={val}" for k, val in rendered]
     s = ", ".join(items)
     if len(s) > max_len:
         s = s[: max_len - 3] + "..."
@@ -88,6 +93,37 @@ def _type_glyph_for_fn(fn) -> str:
     if fn.is_code():
         return "⚙️"
     return "•"
+
+
+def _format_elapsed(nv: NodeView) -> Optional[str]:
+    """Return a colored elapsed time in square brackets.
+
+    - Running: red [Xs]
+    - Terminal: green [Xs]
+    - Waiting/no start: None
+
+    Keeps string short (1 decimal; <1s -> 2 decimals) to minimize interaction
+    with UI cropping. The ANSI wrapper is self-contained so cropping logic that
+    trims trailing partial CSI remains safe.
+    """
+    start = nv.started_at
+    if start is None:
+        return None
+    end: Optional[float] = None
+    if nv.state in (NodeState.Success, NodeState.Error, NodeState.Canceled):
+        end = nv.ended_at
+    tnow = time.time()
+    elapsed = max(0.0, (end if end is not None else tnow) - start)
+    if elapsed < 1.0:
+        s = f"{elapsed:.2f}s"
+    else:
+        s = f"{elapsed:.1f}s"
+    # color by state (running=red, done=green)
+    if nv.state is NodeState.Running:
+        body = _color(s, fg="red")
+    else:
+        body = _color(s, fg="green")
+    return f" [{body}]"
 
 
 @dataclass
@@ -138,7 +174,12 @@ class ConsoleRender(Render[str]):
                 color = "magenta"
             args = _format_args(nv.inputs)
             type_g = _type_glyph_for_fn(nv.fn)
+            # Base prefix + function name
             header = f"{_color(glyph, fg=color, bold=True)} {_color(type_g, dim=True)} {_color(nv.fn.name, bold=True)}"
+            # Elapsed time immediately after function name, to reduce truncation risk
+            et = _format_elapsed(nv)
+            if et:
+                header += et
             if args:
                 header += f"({_color(args, dim=True)})"
 

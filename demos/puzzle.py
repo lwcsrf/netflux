@@ -13,7 +13,7 @@ from ..core import (
     CancellationException,
 )
 from ..runtime import Runtime
-from .auth_factory import CLIENT_FACTORIES
+from .client_factory import CLIENT_FACTORIES
 from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
 
 

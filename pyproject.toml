@@ -27,14 +27,18 @@ test = [
 ]
 
 # Provider-specific dependencies
-anthropic = ["anthropic>=0.60.0, <1.0.0"]
-gemini = ["google-genai>=1.25.0, <2.0.0"]
+anthropic = [
+    "anthropic>=0.69.0, <1.0.0",
+    "httpx[http2]",
+]
+gemini = ["google-genai>=1.41.0, <2.0.0"]
 openai = ["openai>=1.109.1, <2.0.0"]
 xai = ["xai-sdk>=1.2.0, <2.0.0"]
 
 # A convenience group to install all provider clients
 # if running the demos or doing E2E integration tests.
 all = [
+    "netflux[test]",
     "netflux[anthropic]",
     "netflux[gemini]",
     "netflux[openai]",

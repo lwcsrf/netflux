@@ -16,7 +16,7 @@ from typing import Dict, List, Optional
 from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider, RunContext, CancellationException
 from ..runtime import Runtime
 from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
-from .auth_factory import CLIENT_FACTORIES
+from .client_factory import CLIENT_FACTORIES
 from ..func_lib.text_editor import text_editor
 from ..func_lib.raise_exception import raise_exception
  
@@ -332,6 +332,7 @@ perf_optimizer = AgentFunction(
         "- Use the perf profile report to also detect source code errors that may cause runtime failures, by looking at "
         "  the captured stderr and exception sections. If you find issues, fix them in the new candidate. "
         "- If a bug was already present in the original code and it can't be fixed after some attempts, use {raise_exception.name} to fail.\n"
+        "- If the functions you invoke raise an exception, re-check your paths and the code input.\n"
         "- If you encounter a new bug in your candidate code, iterate to fix it by using the stderr of the profiler (read its report) as an executor. "
         " You can do that multiple times in a row if necessary, otherwise consider backtracking on your current direction.\n"
         "- Iterate until you hit a clear plateau: once remaining ideas stop improving the profile and it's evident no "
@@ -363,6 +364,8 @@ perf_optimizer = AgentFunction(
         "<final_output>\n"
         "Return a string containing the absolute filepath of your final report.\n"
         "Your final completion text should be only this filepath, nothing else. Save commentary for the report.\n"
+        "Example final completion text: '/{scratch_dir}/FINAL_REPORT-3f5e2a9c.md'. Not even a message, just a path.\n"
+        "**This must be written explicitly as assistant/model text output, not just implied by the function result.**\n"
         "</final_output>\n"
         "</instructions>\n\n"
 
@@ -381,7 +384,7 @@ perf_optimizer = AgentFunction(
 
 
 def make_demo_workspace() -> Dict[str, str]:
-    scratch_dir = Path(tempfile.mkdtemp(prefix="netflux_perf_opt_")).resolve()
+    scratch_dir = Path(tempfile.mkdtemp(prefix="perf_opt_")).resolve()
 
     # Baseline implementation without scaffold
     baseline_code = (
@@ -503,7 +506,7 @@ def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
     provider = Provider(provider_value)
-    report_path = run_perf_optimizer_tree(provider)
+    report_path = run_perf_optimizer_tree(provider).strip()
     if not report_path:
         return
 

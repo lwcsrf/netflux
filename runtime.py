@@ -233,6 +233,8 @@ class Runtime:
             exception=node.exception,  # Ditto.
             children=child_views,
             usage=usage,
+            started_at=node.started_at,
+            ended_at=node.ended_at,
             update_seqnum=self._global_seqno,
         )
 
@@ -298,6 +300,9 @@ class Runtime:
     def post_status_update(self, node: Node, state: NodeState) -> None:
         with self._lock:
             self._global_seqno += 1
+            # Record start time on first transition to Running
+            if state is NodeState.Running and not node.started_at:
+                node.started_at = time.time()
             node.state = state
             self._publish_tree_update(node)
 
@@ -306,6 +311,8 @@ class Runtime:
             self._global_seqno += 1
             node.outputs = outputs
             node.state = NodeState.Success
+            if not node.ended_at:
+                node.ended_at = time.time()
             self._publish_tree_update(node)
             node.done.set()
 
@@ -314,6 +321,8 @@ class Runtime:
             self._global_seqno += 1
             node.exception = exception
             node.state = NodeState.Error
+            if not node.ended_at:
+                node.ended_at = time.time()
             self._publish_tree_update(node)
             node.done.set()
 
@@ -331,5 +340,7 @@ class Runtime:
             self._global_seqno += 1
             node.exception = exception or CancellationException()
             node.state = NodeState.Canceled
+            if not node.ended_at:
+                node.ended_at = time.time()
             self._publish_tree_update(node)
             node.done.set()

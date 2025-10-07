@@ -1,13 +1,13 @@
 ### Authentication setup
 
-The demos use client factories defined in `netflux/demos/auth_factory.py`.
+The demos use client factories defined in `netflux/demos/client_factory.py`.
 By default it reads API keys from the following files in this directory:
 
 - `anthropic.key`
 - `gemini.key`
 
 Create each file and paste your API key as the only line of text. If you use a different
-authentication flow, update the callables in `auth_factory.py` before running the demos.
+authentication flow, update the callables in `client_factory.py` before running the demos.
 
 ### Gauntlet (`puzzle.py`)
 
@@ -25,3 +25,12 @@ Uses a combination of cProfile and critical reasoning. Produces intermediate pro
 reports, and a final report summarizing changes and measured performance gains.
 
 `python3 -m netflux.demos.perf_opt --provider={gemini,anthropic}`
+
+### Apply Diff (`apply_diff.py`)
+
+Applies a multi-file unified diff (within a markdown changes doc) to a temporary workspace using the built-in `apply_diff_patch` agent. The patch exercises multiple operations: multi-hunk edits, add, delete, and rename, plus a filename containing spaces. Optionally, it can first run an intentionally failing patch to exercise rollback semantics.
+The script prints the workspace path, streams a live view of the agent’s work, and then verifies that all expected file changes were applied.
+
+Run:
+
+`python3 -m netflux.demos.apply_diff --provider={gemini,anthropic} [--fail-first]`

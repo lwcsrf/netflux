@@ -424,6 +424,8 @@ class NodeView:
     exception: Optional[Exception]
     children: tuple['NodeView', ...]
     usage: Optional[TokenUsage]
+    started_at: Optional[float]
+    ended_at: Optional[float]  # Any terminal state.
     update_seqnum: int  # Seqnum when this NodeView was generated.
 
 class Node(ABC):
@@ -448,6 +450,8 @@ class Node(ABC):
         self.done: Event = mp.Event()
         self.session_bag: SessionBag = SessionBag()
         self.cancel_event: Optional[Event] = cancel_event
+        self.started_at: Optional[float] = None
+        self.ended_at: Optional[float] = None
 
         assert isinstance(ctx, RunContext)
         assert isinstance(fn, Function)

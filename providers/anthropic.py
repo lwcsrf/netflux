@@ -2,9 +2,12 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
 from multiprocessing.synchronize import Event
+import time
+import random
+from overrides import override
 
 from ..core import (
-    Node, RunContext, Function, AgentNode, AgentException,
+    Node, RunContext, Function, AgentNode, AgentException, ModelProviderException,
     UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
@@ -13,6 +16,7 @@ from ..func_lib.text_editor import TextEditor
 from ..func_lib.bash import Bash
 
 import anthropic
+import httpx
 from anthropic.types import (
     Message, MessageParam,
     Usage,
@@ -28,7 +32,6 @@ from anthropic.types import (
 
 )
 from anthropic.types.tool_param import InputSchemaTyped
-from overrides import override
 
 """
 ## Misc Research Notes (applicable to Claude 4 models)
@@ -108,13 +111,14 @@ from overrides import override
 # Since we want agentic task completion end to end, we must always add the
 # header on each of our requests.
 INTERLEAVED_BETA = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
-TOOL_CHOICE = ToolChoiceAutoParam(type="auto")
 # "With interleaved thinking, the budget_tokens can exceed the max_tokens parameter,
 # as it represents the total budget across all thinking blocks within one assistant turn."
 MAX_TOKENS = 32_000
 THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=80_000)
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
+# Prevent agent loop runaway. Max tool call + response cycles before giving up.
+MAX_STEPS = 64
 
 
 class AnthropicAgentNode(AgentNode):
@@ -139,18 +143,19 @@ class AnthropicAgentNode(AgentNode):
         client_factory: Callable[[], Any],
     ):
         super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
-        client = client_factory()
+        client: Any = client_factory()
         if not isinstance(client, anthropic.Anthropic):
             raise TypeError(
                 "AnthropicAgentNode expected client_factory to return anthropic.Anthropic"
             )
-        self.client = client
+        self.client: anthropic.Anthropic = client
         self.model = ModelNames[Provider.Anthropic]
         self._history: List[MessageParam] = []   # Typed conversation history we replay every turn
-        self._tools: List[ToolUnionParam] = self._build_tool_params(self.agent_fn.uses)
+        self._tools: List[ToolUnionParam] = self._build_tool_params()
         self._token_usage = TokenUsage()
 
-        # Seed initial user message (cache watermark will be added pre-send)
+        # Seed initial user message (cache watermark will be added pre-send).
+        # Substitute inputs into the templated user prompt.
         user_text = self.build_user_text()
         self.transcript.append(UserTextPart(text=user_text))
         self._history.append(
@@ -163,32 +168,103 @@ class AnthropicAgentNode(AgentNode):
         return self._token_usage
 
     def run(self) -> None:
-        system_prompt = self.agent_fn.system_prompt
-
-        while True:
+        # Agent loop.
+        for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
 
             # Apply watermark to *latest* user message only (just-in-time).
             # The longest prefix cache partial hit wins. We get partial credit for
             # a cached prefix and the rest are new tokens which we incrementally pay to cache.
-            msgs = self._messages_with_latest_cache_ttl(self._history, CACHE_TTL)
+            msgs: List[MessageParam] = self._messages_with_latest_cache_ttl(self._history, CACHE_TTL)
 
-            # One interleaved-thinking turn (streaming for correctness; we just take final message)
-            # TODO: Implement retry/backoff for known transient Anthropic SDK exceptions.
-            with self.client.messages.stream(
-                model=self.model,
-                system=system_prompt,
-                messages=msgs,
-                tools=self._tools,
-                tool_choice=TOOL_CHOICE,
-                max_tokens=MAX_TOKENS,
-                thinking=THINKING_CFG,
-                extra_headers=INTERLEAVED_BETA,
-            ) as stream:
-                resp: Message = stream.get_final_message()
-                self._accumulate_usage(resp.usage)
+            # One thinking-tool turn.
+            resp: Message
+            max_attempts = 8
+            base_delay = 3  # seconds
+            attempt = 1
+            # Retry logic.
+            while True:
+                try:
+                    with self.client.messages.stream(
+                        model=self.model,
+                        system=self.agent_fn.system_prompt,
+                        messages=msgs,
+                        tools=self._tools,
+                        tool_choice=ToolChoiceAutoParam(type="auto"),
+                        max_tokens=MAX_TOKENS,
+                        thinking=THINKING_CFG,
+                        extra_headers=INTERLEAVED_BETA,
+                    ) as stream:
+                        resp = stream.get_final_message()
+                        break
+
+                except (
+                    anthropic.APIConnectionError,
+                    anthropic.RateLimitError,
+                    anthropic.APIStatusError,
+                    httpx.TransportError,
+                    httpx.HTTPStatusError,
+                ) as e:
+                    is_retriable: bool = False
+                    is_connection: bool = False
+
+                    # Retry on known transient conditions: connection issues, rate limits, or 5xx responses.
+                    if isinstance(e, anthropic.RateLimitError):
+                        is_retriable = True
+                    if isinstance(e, anthropic.APIStatusError):
+                        if e.status_code in (408, 409, 429) or e.status_code >= 500:
+                            is_retriable = True
+                    if isinstance(e, httpx.HTTPStatusError):
+                        status_code = e.response.status_code
+                        if status_code in (408, 409, 429) or status_code >= 500:
+                            is_retriable = True
+                    if isinstance(e, anthropic.APIConnectionError):
+                        is_retriable = True
+                        is_connection = True
+                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
+                        is_retriable = True
+                        is_connection = True
+                    
+                    if not is_retriable or attempt >= max_attempts:
+                        raise
+
+                    if self.is_cancel_requested():
+                        self.ctx.post_cancel()
+                        self.client.close()
+                        return
+
+                    delay = base_delay * (2 ** (attempt - 1))
+                    delay = min(delay, 30)
+                    # Add small jitter to prevent thundering herd.
+                    delay += random.uniform(0, delay * 0.1)
+
+                    # Sleep unless canceled.
+                    if self.cancel_event:
+                        if self.cancel_event.wait(delay):
+                            self.ctx.post_cancel()
+                            self.client.close()
+                            return
+                    else:
+                        time.sleep(delay)
+
+                    # Rebuild client on transport errors to reset broken sessions/sockets.
+                    if is_connection:
+                        self.client.close()
+                        self.client = self.client_factory()
+
+                    attempt += 1
+                    continue
+
+            if self.is_cancel_requested():
+                self.ctx.post_cancel()
+                self.client.close()
+                return
+
+            # Incremental token accounting.
+            self._accumulate_usage(resp.usage)
 
             # Map response ContentBlocks -> *Param blocks for strict replay,
             # while also projecting into our framework transcript.
@@ -240,16 +316,39 @@ class AnthropicAgentNode(AgentNode):
 
             # If no tool uses -> finalize with the accumulated text.
             if not tool_uses:
+                # Assert expectation that the protocol is the way we think:
+                # model is finishing the turn with final text completion.
+                if resp.stop_reason != "end_turn":
+                    raise ModelProviderException(
+                        message=f"Expected stop_reason 'end_turn' for final text, got "
+                                f"'{resp.stop_reason!r}'; debug protocol adherence.",
+                        provider=type(self),
+                        agent_name=self.agent_fn.name,
+                        node_id=self.id,
+                    )
+                
                 final_text = "\n".join(t for t in final_text_chunks if t).strip()
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_success(final_text)
+                self.client.close()
                 return
 
             # Make sure we check for cancellation right before commencing possibly
             # lengthy sub-tasks.
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
+
+            # Assert expectation: model requested tool use in this turn.
+            if resp.stop_reason != "tool_use":
+                raise ModelProviderException(
+                    message=f"Expected stop_reason 'tool_use' before tool execution, got "
+                            f"'{resp.stop_reason!r}'; debug protocol adherence.",
+                    provider=type(self),
+                    agent_name=self.agent_fn.name,
+                    node_id=self.id,
+                )
 
             # Execute requested tools in parallel and aggregate tool_result blocks.
             # Even if some tool invocations fail early, continue processing others.
@@ -287,7 +386,7 @@ class AnthropicAgentNode(AgentNode):
                 out_text: str
                 is_error: bool
 
-                # Did the invocation itself fail-fast?
+                # Did the invocation itself fail-fast? (e.g. bad args)
                 if invoke_ex:
                     out_text = AgentNode.stringify_exception(invoke_ex)
                     is_error = True
@@ -332,13 +431,18 @@ class AnthropicAgentNode(AgentNode):
             # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
+                self.client.close()
                 return
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self.client.close()
                 return
             
             # Per protocol: next user message contains only tool_result blocks
             self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
+
+        raise RuntimeError(f"Anthropic agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
+                           "without producing a final response.")
 
     def _accumulate_usage(self, usage: Usage) -> None:
         cache_read = usage.cache_read_input_tokens or 0
@@ -353,7 +457,8 @@ class AnthropicAgentNode(AgentNode):
         token_usage.input_tokens_total += input_tokens + cache_write + cache_read
         token_usage.output_tokens_total += output_tokens
 
-    def _build_tool_params(self, funcs: Sequence[Function]) -> List[ToolUnionParam]:
+    def _build_tool_params(self) -> List[ToolUnionParam]:
+        funcs: Sequence[Function] = self.agent_fn.uses
         tools: List[ToolUnionParam] = []
         for f in funcs:
             # Anthropic's training harness includes some common tools for which it
@@ -412,8 +517,9 @@ class AnthropicAgentNode(AgentNode):
     @staticmethod
     def _messages_with_latest_cache_ttl(msgs: List[MessageParam], ttl: Literal['5m', '1h']) -> List[MessageParam]:
         """
-        Deep-copy and attach CacheControlEphemeralParam(ttl) to the *latest* user message’s
-        parent blocks (text/tool_result). This is applied pre-send every turn.
+        Deep-copy and attach CacheControlEphemeralParam(ttl) only to the last element of the
+        latest user message's (text or function response) content list.
+        Leave earlier content blocks untouched.
         """
         out: List[MessageParam] = copy.deepcopy(msgs)
 
@@ -427,19 +533,22 @@ class AnthropicAgentNode(AgentNode):
             return out
 
         cc = CacheControlEphemeralParam(type="ephemeral", ttl=ttl)
+        orig_blocks = cast(List[Any], out[idx]["content"])
+        assert orig_blocks, "User message content is empty"
         new_blocks: List[Any] = []
 
         to_obj = lambda x: x if not isinstance(x, dict) else SimpleNamespace(**x)
 
-        for blk in cast(List[Any], out[idx]["content"]):
+        last_block_idx = len(orig_blocks) - 1
+        for i, blk in enumerate(orig_blocks):
+            if i != last_block_idx:
+                new_blocks.append(blk)
+                continue
+
             b = to_obj(blk)
-
-            if b.type == "text":
-                new_blocks.append(
-                    TextBlockParam(text=b.text, type="text", cache_control=cc)
-                )
-
-            elif b.type == "tool_result":
+            if getattr(b, "type", None) == "text":
+                new_blocks.append(TextBlockParam(text=b.text, type="text", cache_control=cc))
+            elif getattr(b, "type", None) == "tool_result":
                 new_blocks.append(
                     ToolResultBlockParam(
                         tool_use_id=b.tool_use_id,
@@ -449,8 +558,8 @@ class AnthropicAgentNode(AgentNode):
                         cache_control=cc,
                     )
                 )
-
             else:
+                # Unknown block type; leave untouched (no cache control).
                 new_blocks.append(blk)
 
         out[idx] = cast(MessageParam, {"role": "user", "content": new_blocks})
