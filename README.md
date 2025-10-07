@@ -1,9 +1,10 @@
 
+[![PyPI - Version](https://img.shields.io/pypi/v/netflux.svg)](https://pypi.org/project/netflux/)
+[![Tests](https://img.shields.io/github/actions/workflow/status/lwcsrf/netflux/tests.yml?branch=master&label=tests)](https://github.com/lwcsrf/netflux/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests](https://github.com/lwcsrf/netflux/actions/workflows/tests.yml/badge.svg?branch=master)](https://github.com/lwcsrf/netflux/actions/workflows/tests.yml)
 
 <p align="center">
-  <img src="assets/banner.png" alt="netflux banner" width="500">
+    <img src="https://raw.githubusercontent.com/lwcsrf/netflux/master/assets/banner.png" alt="netflux banner" width="500">
 </p>
 
 
@@ -19,6 +20,8 @@ Our goal is a framework that is:
 ---
 
 ## Quick-Start Demos & Development
+
+To build an agentic app on `netflux`, just add the [pypi dependency](https://pypi.org/project/netflux/) to your project. The `demos/` are a good guide to rapidly getting started.
 
 To run the `demos/`, you will need the provider-specific dependencies installed.
 Once you make a venv, see `demos/README.md` to run any demo.

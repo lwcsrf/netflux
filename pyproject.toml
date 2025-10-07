@@ -20,6 +20,11 @@ dependencies = [
     "overrides",
 ]
 
+[project.urls]
+Homepage = "https://github.com/lwcsrf/netflux"
+Repository = "https://github.com/lwcsrf/netflux"
+Issues = "https://github.com/lwcsrf/netflux/issues"
+
 [project.optional-dependencies]
 # For developers running unit tests
 test = [
