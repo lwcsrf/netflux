@@ -1,0 +1,64 @@
+name: Publish to PyPI on Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-publish:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build twine
+
+      - name: Verify tag matches version
+        id: verify
+        shell: bash
+        run: |
+          TAG_NAME="${GITHUB_REF##*/}"
+          echo "Git tag: $TAG_NAME"
+          VERSION=$(python -c "import tomllib;print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          echo "Project version: $VERSION"
+          if [ "$TAG_NAME" != "v$VERSION" ] && [ "$TAG_NAME" != "$VERSION" ]; then
+            echo "Tag must be either $VERSION or v$VERSION, got $TAG_NAME" >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build sdist and wheel
+        run: python -m build
+
+      - name: Check distributions
+        run: |
+          twine check dist/*
+
+      - name: Publish to TestPyPI (prerelease)
+        if: github.event.release.prerelease == true
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.TEST_PYPI_API_TOKEN }}
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: false
+          print-hash: true
+
+      - name: Publish to PyPI
+        if: github.event.release.prerelease == false && (startsWith(github.event.release.tag_name, 'v') || github.event.release.tag_name == steps.verify.outputs.version)
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
+          skip-existing: false
+          print-hash: true
