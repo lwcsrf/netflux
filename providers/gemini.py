@@ -250,6 +250,7 @@ class GeminiAgentNode(AgentNode):
 
                     # Rebuild client on transport errors to reset broken sessions/sockets.
                     if is_connection:
+                        self.client.close()
                         self.client = self.client_factory()
 
                     attempt += 1
