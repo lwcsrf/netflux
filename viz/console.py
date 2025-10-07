@@ -102,9 +102,9 @@ def _format_elapsed(nv: NodeView) -> Optional[str]:
     - Terminal: green [Xs]
     - Waiting/no start: None
 
-    Keeps string short (1 decimal; <1s -> 2 decimals) to minimize interaction
-    with UI cropping. The ANSI wrapper is self-contained so cropping logic that
-    trims trailing partial CSI remains safe.
+    Keeps string short (1 decimal). For durations <1s, hide it entirely to
+    avoid visual noise. The ANSI wrapper is self-contained so cropping logic
+    that trims trailing partial CSI remains safe.
     """
     start = nv.started_at
     if start is None:
@@ -114,10 +114,10 @@ def _format_elapsed(nv: NodeView) -> Optional[str]:
         end = nv.ended_at
     tnow = time.time()
     elapsed = max(0.0, (end if end is not None else tnow) - start)
+    # Hide sub-second durations entirely
     if elapsed < 1.0:
-        s = f"{elapsed:.2f}s"
-    else:
-        s = f"{elapsed:.1f}s"
+        return None
+    s = f"{elapsed:.1f}s"
     # color by state (running=red, done=green)
     if nv.state is NodeState.Running:
         body = _color(s, fg="red")
