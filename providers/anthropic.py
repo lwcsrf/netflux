@@ -113,8 +113,8 @@ from anthropic.types.tool_param import InputSchemaTyped
 INTERLEAVED_BETA = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
 # "With interleaved thinking, the budget_tokens can exceed the max_tokens parameter,
 # as it represents the total budget across all thinking blocks within one assistant turn."
-MAX_TOKENS = 32_000
-THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=80_000)
+MAX_TOKENS = 64_000
+THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=62_000)
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
@@ -532,7 +532,12 @@ class AnthropicAgentNode(AgentNode):
         if idx is None:
             return out
 
-        cc = CacheControlEphemeralParam(type="ephemeral", ttl=ttl)
+        cc: CacheControlEphemeralParam
+        if ttl == '5m':
+            # Omit the `ttl` argument (default) because older clients may not support it.
+            cc = CacheControlEphemeralParam(type="ephemeral")
+        else:
+            cc = CacheControlEphemeralParam(type="ephemeral", ttl=ttl)
         orig_blocks = cast(List[Any], out[idx]["content"])
         assert orig_blocks, "User message content is empty"
         new_blocks: List[Any] = []
