@@ -106,7 +106,7 @@ class GeminiAgentNode(AgentNode):
             )
         self.client: genai.Client = client
         self.model = ModelNames[Provider.Gemini]
-        self._history: types.ContentListUnionDict = []   # Typed conversation history we replay every turn
+        self._history: List[types.Content] = []   # Typed conversation history we replay every turn
         self._tool_call_counter = 0
         self._tools: List[types.Tool] = self._build_tool_params()
         self._token_usage = TokenUsage()
@@ -287,7 +287,7 @@ class GeminiAgentNode(AgentNode):
 
             part: types.Part
             calls: List[types.FunctionCall] = []
-            for part in candidate.content.parts:
+            for part in candidate.content.parts:  # pyright: ignore[reportOptionalIterable]
                 thought_sig: Optional[bytes] = part.thought_signature
                 if thought_sig:
                     # Thought signatures are always recorded in transcript as ThinkingBlockPart
