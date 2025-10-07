@@ -1,7 +1,8 @@
+# llm provider keys (dev api keys)
 demos/gemini.key
 demos/anthropic.key
 
-# Byte-compiled / optimized / DLL files
+# pycache
 __pycache__/
 *.py[cod]
 *$py.class
@@ -42,15 +43,18 @@ __pypackages__/
 # Environments
 .env
 .venv
+.venv_win
 env/
 venv/
+venv_win/
 ENV/
 env.bak/
 venv.bak/
 
-# VS Code: ignore folder but allow safe, shareable configs
+# IDE: ignore folder but allow safe, shareable configs
 .vscode/*
 !.vscode/extensions.json
+.idea/
 
 # Python tooling caches
 .mypy_cache/
