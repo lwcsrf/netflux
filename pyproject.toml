@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "netflux"
-version = "0.1.0"
+version = "0.1.0rc1"
 maintainers = [
   { name="LW Computational Science Research Foundation" },
 ]
@@ -50,3 +50,8 @@ packages = ["netflux"]
 
 [tool.setuptools.package-dir]
 netflux = "."
+
+[tool.setuptools.package-data]
+netflux = [
+    "assets/*",
+]
