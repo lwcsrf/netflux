@@ -51,7 +51,14 @@ all = [
 ]
 
 [tool.setuptools]
-packages = ["netflux"]
+packages = [
+    "netflux",
+    "netflux.providers",
+    "netflux.tests",
+    "netflux.viz",
+    "netflux.func_lib",
+    "netflux.demos",
+]
 
 [tool.setuptools.package-dir]
 netflux = "."
