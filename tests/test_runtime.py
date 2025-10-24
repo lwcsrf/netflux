@@ -8,7 +8,7 @@ from unittest.mock import patch
 import multiprocessing as mp
 from multiprocessing.synchronize import Event
 
-from ..runtime import Runtime
+from ..runtime import Runtime, NodeObservable
 from ..core import (
     AgentFunction,
     AgentNode,
@@ -91,8 +91,12 @@ class DummyNode(Node):
 
 
 def _register_dummy_node(runtime: Runtime, node: Node) -> None:
-    """Register a manually constructed Node with the Runtime (mirrors invoke setup)."""
-
+    """Register a manually constructed Node with the Runtime (mirrors invoke setup).
+    
+    IMPORTANT: If this node has children in node.children, they must already be
+    registered (have observables) before calling this function, otherwise
+    _build_node_view will fail.
+    """
     ctx = node.ctx
     assert ctx.node is node
     if not ctx.object_bags:
@@ -102,7 +106,12 @@ def _register_dummy_node(runtime: Runtime, node: Node) -> None:
         if node.parent is None:
             runtime._roots.append(node)
         runtime._global_seqno += 1
-        runtime._publish_tree_update(node)
+        # Create NodeObservable with initial view
+        runtime._node_observables[node.id] = NodeObservable(
+            cond=mp.Condition(runtime._lock),
+            touch_seqno=runtime._global_seqno,
+            view=runtime._build_node_view(node),
+        )
 
 
 class TestRuntimeClientFactories(unittest.TestCase):
@@ -488,7 +497,7 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         self.assertIsNotNone(view.exception)
         self.assertIsInstance(view.exception, CancellationException)
 
-    def test_publish_tree_update_refreshes_ancestors(self) -> None:
+    def test_publish_viewtree_update_refreshes_ancestors(self) -> None:
         runtime = Runtime([], client_factories={})
         parent_ctx = RunContext(runtime=runtime, node=None)
         child_ctx = RunContext(runtime=runtime, node=None)
@@ -496,10 +505,11 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         child = DummyNode(ctx=child_ctx, id=11, fn=DummyFunction("child"), inputs={}, parent=parent)
         parent_ctx.node = parent
         child_ctx.node = child
+        # Register child first (so parent can reference it in its view)
+        _register_dummy_node(runtime, child)
         parent.children.append(child)
         child.parent = parent
         _register_dummy_node(runtime, parent)
-        _register_dummy_node(runtime, child)
 
         parent_view_before = runtime.get_view(parent.id)
         child_view_before = runtime.get_view(child.id)
@@ -507,7 +517,7 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         with runtime._lock:
             runtime._global_seqno += 1
             child.state = NodeState.Running
-            runtime._publish_tree_update(child)
+            runtime._publish_viewtree_update(child)
 
         parent_view_after = runtime.get_view(parent.id)
         self.assertGreater(parent_view_after.update_seqnum, parent_view_before.update_seqnum)

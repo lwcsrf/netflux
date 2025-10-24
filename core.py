@@ -1,7 +1,7 @@
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Union, get_args
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Union, get_args, Mapping
 import inspect
 from threading import Thread
 import multiprocessing as mp
@@ -298,32 +298,32 @@ class CodeFunction(Function):
                         f"{self.name}: required arg '{a.name}' must not have a default"
                     )
 
-@dataclass
+@dataclass(frozen=True)
 class TranscriptPart:
     pass
 
-@dataclass
+@dataclass(frozen=True)
 class UserTextPart(TranscriptPart):
     text: str
 
-@dataclass
+@dataclass(frozen=True)
 class ModelTextPart(TranscriptPart):
     text: str
 
-@dataclass
+@dataclass(frozen=True)
 class ToolUsePart(TranscriptPart):
     tool_use_id: str
     tool_name: str
-    args: Dict[str, Any]
+    args: Mapping[str, Any]
 
-@dataclass
+@dataclass(frozen=True)
 class ToolResultPart(TranscriptPart):
     tool_use_id: str
     tool_name: str
     outputs: Any
     is_error: bool
 
-@dataclass
+@dataclass(frozen=True)
 class ThinkingBlockPart(TranscriptPart):
     content: str
     signature: str
@@ -387,6 +387,12 @@ class RunContext:
             raise RuntimeError("post_cancel may only be called from within a Node execution context")
         self.runtime.post_cancel(self.node, exception)
 
+    def post_transcript_update(self) -> None:
+
+        if self.node is None:
+            raise RuntimeError("post_transcript_update may only be called from within a Node execution context")
+        self.runtime.post_transcript_update(self.node)
+
     def cancel_requested(self) -> bool:
         return bool(self.cancel_event and self.cancel_event.is_set())
 
@@ -424,6 +430,7 @@ class NodeView:
     exception: Optional[Exception]
     children: tuple['NodeView', ...]
     usage: Optional[TokenUsage]
+    transcript: tuple[TranscriptPart, ...]
     started_at: Optional[float]
     ended_at: Optional[float]  # Any terminal state.
     update_seqnum: int  # Seqnum when this NodeView was generated.
@@ -464,11 +471,12 @@ class Node(ABC):
     def start(self) -> None:
         if self.thread is not None:
             return
-        self.ctx.post_status_update(NodeState.Running)
         self.thread = Thread(target=self.run_wrapper, name=f"netflux-node-{self.id}", daemon=True)
         self.thread.start()
 
     def run_wrapper(self) -> None:
+        self.ctx.post_status_update(NodeState.Running)
+
         try:
             self.run()
         except CancellationException as ex:
@@ -594,6 +602,7 @@ class AgentNode(Node):
 
     @override
     def run_wrapper(self) -> None:
+        self.ctx.post_status_update(NodeState.Running)
         try:
             self.run()
         except AgentException as e:
