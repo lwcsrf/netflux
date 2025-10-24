@@ -443,6 +443,8 @@ class GeminiAgentNode(AgentNode):
         token_usage.output_tokens_reasoning = (token_usage.output_tokens_reasoning or 0) + reasoning_tokens
         token_usage.output_tokens_text = (token_usage.output_tokens_text or 0) + text_tokens
         token_usage.output_tokens_total += reasoning_tokens + text_tokens
+        token_usage.context_window_in = prompt_tokens + tool_prompt_tokens
+        token_usage.context_window_out = reasoning_tokens + text_tokens
 
     def _build_tool_params(self) -> list[types.Tool]:
         decls = [self._make_function_declaration(t) for t in self.agent_fn.uses]

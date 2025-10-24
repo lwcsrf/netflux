@@ -62,6 +62,11 @@ class TokenUsage:
     # the sum of all output tokens (including tool call, reasoning, non-reasoning tokens), which are mutually exclusive.
     output_tokens_total: int = 0
 
+    # Context window token totals for the last completed request-response cycle.
+    # These values are overwritten on each cycle to reflect the latest context window size.
+    context_window_in: int = 0
+    context_window_out: int = 0
+
 class SessionBag:
     """Thread-safe namespace/key object registry for a Node scope."""
     def __init__(self) -> None:

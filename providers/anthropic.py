@@ -456,6 +456,8 @@ class AnthropicAgentNode(AgentNode):
         token_usage.input_tokens_regular += input_tokens
         token_usage.input_tokens_total += input_tokens + cache_write + cache_read
         token_usage.output_tokens_total += output_tokens
+        token_usage.context_window_in = input_tokens + cache_write + cache_read
+        token_usage.context_window_out = output_tokens
 
     def _build_tool_params(self) -> List[ToolUnionParam]:
         funcs: Sequence[Function] = self.agent_fn.uses
