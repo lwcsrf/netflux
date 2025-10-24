@@ -214,12 +214,17 @@ class BashSession:
 
         # Single sentinel line that also carries the exit code (Y's format).
         sentinel = f"__NETFLUX_BASH_DONE__{uuid.uuid4().hex}"
+        # Ensure the user command ends with a newline so here-doc delimiters stand alone.
+        cmd = command if command.endswith("\n") else command + "\n"
         # Make sentinel resilient to `set -e` and common fd redirections; print to both stdout and stderr.
         block = (
             "was_e=false; case $- in *e*) was_e=true;; esac\n"
-            "set +e; { "
-            f"{command}"
-            " ; }; __nf_ec=$?\n"
+            # The curly braces are intentionally placed on their own lines to ensure heredoc delimiters
+            # are recognized correctly by bash. Do not merge them with other lines.
+            "set +e; {\n"
+            f"{cmd}"
+            "}\n"
+            "__nf_ec=$?\n"
             "$was_e && set -e\n"
             f"printf '\\n{sentinel} %d\\n' \"$__nf_ec\"\n"
             f"printf '\\n{sentinel} %d\\n' \"$__nf_ec\" 1>&2\n"
