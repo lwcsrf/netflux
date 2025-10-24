@@ -219,6 +219,8 @@ class BashSession:
         # Make sentinel resilient to `set -e` and common fd redirections; print to both stdout and stderr.
         block = (
             "was_e=false; case $- in *e*) was_e=true;; esac\n"
+            # The curly braces are intentionally placed on their own lines to ensure heredoc delimiters
+            # are recognized correctly by bash. Do not merge them with other lines.
             "set +e; {\n"
             f"{cmd}"
             "}\n"

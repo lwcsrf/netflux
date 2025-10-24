@@ -140,7 +140,7 @@ class TestBashFunctionCommands(unittest.TestCase):
 
         output = self.bash._call(self.ctx, command=command, session_id=0)
 
-        self.assertEqual([line for line in output.strip().splitlines()], ["bar fighters"])
+        self.assertEqual(output.strip().splitlines(), ["bar fighters"])
 
     def test_heredoc_with_variable_expansion(self) -> None:
         command = "\n".join(
@@ -161,6 +161,7 @@ class TestBashFunctionCommands(unittest.TestCase):
 
         output = self.bash._call(self.ctx, command=command, session_id=0)
 
+        # Filter out empty lines because the subshell chaining may produce blank lines in the output.
         lines = [line for line in output.strip().splitlines() if line]
         self.assertEqual(lines, ["outer", "inner", "done"])
 
