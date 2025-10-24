@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import copy
 import logging
 import time
@@ -7,6 +7,8 @@ import multiprocessing as mp
 from multiprocessing import Lock
 from multiprocessing.synchronize import Event, Condition
 from collections import deque
+import os
+import threading
 
 from .core import (
     Node,
@@ -175,16 +177,23 @@ class Runtime:
         ctx.node = node
         ctx.object_bags = self._build_session_bags(node)
 
-        # Register global node mapping
+        # Register global node mapping and create its observable + initial view
         with self._lock:
+            self._global_seqno += 1  # Every state change bumps it.
+
             self._nodes_by_id[node_id] = node
+            self._node_observables[node_id] = NodeObservable(
+                cond=mp.Condition(self._lock),
+                touch_seqno=self._global_seqno,
+                view=self._build_node_view(node),
+            )
+
             if caller is None:
                 self._roots.append(node)
             else:
                 caller.children.append(node)
-
-            self._global_seqno += 1  # Every state change bumps it.
-            self._publish_tree_update(node)
+           
+            self._publish_viewtree_update(node)
 
         node.start()
         return node
@@ -203,26 +212,36 @@ class Runtime:
             bags[SessionScope.Parent] = node.parent.session_bag
         return bags
 
-    def _ensure_observable(self, node: Node) -> NodeObservable:
-        """Should only be used during `_publish_tree_update()` while holding lock."""
-        observable = self._node_observables.get(node.id)
-        if observable is None:
-            observable = NodeObservable(
-                cond=mp.Condition(self._lock),
-                touch_seqno=self._global_seqno,
-                view=self._build_node_view(node),
-            )
-            self._node_observables[node.id] = observable
-        return observable
+    def _fatal(self, msg: str) -> None:
+        logging.critical(msg)
+        os._exit(1)
 
     def _build_node_view(self, node: Node) -> NodeView:
-        """Should only be used during `_publish_tree_update()` while holding lock."""
-        child_views = tuple(
-            self._ensure_observable(child).view for child in node.children
-        )
+        """Build a NodeView from a live Node. Must only be called by the node's own thread
+        while it is holding the runtime lock, or else during initial creation."""
+        if node.thread is not None:
+            ident = node.thread.ident
+            current_ident = threading.get_ident()
+            if ident is None or ident != current_ident:
+                self._fatal(
+                    f"Node {node.id} view rebuilt from wrong thread. expected={ident} actual={current_ident}"
+                )
+
+        # Resolve child views via invariant: every child already has an observable/view.
+        child_views: List[NodeView] = []
+        for child in node.children:
+            if child.id not in self._node_observables:
+                self._fatal(
+                    f"Missing observable for child {child.id} while building view for node {node.id}"
+                )
+            child_views.append(self._node_observables[child.id].view)
+
         usage: Optional[TokenUsage] = None
+        transcript: tuple = ()
         if isinstance(node, AgentNode):
+            # Snapshot token usage and transcript as immutables.
             usage = copy.deepcopy(node.token_usage)
+            transcript = tuple(node.transcript)
 
         return NodeView(
             id=node.id,
@@ -231,23 +250,61 @@ class Runtime:
             state=node.state,
             outputs=node.outputs,      # Safe to share ref to immutable outputs (once created and set).
             exception=node.exception,  # Ditto.
-            children=child_views,
+            children=tuple(child_views),
             usage=usage,
+            transcript=transcript,
             started_at=node.started_at,
             ended_at=node.ended_at,
             update_seqnum=self._global_seqno,
         )
 
-    def _publish_tree_update(self, node: Node) -> None:
-        seq = self._global_seqno
-        current: Optional[Node] = node
+    def _publish_viewtree_update(self, origin: Node) -> None:
+        """Publish view updates for `origin` and its ancestors, due to change in `origin`.
+        `origin`'s view is rebuilt from the live Node (whose thread is holding
+        the Runtime lock when this is called); ancestor views are rebuilt from their
+        existing view snapshots, updating only their children."""
+        seq: int = self._global_seqno
+
+        # Rebuild origin's view from live state.
+        if origin.id not in self._node_observables:
+            self._fatal(f"Origin node {origin.id} has no observable during publish")
+        obs: NodeObservable = self._node_observables[origin.id]
+        obs.view = self._build_node_view(origin)
+        obs.touch_seqno = seq
+        obs.cond.notify_all()
+
+        # Walk ancestors up, rebuilding views without touching live ancestor fields
+        current: Optional[Node] = origin.parent
         while current is not None:
-            observable = self._ensure_observable(current)
-            assert observable.touch_seqno <= seq
-            if observable.touch_seqno < seq:
-                observable.view = self._build_node_view(current)
-                observable.touch_seqno = seq
-                observable.cond.notify_all()
+            if current.id not in self._node_observables:
+                self._fatal(f"Ancestor node {current.id} has no observable during publish")
+            obs = self._node_observables[current.id]
+            if obs.touch_seqno > seq:
+                self._fatal(
+                    f"Ancestor node {current.id} has touch_seqno {obs.touch_seqno} "
+                    f"> current global seqno {seq} during publish"
+                )
+
+            # Get previous snapshot to reuse non-children fields, so that we have no races.
+            prev = obs.view
+
+            # Recompute children views from observables, enumerating
+            # the live children list (safe under Runtime lock).
+            child_views: List[NodeView] = []
+            for child in current.children:
+                child_obs = self._node_observables.get(child.id)
+                if child_obs is None:
+                    self._fatal(
+                        f"Ancestor node {current.id} missing observable for child {child.id}"
+                    )
+                child_views.append(child_obs.view)
+
+            # Build a new NodeView, reusing prev fields except children/update_seqnum.
+            # Ancestor Node threads need Runtime lock (we hold) to touch children. So this is safe.            
+            obs.view = replace(prev, children=tuple(child_views), update_seqnum=seq)
+            obs.touch_seqno = seq
+            obs.cond.notify_all()
+
             current = current.parent
 
     def watch(
@@ -304,7 +361,7 @@ class Runtime:
             if state is NodeState.Running and not node.started_at:
                 node.started_at = time.time()
             node.state = state
-            self._publish_tree_update(node)
+            self._publish_viewtree_update(node)
 
     def post_success(self, node: Node, outputs: Any) -> None:
         with self._lock:
@@ -313,7 +370,7 @@ class Runtime:
             node.state = NodeState.Success
             if not node.ended_at:
                 node.ended_at = time.time()
-            self._publish_tree_update(node)
+            self._publish_viewtree_update(node)
             node.done.set()
 
     def post_exception(self, node: Node, exception: Exception) -> None:
@@ -323,7 +380,7 @@ class Runtime:
             node.state = NodeState.Error
             if not node.ended_at:
                 node.ended_at = time.time()
-            self._publish_tree_update(node)
+            self._publish_viewtree_update(node)
             node.done.set()
 
         # Log immediately so there is trace of it even if consumer never collects .result()
@@ -342,5 +399,11 @@ class Runtime:
             node.state = NodeState.Canceled
             if not node.ended_at:
                 node.ended_at = time.time()
-            self._publish_tree_update(node)
+            self._publish_viewtree_update(node)
             node.done.set()
+
+    def post_transcript_update(self, node: Node) -> None:
+        """Called by a Node when its transcript changed and a new NodeView snapshot should be published."""
+        with self._lock:
+            self._global_seqno += 1
+            self._publish_viewtree_update(node)

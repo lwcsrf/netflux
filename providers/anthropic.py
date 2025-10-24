@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+from types import SimpleNamespace, MappingProxyType
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
 from multiprocessing.synchronize import Event
@@ -280,6 +280,7 @@ class AnthropicAgentNode(AgentNode):
                     self.transcript.append(
                         ThinkingBlockPart(content=blk.thinking, signature=blk.signature, redacted=False)
                     )
+                    self.ctx.post_transcript_update()
                     # Add sdk-type msg for session replay.
                     assistant_params.append(
                         ThinkingBlockParam(signature=blk.signature, thinking=blk.thinking, type=blk.type)
@@ -289,15 +290,19 @@ class AnthropicAgentNode(AgentNode):
                     self.transcript.append(
                         ThinkingBlockPart(content=blk.data, signature="", redacted=True)
                     )
+                    self.ctx.post_transcript_update()
                     assistant_params.append(
                         RedactedThinkingBlockParam(data=blk.data, type=blk.type)
                     )
 
                 elif isinstance(blk, ToolUseBlock):
                     args = cast(Dict[str, Any], blk.input or {})
+                    # Make args mapping immutable for transcript snapshot
+                    args_ro = MappingProxyType(copy.deepcopy(args))
                     self.transcript.append(
-                        ToolUsePart(tool_use_id=blk.id, tool_name=blk.name, args=args)
+                        ToolUsePart(tool_use_id=blk.id, tool_name=blk.name, args=args_ro)
                     )
+                    self.ctx.post_transcript_update()
                     tool_uses.append(blk)
                     assistant_params.append(
                         ToolUseBlockParam(id=blk.id, name=blk.name, input=args, type="tool_use")
@@ -329,6 +334,7 @@ class AnthropicAgentNode(AgentNode):
                 
                 final_text = "\n".join(t for t in final_text_chunks if t).strip()
                 self.transcript.append(ModelTextPart(text=final_text))
+                self.ctx.post_transcript_update()
                 self.ctx.post_success(final_text)
                 self.client.close()
                 return
@@ -416,6 +422,7 @@ class AnthropicAgentNode(AgentNode):
                         is_error=is_error,
                     )
                 )
+                self.ctx.post_transcript_update()
 
                 result_blocks.append(
                     ToolResultBlockParam(

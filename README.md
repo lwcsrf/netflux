@@ -557,6 +557,7 @@ This refined example shows:
         * Subtypes `AnthropicAgentNode` and `GeminiAgentNode` store and use the SDK-specific types in their internal impl.
     * `node.get_transcript() -> List[TranscriptPart]`
         * Subtypes must implement; they must convert the SDK-specific types in the transcription they are tracking to the framework-common `TranscriptPart`s. They never convert types in the reverse direction.
+        * For external observers (UIs, tools), prefer `NodeView.transcript: tuple[TranscriptPart, ...]` which is an immutable snapshot captured at publish time. `node.get_transcript()` returns a copy of the live list and should not be used concurrently from outside the node’s thread.
     * Child `Function` invocations are tracked in `node.children: List[Node]` property.
         * Always ordered to reflect the sequence in which `Function`s were invoked. 
         * For consumers outside the framework, use `NodeView.children: tuple[NodeView, ...]` instead to access child information safely.
@@ -576,6 +577,7 @@ This refined example shows:
     * `state: NodeState`: (Waiting, Running, Success, Error, Canceled) enum
     * `children: List[Node]`: ordered list of child `Function` invocations made by this `Node`.
     * **Note**: External consumers should access this information through `NodeView` instead of `Node` directly to avoid race conditions.
+    * For agents, `NodeView.usage` is a deep-copied snapshot and `NodeView.transcript` is an immutable tuple (empty tuple for `CodeNode`).
 
 ## `TranscriptPart`
 
@@ -692,13 +694,30 @@ This refined example shows:
 
 ## `NodeView`
 
-`NodeView` is an immutable, consistent snapshot of a `Node` and, through reference, its entire subtree, intended for external consumers to observe task tree state without races. Do not read `Node` fields directly from UI/visualizers or outside code running inside a `CodeFunction` — those mutate concurrently while tasks run and are part of the framework's object model. Instead, use `NodeView`s.
+`NodeView` is an immutable, consistent snapshot of a `Node` and, through reference, its subtree. Use it for observation; do not read live `Node` fields from UIs or other threads.
 
-- Purpose: provide a race-free, immutable view of a (sub-)tree at a single global version. The snapshot includes most fields in `Node` (e.g. `state`, `outputs`, `exception`, `children`).
-- Consistency model: the `Runtime` maintains a global sequence number. On any change (node creation, status updates, success/exception), it rebuilds the `NodeView` for the changed node and all ancestors and updates the latest cached `NodeView` tree as of that version. Notice that siblings and siblings of the ancestors don't need to have their `NodeView`s regenerated because they aren't affected. Consumers can only acquire `NodeView` trees in-between these updates. Each `NodeView` also has `update_seqnum` giving when it was last updated.
-- Consumer Watcher loop: call `node.watch(as_of_seq=prev_seq)` to block until there is a newer snapshot (where `touch_seqno > as_of_seq`) and then receive the latest `NodeView` for that subtree. Start with `prev_seq = 0` and after each update set `prev_seq = view.update_seqnum` to continue receiving atomic updates. This is similar to etcd/zookeeper watchers, except the `Runtime` keeps only the latest view available. Watcher loops should be used for event-driven UI.
-- Top-level views: use `runtime.list_toplevel_views()` to get a consistent snapshot of all root tasks at once; `runtime.get_view(node_id)` returns the latest snapshot for any node without blocking.
-- Why: this isolates observers from partial, in-flight mutations during execution and guarantees each delivered view is a self-consistent global snapshot of the tree at a specific sequence number.
+- Fields
+  - `children: tuple[NodeView, ...]` — immutable ordered children
+  - `usage: Optional[TokenUsage]` — deep-copied snapshot for agents
+  - `transcript: tuple[TranscriptPart, ...]` — immutable transcript snapshot for agents (empty for `CodeNode`)
+  - `update_seqnum: int` — global sequence when this view was produced
+  - Plus core fields: `id`, `fn`, `inputs`, `state`, `outputs`, `exception`, `started_at`, `ended_at`
+
+- What triggers a new `NodeView`
+  - Node creation and linking into the tree
+  - Status changes (`post_status_update`), success/exception/cancel
+  - Transcript appends (agents call `post_transcript_update()` after each append)
+
+- Consistency model (origin-only live rebuild)
+  - On each change, the origin node’s `NodeView` is rebuilt from the live `Node` under a global lock. Each ancestor gets a fresh `NodeView` by reusing its previous snapshot fields and recomputing only `children` from current child `NodeView`s. No live ancestor fields are read.
+  - Implication: an ancestor’s `usage`/`transcript` reflect the last time that ancestor itself published; child changes do not refresh them. Only `children` changes propagate up.
+
+- Immutability guarantees
+  - `children` and `transcript` are tuples in the snapshot. Provider code appends immutable `TranscriptPart`s; `ToolUsePart.args` are stored as immutable mappings; `TokenUsage` is deep-copied at snapshot time.
+
+- Watching for updates
+  - Use `node.watch(as_of_seq=prev_seq)` to block until a newer snapshot is available, then set `prev_seq = view.update_seqnum` for the next iteration.
+  - `runtime.list_toplevel_views()` returns a consistent snapshot of all root `NodeView`s; `runtime.get_view(node_id)` fetches the latest view without blocking.
 
 ## Deferred Features
 

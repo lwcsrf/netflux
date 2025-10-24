@@ -1,4 +1,6 @@
 from typing import Any, Callable, Dict, List, Optional, Union
+from types import MappingProxyType
+import copy
 import base64
 import time
 import random
@@ -297,6 +299,7 @@ class GeminiAgentNode(AgentNode):
                     else:
                         sig_b64 = str(thought_sig)
                     self.transcript.append(ThinkingBlockPart(content="", signature=sig_b64))
+                    self.ctx.post_transcript_update()
                     # Ensure our understanding of the protocol is correct that function calls come last.
                     assert not calls, "Gemini thought_signature parts should precede function_call parts."
 
@@ -308,6 +311,7 @@ class GeminiAgentNode(AgentNode):
                 text: Optional[str] = part.text
                 if text:
                     self.transcript.append(ModelTextPart(text=text))
+                    self.ctx.post_transcript_update()
                     # Ensure our understanding of the protocol is correct that function calls come last.
                     assert not calls, "Gemini text parts should precede function_call parts."
 
@@ -343,9 +347,11 @@ class GeminiAgentNode(AgentNode):
                 tool_use_id = fc.id or self._new_tool_use_id(name)
                 tool_use_ids.append(tool_use_id)
 
+                args_ro = MappingProxyType(copy.deepcopy(tool_args))
                 self.transcript.append(
-                    ToolUsePart(tool_use_id=tool_use_id, tool_name=name, args=tool_args)
+                    ToolUsePart(tool_use_id=tool_use_id, tool_name=name, args=args_ro)
                 )
+                self.ctx.post_transcript_update()
 
                 try:
                     children.append(self.invoke_tool_function(name, tool_args))
@@ -397,6 +403,7 @@ class GeminiAgentNode(AgentNode):
                         is_error=is_error,
                     )
                 )
+                self.ctx.post_transcript_update()
 
                 # Transcript result in gemini sdk types.
                 result_parts.append(types.Part(
