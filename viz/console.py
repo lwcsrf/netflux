@@ -22,6 +22,7 @@ FG = {
     "magenta": "\x1b[35m",
     "cyan": "\x1b[36m",
     "white": "\x1b[37m",
+    "orange": "\x1b[38;5;208m",
 }
 
 
@@ -226,6 +227,15 @@ class ConsoleRender(Render[str]):
                     segs.append(_color(f"In: {{{', '.join(in_fields)}}}", fg="cyan", bold=True))
                 if out_fields:
                     segs.append(_color(f"Out: {{{', '.join(out_fields)}}}", fg="magenta", bold=True))
+
+                ctx_total = u.context_window_in + u.context_window_out
+                if ctx_total:
+                    ctx_fields = [
+                        f"in={u.context_window_in}",
+                        f"out={u.context_window_out}",
+                        f"total={ctx_total}",
+                    ]
+                    segs.append(_color(f"Ctx: {{{', '.join(ctx_fields)}}}", fg="orange", bold=True))
 
                 if segs:
                     detail_prefix = prefix + ("   " if is_last else "│  ")
