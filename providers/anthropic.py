@@ -114,11 +114,11 @@ INTERLEAVED_BETA = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
 # "With interleaved thinking, the budget_tokens can exceed the max_tokens parameter,
 # as it represents the total budget across all thinking blocks within one assistant turn."
 MAX_TOKENS = 64_000
-THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=62_000)
+THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=80_000)
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
-MAX_STEPS = 64
+MAX_STEPS = 256
 
 
 class AnthropicAgentNode(AgentNode):
