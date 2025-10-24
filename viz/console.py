@@ -227,6 +227,15 @@ class ConsoleRender(Render[str]):
                 if out_fields:
                     segs.append(_color(f"Out: {{{', '.join(out_fields)}}}", fg="magenta", bold=True))
 
+                ctx_total = u.context_window_in + u.context_window_out
+                if ctx_total:
+                    ctx_fields = [
+                        f"in={u.context_window_in}",
+                        f"out={u.context_window_out}",
+                        f"total={ctx_total}",
+                    ]
+                    segs.append(_color(f"Ctx: {{{', '.join(ctx_fields)}}}", fg="blue", bold=True))
+
                 if segs:
                     detail_prefix = prefix + ("   " if is_last else "│  ")
                     lines.append(detail_prefix + "│    " + ", ".join(segs))
