@@ -215,16 +215,16 @@ class GeminiAgentNode(AgentNode):
                     if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
                         is_retriable = True
                         is_connection = True
-
+                    if isinstance(e, httpx.RemoteProtocolError):
+                        is_retriable = True
+                        is_connection = True
                     if isinstance(e, httpx.HTTPStatusError):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
-
                     if isinstance(e, genai_errors.APIError):
                         if e.code in (408, 409, 429) or e.code >= 500:
                             is_retriable = True
-
                     if isinstance(e, genai_errors.UnknownApiResponseError):
                         is_retriable = True
 
