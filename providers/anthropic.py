@@ -12,8 +12,7 @@ from ..core import (
     TokenUsage,
 )
 from . import ModelNames, Provider
-from ..func_lib.text_editor import TextEditor
-from ..func_lib.bash import Bash
+
 
 import anthropic
 import httpx
@@ -26,7 +25,6 @@ from anthropic.types import (
     ToolUseBlock, ToolUseBlockParam,
     ToolResultBlockParam,
     ToolParam, ToolUnionParam,
-    ToolTextEditor20250728Param, ToolBash20250124Param,
     CacheControlEphemeralParam,
     ToolChoiceAutoParam, ThinkingConfigEnabledParam,
 
@@ -364,20 +362,6 @@ class AnthropicAgentNode(AgentNode):
             for tu in tool_uses:
                 args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
 
-                # Workaround for Anthropic using TextEditor:
-                # Normalize Anthropic's `view_range` [start, end] into TextEditor's args.
-                # We cannot change the spec because Anthropic is trained on it for adherence.
-                # It's not worth having to support collection arguments in our framework.
-                if tu.name == TextEditor.name:
-                    if args.get("command") == "view" and "view_range" in args:
-                        vr = args.pop("view_range", None)
-                        if isinstance(vr, list) and len(vr) == 2:
-                            start, end = vr
-                            if start is not None:
-                                args["view_start_line"] = start
-                            if end is not None:
-                                args["view_end_line"] = end
-
                 try:
                     children.append(self.invoke_tool_function(tu.name, args))
                     invoke_exceptions.append(None)
@@ -470,32 +454,6 @@ class AnthropicAgentNode(AgentNode):
         funcs: Sequence[Function] = self.agent_fn.uses
         tools: List[ToolUnionParam] = []
         for f in funcs:
-            # Anthropic's training harness includes some common tools for which it
-            # already knows the schema and Anthropic will inject their own system prompt.
-            if isinstance(f, TextEditor):
-                # Ref: `https://docs.claude.com/en/docs/agents-and-tools/tool-use/text-editor-tool`
-                # `TextEditor` is meant for use by *any* model, but is inspired by Anthropic's spec.
-                # Because it follows Anthropic's spec exactly, we only need this for its tool spec:
-                tools.append(
-                    ToolTextEditor20250728Param(
-                        type="text_editor_20250728",
-                        name="str_replace_based_edit_tool",
-                        max_characters=TextEditor.max_characters,
-                    )
-                )
-                continue
-
-            if isinstance(f, Bash):
-                # Ref: `https://docs.claude.com/en/docs/agents-and-tools/tool-use/bash-tool`
-                # Similar case as `TextEditor`.
-                tools.append(
-                    ToolBash20250124Param(
-                        type="bash_20250124",
-                        name="bash",
-                    )
-                )
-                continue
-
             # Build args spec.
             props: Dict[str, Dict[str, Any]] = {}
             required: List[str] = []
