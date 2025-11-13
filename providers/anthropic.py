@@ -219,10 +219,10 @@ class AnthropicAgentNode(AgentNode):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
-                    if isinstance(e, anthropic.APIConnectionError):
+                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
+                    if isinstance(e, (anthropic.APIConnectionError, httpx.RemoteProtocolError)):
                         is_retriable = True
                         is_connection = True
                     
