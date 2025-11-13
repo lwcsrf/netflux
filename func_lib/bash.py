@@ -320,12 +320,12 @@ class BashSession:
 class Bash(CodeFunction):
     """
     Stateful Bash tool.
-    - Persistent shell per {agent, session_id}.
+    - Persistent shell state per {agent, session_id} across function/tool calls.
     - Non-interactive commands only. Use `restart=true` to reset the environment.
     - Success: returns stdout+stderr (concatenated) preserving interleaving order.
       Failure: raises with exit code and combined output.
     - Timeout: default 120s; marks the session as requiring restart.
-    - Output is truncated to 96k characters per command with a clear note.
+    - Output is truncated to MAX_OUTPUT_CHARS characters per command with a clear note.
     """
 
     desc = (
@@ -333,10 +333,14 @@ class Bash(CodeFunction):
         "by only *you*, the agent caller).\n"
         "* Maintains state (cwd, env, vars) across calls until restarted.\n"
         "* Non-interactive commands only (no TTY prompts).\n"
+        "* heredocs and multi-line commands supported.\n"
         "* Success returns merged stdout/stderr, preserving interleaved order.\n"
         "* On non-zero exit, raises exception with exit code and the stdout/stderr.\n"
         "* Timeout (default 120s) raises and marks the session as requiring restart.\n"
         f"* Output truncated to {BashSession.MAX_OUTPUT_CHARS} characters per call.\n"
+        "* Avoid concurrent calls to the same session (use different `session_id`s if necessary).\n"
+        "* Restarts are session_id specific and do not affect other sessions.\n"
+        "* Avoid commands that may produce excessive/irrelevant output to prevent context pollution.\n"
     )
 
     args = [

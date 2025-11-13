@@ -15,18 +15,20 @@ class TextEditor(CodeFunction):
     `str_replace_based_edit_tool` , but implemented and consumable as an ordinary `CodeFunction`
     independent of any Provider, so it can be used by all agents as a standard utility.
     """
-    name: str = "str_replace_based_edit_tool"
+    name: str = "text_editor"
     commands: set[str] = {"view", "str_replace", "create", "insert"}
 
     # Truncate on each `view` command output.
     max_characters: int = 96000
 
     desc = (
-        "aka: `TextEditor`; `text_editor`. "
-        "View, create, and edit text files. Commands:\n"
-        "• `view`: View a file or list a directory. "
+        "View, create, and edit text files.\n"
+        "Similar to Anthropic's `str_replace_based_edit_tool`.\n"  # Beneficial (for all providers); do not remove.
+        "Commands:\n"
+        "• `view`: View a file or list a directory (single level). "
         "Files show line numbers (format: `number|content`) and you can optionally "
         "specify a line range. For directories, subdirectories are listed with '/' appended to their names.\n"
+        "List dirs only sparingly to avoid context pollution.\n"
         "• `str_replace`: Replace exact text in a file (`old_str` → `new_str`). Line numbers are"
         " for display only; do not include them in `old_str`.\n"
         "• `create`: Create a new file with given text content.\n"
@@ -59,7 +61,7 @@ class TextEditor(CodeFunction):
         # Command-specific parameters (globally optional; validated per command at runtime):
         FunctionArg("old_str", str, "Text to replace when command=str_replace (must match exactly).",
                     optional=True),
-        FunctionArg("new_str", str, "Replacement text for `str_replace`, or inserted text for `insert`.",
+        FunctionArg("new_str", str, "Replacement text for `str_replace` (can be empty str); or inserted text for `insert`.",
                     optional=True),
         FunctionArg("file_text", str, "Full file contents when command=create.",
                     optional=True),
