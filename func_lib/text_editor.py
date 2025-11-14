@@ -2,6 +2,7 @@ from pathlib import Path
 import tempfile
 import os
 import re
+import secrets
 from typing import Set, Optional
 
 from ..core import FunctionArg, CodeFunction, RunContext
@@ -19,7 +20,7 @@ class TextEditor(CodeFunction):
     commands: set[str] = {"view", "str_replace", "create", "insert"}
 
     # Truncate on each `view` command output.
-    max_characters: int = 96000
+    max_characters: int = 36000
 
     desc = (
         "View, create, and edit text files.\n"
@@ -29,9 +30,10 @@ class TextEditor(CodeFunction):
         "Files show line numbers (format: `number|content`) and you can optionally "
         "specify a line range. For directories, subdirectories are listed with '/' appended to their names.\n"
         "List dirs only sparingly to avoid context pollution.\n"
+        "Be selective when viewing files to prevent context explosion; use line ranges to limit output.\n"
         "• `str_replace`: Replace exact text in a file (`old_str` → `new_str`). Line numbers are"
         " for display only; do not include them in `old_str`.\n"
-        "• `create`: Create a new file with given text content.\n"
+        "• `create`: Create a new file with given text content (overwrites disallowed).\n"
         "• `insert`: Insert text after a given line in a file.\n\n"
         "Arguments by command:\n"
         "• `view` → `path` (absolute or relative; file or directory). Optional: `view_start_line`, `view_end_line`. "
@@ -40,7 +42,7 @@ class TextEditor(CodeFunction):
         "set view_end_line=-1 to read through the last line."
         f"Truncation will occur after {max_characters} characters, with it clearly noted in the returned text.\n"
         "• `str_replace` → `path`, `old_str`, `new_str` (requires *exact* match including whitespace/indentation).\n"
-        "• `create` → `path`, `file_text`.\n"
+        "• `create` → `path` (must not pre-exist), `file_text`.\n"
         "• `insert` → `path`, `insert_line`, `new_str`. "
         "Examples: `insert_line=0` inserts at the beginning of the file; "
         "`insert_line=1` inserts *after* the very first line (starting on the second line); "
@@ -293,7 +295,7 @@ class TextEditor(CodeFunction):
         if p.exists():
             if p.is_dir():
                 raise IsADirectoryError(f"Path is a directory: {p}")
-            raise FileExistsError(f"File already exists: {p}")
+            self._raise_create_conflict(p, file_text)
 
         # Race-safe create:
         # Use exclusive create ('x') so if another process creates the file between our
@@ -308,8 +310,8 @@ class TextEditor(CodeFunction):
         try:
             with p.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
                 f.write(file_text)
-        except FileExistsError:
-            raise FileExistsError(f"File already exists: {p}")
+        except FileExistsError as exc:
+            self._raise_create_conflict(p, file_text, original_exc=exc)
         except PermissionError as exc:
             raise PermissionError(f"while creating file '{p}': {exc}") from exc
         except OSError as exc:
@@ -361,6 +363,87 @@ class TextEditor(CodeFunction):
         if updated != content:
             self._atomic_write_text(p, updated)
         return "Insert successful."
+
+    def _raise_create_conflict(
+        self,
+        p: Path,
+        file_text: str,
+        original_exc: Optional[Exception] = None,
+    ) -> None:
+        """
+        Handle the case where a create would overwrite an existing path.
+        We first attempt an alternate sibling file and then raise a FileExistsError
+        describing what happened.
+
+        This design lets agents preserve user changes without forcing the LLM to
+        re-send the full file contents as another tool argument when resolving
+        path conflicts, which helps avoid unnecessary context bloat.
+        """
+        alt_path, alt_exc = self._attempt_alternate_create(p, file_text)
+        line_count = len(file_text.splitlines(keepends=True))
+
+        if alt_exc is None and alt_path is not None:
+            err = FileExistsError(
+                f"File already exists: {p}. "
+                f"Successfully wrote {line_count} lines instead to alternate path '{alt_path}' "
+                "because overwrite is not allowed for command=create. "
+                "You should rename or otherwise resolve the conflict (for example by moving or "
+                "deleting one of these paths using other tools)."
+            )
+            if original_exc is not None:
+                raise err from original_exc
+            raise err
+
+        if alt_path is not None and alt_exc is not None:
+            raise FileExistsError(
+                f"File already exists: {p}. "
+                f"Also failed to write contents to alternate path '{alt_path}' while trying to "
+                f"preserve your changes: {type(alt_exc).__name__}: {alt_exc}"
+            ) from alt_exc
+
+        err = FileExistsError(f"File already exists: {p}")
+        if original_exc is not None:
+            raise err from original_exc
+        raise err
+
+    def _attempt_alternate_create(
+        self,
+        original_path: Path,
+        file_text: str,
+        max_attempts: int = 5,
+    ) -> tuple[Optional[Path], Optional[Exception]]:
+        """
+        Attempt to create a sibling file with a random 6-hex-digit suffix when the
+        original path already exists and we do not allow overwrite.
+
+        Returns (alternate_path, exc):
+          - (Path, None) on success.
+          - (Path, exc) if we tried an alternate path but failed with an error.
+          - (None, exc) is not expected in normal operation but included for completeness.
+        """
+        last_exc: Optional[Exception] = None
+        alt_path: Optional[Path] = None
+
+        for _ in range(max_attempts):
+            stem = original_path.stem
+            suffix = original_path.suffix
+            rand = secrets.token_hex(3)
+            name = f"{stem}.{rand}{suffix}" if stem else f".{rand}{suffix}"
+            alt_path = original_path.with_name(name)
+
+            try:
+                with alt_path.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                    f.write(file_text)
+                return alt_path, None
+            except FileExistsError as exc:
+                last_exc = exc
+                continue
+            except PermissionError as exc:
+                return alt_path, PermissionError(f"while creating alternate file '{alt_path}': {exc}")
+            except OSError as exc:
+                return alt_path, OSError(f"while creating alternate file '{alt_path}': {exc}")
+
+        return alt_path, last_exc
 
     def _check_extraneous_args(self, args_provided: Set[str], command: str) -> None:
         allowed_by_cmd: dict[str, set[str]] = {
