@@ -45,7 +45,7 @@ class BashSession:
     """
 
     DEFAULT_TIMEOUT_SEC = 120
-    MAX_OUTPUT_CHARS = 96_000
+    MAX_OUTPUT_CHARS = 40_000
 
     def __init__(self, session_id: int) -> None:
         self.session_id = session_id
