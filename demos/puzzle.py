@@ -2,7 +2,7 @@ import argparse
 import sys
 import shutil
 import multiprocessing as mp
-from typing import List, Optional, Sequence
+from typing import Any, List, Optional, Sequence
 
 from ..core import (
     AgentFunction,
@@ -209,9 +209,11 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
         update_interval=0.1,
     )
 
+    final_result: Optional[Any] = None
+    run_exception: Optional[Exception] = None
     try:
        # Block until tree finished.
-       node.result()
+       final_result = node.result()
     except KeyboardInterrupt:
         # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
         cancel_evt.set()
@@ -220,6 +222,8 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
             node.result()
         except CancellationException:
             pass
+    except Exception as e:
+        run_exception = e
     finally:
         # Ensure UI watcher/ticker threads exit.
         cancel_evt.set()
@@ -233,6 +237,15 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
 
     # Final render to show final state.
     print(str(render.render(runtime.watch(node))))
+
+    if run_exception:
+        print("\n--- Execution Exception ---\n")
+        print(run_exception)
+        print("\n---------------------------\n")
+    elif final_result:
+        print("\n--- Final Response ---\n")
+        print(final_result)
+        print("\n----------------------\n")
 
 def parse_args(
     argv: Optional[List[str]] = None,
