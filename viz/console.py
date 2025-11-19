@@ -26,6 +26,7 @@ FG = {
 }
 
 THOUGHT_GLYPH = "\u27B0"  # ➰
+VERT_GLYPH = "\u2502"     # │
 
 
 def _color(text: str, *, fg: Optional[str] = None, bold: bool = False, dim: bool = False) -> str:
@@ -204,7 +205,7 @@ class ConsoleRender(Render[str]):
                 for tb in parts:
                     msg = format_thinking(tb)
                     if msg:
-                        lines.append(detail_prefix + "│    " + _color(msg, dim=True))
+                        lines.append(detail_prefix + f"{VERT_GLYPH}    " + _color(msg, dim=True))
 
             glyph, color = _state_glyph(nv.state, tick)
             # If cancellation is pending, visually mark non-terminal states distinctly
@@ -277,7 +278,7 @@ class ConsoleRender(Render[str]):
 
                 if segs:
                     detail_prefix = prefix + ("   " if is_last else "│  ")
-                    lines.append(detail_prefix + "│    " + ", ".join(segs))
+                    lines.append(detail_prefix + f"{VERT_GLYPH}    " + ", ".join(segs))
 
             # Thinking blocks associated with this node appear as their own lines
             # under the node header (and any usage line), aligned with tree rails.
@@ -286,7 +287,9 @@ class ConsoleRender(Render[str]):
             child_prefix = prefix + ("   " if is_last else "│  ")
             count = len(nv.children)
             for idx, child in enumerate(nv.children):
-                add_node(child, child_prefix, idx == count - 1)
+                has_trailing_thought = bool(thinking_slots.get(idx + 1))
+                is_last_child = (idx == count - 1) and not has_trailing_thought
+                add_node(child, child_prefix, is_last_child)
                 emit_thinking(idx + 1)
 
         add_node(self._last_view, prefix="", is_last=True)
