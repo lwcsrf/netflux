@@ -7,7 +7,7 @@ import multiprocessing as mp
 from multiprocessing.synchronize import Event
 from typing import List, Optional, Tuple
 
-from ..core import NodeState, NodeView
+from ..core import NodeState, NodeView, ThinkingBlockPart, ToolUsePart
 from .viz import Render
 
 # ANSI helpers for console rendering
@@ -24,6 +24,9 @@ FG = {
     "white": "\x1b[37m",
     "orange": "\x1b[38;5;208m",
 }
+
+THOUGHT_GLYPH = "\u27B0"  # ➰
+VERT_GLYPH = "\u2502"     # │
 
 
 def _color(text: str, *, fg: Optional[str] = None, bold: bool = False, dim: bool = False) -> str:
@@ -92,7 +95,7 @@ def _type_glyph_for_fn(fn) -> str:
     if fn.is_agent():
         return "✨"
     if fn.is_code():
-        return "⚙️"
+        return "⚙️ "
     return "•"
 
 
@@ -168,6 +171,42 @@ class ConsoleRender(Render[str]):
         cancel_pending = bool(self.cancel_event and self.cancel_event.is_set())
 
         def add_node(nv: NodeView, prefix: str, is_last: bool) -> None:
+            def format_thinking(part: ThinkingBlockPart) -> Optional[str]:
+                content = part.content or ""
+                signature = part.signature or ""
+
+                if part.redacted or content == "":
+                    content_display = ""
+                else:
+                    content_display = _short_repr(content, 200)
+                sig_prefix = signature[:5]
+
+                if content_display:
+                    return f"{THOUGHT_GLYPH} thought: {content_display}"
+                return f"{THOUGHT_GLYPH} thought"
+
+            # Precompute thinking slots relative to tool uses for this node.
+            thinking_slots = {}
+            if nv.transcript:
+                tool_uses_seen = 0
+                for part in nv.transcript:
+                    if isinstance(part, ThinkingBlockPart):
+                        thinking_slots.setdefault(tool_uses_seen, []).append(part)
+                    elif isinstance(part, ToolUsePart):
+                        tool_uses_seen += 1
+
+            def emit_thinking(slot_index: int) -> None:
+                if not thinking_slots:
+                    return
+                parts = thinking_slots.get(slot_index)
+                if not parts:
+                    return
+                detail_prefix = prefix + ("   " if is_last else "│  ")
+                for tb in parts:
+                    msg = format_thinking(tb)
+                    if msg:
+                        lines.append(detail_prefix + f"{VERT_GLYPH}    " + _color(msg, dim=True))
+
             glyph, color = _state_glyph(nv.state, tick)
             # If cancellation is pending, visually mark non-terminal states distinctly
             # to indicate "cancel requested" overlay without implying terminal state.
@@ -176,7 +215,7 @@ class ConsoleRender(Render[str]):
             args = _format_args(nv.inputs)
             type_g = _type_glyph_for_fn(nv.fn)
             # Base prefix + function name
-            header = f"{_color(glyph, fg=color, bold=True)} {_color(type_g, dim=True)} {_color(nv.fn.name, bold=True)}"
+            header = f"{_color(glyph, fg=color, bold=True)} {_color(type_g)} {_color(nv.fn.name, bold=True)}"
             # Elapsed time immediately after function name, to reduce truncation risk
             et = _format_elapsed(nv)
             if et:
@@ -239,12 +278,19 @@ class ConsoleRender(Render[str]):
 
                 if segs:
                     detail_prefix = prefix + ("   " if is_last else "│  ")
-                    lines.append(detail_prefix + "│    " + ", ".join(segs))
+                    lines.append(detail_prefix + f"{VERT_GLYPH}    " + ", ".join(segs))
+
+            # Thinking blocks associated with this node appear as their own lines
+            # under the node header (and any usage line), aligned with tree rails.
+            emit_thinking(0)
 
             child_prefix = prefix + ("   " if is_last else "│  ")
             count = len(nv.children)
             for idx, child in enumerate(nv.children):
-                add_node(child, child_prefix, idx == count - 1)
+                has_trailing_thought = bool(thinking_slots.get(idx + 1))
+                is_last_child = (idx == count - 1) and not has_trailing_thought
+                add_node(child, child_prefix, is_last_child)
+                emit_thinking(idx + 1)
 
         add_node(self._last_view, prefix="", is_last=True)
 
