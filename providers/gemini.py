@@ -72,7 +72,7 @@ from google.genai import errors as genai_errors
 
 MAX_TOKENS = 64000
 THINKING_CFG = types.ThinkingConfig(
-    thinking_budget=32768,
+    thinking_level=types.ThinkingLevel.HIGH,
     # Disable Thought Summaries always: they are not useful, and we don't want to
     # accidentally allow them to be included as past thinking content ever.
     include_thoughts=False,

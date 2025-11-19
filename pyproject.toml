@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netflux"
-version = "0.2.3"
+version = "0.2.4"
 maintainers = [
   { name="LW Computational Science Research Foundation" },
 ]
@@ -37,7 +37,7 @@ anthropic = [
     "httpx[http2]",
 ]
 gemini = [
-    "google-genai>=1.41.0, <2.0.0",
+    "google-genai>=1.51.0, <2.0.0",
     "httpx[http2]",
 ]
 openai = ["openai>=1.109.1, <2.0.0"]
