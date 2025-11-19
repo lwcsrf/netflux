@@ -242,6 +242,7 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
         print("\n--- Execution Exception ---\n")
         print(run_exception)
         print("\n---------------------------\n")
+        raise run_exception
     elif final_result:
         print("\n--- Final Response ---\n")
         print(final_result)
