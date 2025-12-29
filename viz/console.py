@@ -352,7 +352,9 @@ class ConsoleRender(Render[str]):
             return chunk + RESET
 
         lines = s.splitlines()
-        cropped = [_crop_tail_safe(ln, safe_cols) for ln in lines[:safe_rows]]
+        # Take the last safe_rows lines to "tail" the output (show bottom when full)
+        visible_lines = lines[-safe_rows:] if len(lines) > safe_rows else lines
+        cropped = [_crop_tail_safe(ln, safe_cols) for ln in visible_lines]
         # Pad with blanks to overwrite remnants from previous longer frames
         if len(cropped) < safe_rows:
             cropped.extend([""] * (safe_rows - len(cropped)))
