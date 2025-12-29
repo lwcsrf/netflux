@@ -1,11 +1,12 @@
 from pathlib import Path
+from multiprocessing import Lock
 import tempfile
 import os
 import re
 import secrets
 from typing import Set, Optional
 
-from ..core import FunctionArg, CodeFunction, RunContext
+from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
 
 class TextEditorException(Exception):
     """Raised for business-logic violations in the TextEditor tool."""
@@ -21,6 +22,8 @@ class TextEditor(CodeFunction):
 
     # Truncate on each `view` command output.
     max_characters: int = 36000
+
+    _FILE_LOCK_NAMESPACE: str = "text_editor.file_lock"
 
     desc = (
         "View, create, and edit text files.\n"
@@ -116,13 +119,26 @@ class TextEditor(CodeFunction):
         if command == "view":
             return self.handle_view(path, view_start_line, view_end_line)
         if command == "str_replace":
-            return self.handle_str_replace(path, old_str, new_str)
+            return self.handle_str_replace(ctx, path, old_str, new_str)
         if command == "create":
             return self.handle_create(path, file_text)
         if command == "insert":
-            return self.handle_insert(path, insert_line, new_str)
+            return self.handle_insert(ctx, path, insert_line, new_str)
 
         raise NotImplementedError(f"TextEditor needs impl update for `command`: '{command!r}'")
+
+    @staticmethod
+    def _file_lock_key(p: Path) -> str:
+        # Ensure consistent keying across common casing + separator conventions.
+        return os.path.normcase(str(p))
+
+    def _get_file_lock(self, ctx: RunContext, p: Path):
+        return ctx.get_or_put(
+            SessionScope.TopLevel,
+            namespace=self._FILE_LOCK_NAMESPACE,
+            key=self._file_lock_key(p),
+            factory=Lock,
+        )
 
     def handle_view(
         self,
@@ -227,6 +243,7 @@ class TextEditor(CodeFunction):
 
     def handle_str_replace(
         self,
+        ctx: RunContext,
         path: str,
         old_str: Optional[str],
         new_str: Optional[str],
@@ -250,37 +267,42 @@ class TextEditor(CodeFunction):
         if not p.is_file():
             raise TextEditorException(f"Path is not a regular file: {p}")
 
-        # Mid-air guard: record mtime before we read
-        mtime_before = self._stat_mtime_ns(p)
-        content = self._read_text_preserve_eols(p)
+        lock = self._get_file_lock(ctx, p)
+        lock.acquire()
+        try:
+            # Mid-air guard: record mtime before we read
+            mtime_before = self._stat_mtime_ns(p)
+            content = self._read_text_preserve_eols(p)
 
-        count = self._count_overlapping(content, old_str)
-        if count == 0:
-            # See if there is a likely reason for no match that an LLM might make.
-            extra = ""
-            if self._looks_line_numbered(old_str):
-                extra = ". Ensure line numbers not included in `old_str`."
-            else:
-                # Extra guidance when line endings are the likely culprit.
-                if old_str and old_str.replace("\r\n", "\n") in content.replace("\r\n", "\n"):
-                    extra += ". Possible CRLF/LF newline mismatch."
-            raise TextEditorException("No match found for replacement" + extra)
-        if count > 1:
-            raise TextEditorException(
-                f"Found {count} matches for replacement text. "
-                "Provide more context to make it unique.")
+            count = self._count_overlapping(content, old_str)
+            if count == 0:
+                # See if there is a likely reason for no match that an LLM might make.
+                extra = ""
+                if self._looks_line_numbered(old_str):
+                    extra = ". Ensure line numbers not included in `old_str`."
+                else:
+                    # Extra guidance when line endings are the likely culprit.
+                    if old_str and old_str.replace("\r\n", "\n") in content.replace("\r\n", "\n"):
+                        extra += ". Possible CRLF/LF newline mismatch."
+                raise TextEditorException("No match found for replacement" + extra)
+            if count > 1:
+                raise TextEditorException(
+                    f"Found {count} matches for replacement text. "
+                    "Provide more context to make it unique.")
 
-        updated = content.replace(old_str, new_str, 1)
+            updated = content.replace(old_str, new_str, 1)
 
-        # Mid-air guard just before write
-        mtime_now = self._stat_mtime_ns(p)
-        if (mtime_before is not None and mtime_now is not None) and (mtime_now != mtime_before):
-            # Generally we expect agents will be instructed to use temp files and workspaces
-            # to prevent conflict with other processes. This only catches a small subset of races.
-            raise TextEditorException("File changed during edit; refresh your view and try again")
+            # Mid-air guard just before write
+            mtime_now = self._stat_mtime_ns(p)
+            if (mtime_before is not None and mtime_now is not None) and (mtime_now != mtime_before):
+                # Generally we expect agents will be instructed to use temp files and workspaces
+                # to prevent conflict with other processes. This only catches a small subset of races.
+                raise TextEditorException("File changed during edit; refresh your view and try again")
 
-        if updated != content:
-            self._atomic_write_text(p, updated)
+            if updated != content:
+                self._atomic_write_text(p, updated)
+        finally:
+            lock.release()
         return "Replace successful."
 
     def handle_create(
@@ -323,6 +345,7 @@ class TextEditor(CodeFunction):
 
     def handle_insert(
         self,
+        ctx: RunContext,
         path: str,
         insert_line: Optional[int],
         new_str: Optional[str],
@@ -342,26 +365,31 @@ class TextEditor(CodeFunction):
         if not p.is_file():
             raise TextEditorException(f"Path is not a regular file: {p}")
 
-        # Mid-air guard: record mtime before we read
-        mtime_before = self._stat_mtime_ns(p)
-        content = self._read_text_preserve_eols(p)
+        lock = self._get_file_lock(ctx, p)
+        lock.acquire()
+        try:
+            # Mid-air guard: record mtime before we read
+            mtime_before = self._stat_mtime_ns(p)
+            content = self._read_text_preserve_eols(p)
 
-        lines = content.splitlines(keepends=True)
-        n = len(lines)
-        if insert_line > n:
-            raise TextEditorException(f"insert_line {insert_line} is out of range (file has {n} lines)")
+            lines = content.splitlines(keepends=True)
+            n = len(lines)
+            if insert_line > n:
+                raise TextEditorException(f"insert_line {insert_line} is out of range (file has {n} lines)")
 
-        before = "".join(lines[:insert_line])
-        after = "".join(lines[insert_line:])
-        updated = before + new_str + after
+            before = "".join(lines[:insert_line])
+            after = "".join(lines[insert_line:])
+            updated = before + new_str + after
 
-        # Mid-air guard just before write
-        mtime_now = self._stat_mtime_ns(p)
-        if (mtime_before is not None and mtime_now is not None) and (mtime_now != mtime_before):
-            raise TextEditorException("File changed on disk; refresh your view and try again")
+            # Mid-air guard just before write
+            mtime_now = self._stat_mtime_ns(p)
+            if (mtime_before is not None and mtime_now is not None) and (mtime_now != mtime_before):
+                raise TextEditorException("File changed on disk; refresh your view and try again")
 
-        if updated != content:
-            self._atomic_write_text(p, updated)
+            if updated != content:
+                self._atomic_write_text(p, updated)
+        finally:
+            lock.release()
         return "Insert successful."
 
     def _raise_create_conflict(

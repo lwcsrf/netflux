@@ -1,16 +1,28 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from typing import Optional
 from unittest.mock import patch
 
-from ..core import RunContext
+from ..core import RunContext, SessionBag, SessionScope
 from ..func_lib.text_editor import TextEditor, TextEditorException
+
+
+class _DummyNode:
+    def __init__(self, parent: Optional["_DummyNode"] = None) -> None:
+        self.parent = parent
+        self.session_bag = SessionBag()
 
 
 class TestTextEditorBasicOperations(unittest.TestCase):
     def setUp(self) -> None:
-        self.ctx = RunContext(runtime=None, node=None)  # type: ignore[arg-type]
+        node = _DummyNode()
+        self.ctx = RunContext(runtime=None, node=node)  # type: ignore[arg-type]
+        self.ctx.object_bags = {
+            SessionScope.TopLevel: node.session_bag,
+            SessionScope.Self: node.session_bag,
+        }
         self.editor = TextEditor()
 
     def test_view_whole_file_numbers_lines(self) -> None:
@@ -199,9 +211,12 @@ class TestTextEditorBasicOperations(unittest.TestCase):
 
 class TestTextEditorCreateBehavior(unittest.TestCase):
     def setUp(self) -> None:
-        # TextEditor does not currently use the RunContext, so a minimal
-        # instance is sufficient for direct calls.
-        self.ctx = RunContext(runtime=None, node=None)  # type: ignore[arg-type]
+        node = _DummyNode()
+        self.ctx = RunContext(runtime=None, node=node)  # type: ignore[arg-type]
+        self.ctx.object_bags = {
+            SessionScope.TopLevel: node.session_bag,
+            SessionScope.Self: node.session_bag,
+        }
         self.editor = TextEditor()
 
     def test_create_on_new_file_succeeds_without_alternate(self) -> None:
@@ -422,3 +437,131 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
         self.assertIn("Also failed to write contents", msg)
         self.assertIn("PermissionError", msg)
         self.assertIn("no write access", msg)
+
+
+class TestTextEditorConcurrency(unittest.TestCase):
+    def test_parallel_str_replace_same_file_is_serialized(self) -> None:
+        editor = TextEditor()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "file.txt"
+
+            top_bag = SessionBag()
+            node_a = _DummyNode()
+            node_b = _DummyNode()
+            ctx_a = RunContext(runtime=None, node=node_a)  # type: ignore[arg-type]
+            ctx_b = RunContext(runtime=None, node=node_b)  # type: ignore[arg-type]
+            ctx_a.object_bags = {SessionScope.TopLevel: top_bag, SessionScope.Self: node_a.session_bag}
+            ctx_b.object_bags = {SessionScope.TopLevel: top_bag, SessionScope.Self: node_b.session_bag}
+
+            # Ensure LF line endings (Path.write_text() may translate to CRLF on Windows).
+            editor.call(ctx_a, command="create", path=str(target), file_text="a=1\nb=2\n")
+
+            file_lock = editor._get_file_lock(ctx_a, target.resolve())
+            orig_acquire = file_lock.acquire
+            orig_release = file_lock.release
+
+            b_waiting_on_lock = threading.Event()
+            b_acquired_lock = threading.Event()
+
+            def patched_acquire(*args, **kwargs):
+                if threading.current_thread().name == "writer-b":
+                    if not orig_acquire(False):
+                        b_waiting_on_lock.set()
+                    else:
+                        orig_release()
+                    out = orig_acquire(*args, **kwargs)
+                    b_acquired_lock.set()
+                    return out
+                return orig_acquire(*args, **kwargs)
+
+            file_lock.acquire = patched_acquire
+
+            a_prewrite = threading.Event()
+            allow_a_write = threading.Event()
+            a_read_started = threading.Event()
+            b_read_started = threading.Event()
+            errors: list[Exception] = []
+
+            original_atomic_write = editor._atomic_write_text
+            original_read_text = editor._read_text_preserve_eols
+
+            reads: dict[str, str] = {}
+            writes: dict[str, str] = {}
+
+            def patched_atomic_write(p: Path, data: str) -> None:
+                writes[threading.current_thread().name] = data
+                if threading.current_thread().name == "writer-a":
+                    a_prewrite.set()
+                    if not allow_a_write.wait(timeout=2):
+                        raise AssertionError("Timed out waiting to allow writer-a to write")
+                original_atomic_write(p, data)
+
+            def patched_read_text(p: Path) -> str:
+                content = original_read_text(p)
+                reads[threading.current_thread().name] = content
+                if threading.current_thread().name == "writer-a":
+                    a_read_started.set()
+                if threading.current_thread().name == "writer-b":
+                    b_read_started.set()
+                return content
+
+            def worker_a() -> None:
+                try:
+                    editor.call(
+                        ctx_a,
+                        command="str_replace",
+                        path=str(target),
+                        old_str="a=1\n",
+                        new_str="a=10\n",
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            def worker_b() -> None:
+                try:
+                    editor.call(
+                        ctx_b,
+                        command="str_replace",
+                        path=str(target),
+                        old_str="b=2\n",
+                        new_str="b=20\n",
+                    )
+                except Exception as exc:
+                    errors.append(exc)
+
+            with (
+                patch.object(editor, "_atomic_write_text", side_effect=patched_atomic_write),
+                patch.object(editor, "_read_text_preserve_eols", side_effect=patched_read_text),
+            ):
+                thread_a = threading.Thread(target=worker_a, name="writer-a")
+                thread_b = threading.Thread(target=worker_b, name="writer-b")
+
+                thread_a.start()
+                self.assertTrue(a_prewrite.wait(timeout=2))
+                self.assertTrue(a_read_started.wait(timeout=2))
+
+                # While writer-a is paused before writing, the on-disk file is still the original content.
+                self.assertEqual("a=1\nb=2\n", target.read_text(encoding="utf-8"))
+
+                thread_b.start()
+                self.assertTrue(b_waiting_on_lock.wait(timeout=2))
+                self.assertFalse(b_acquired_lock.wait(timeout=0.2))
+                self.assertFalse(b_read_started.wait(timeout=0.2))
+
+                allow_a_write.set()
+
+                thread_a.join(timeout=2)
+                thread_b.join(timeout=2)
+                self.assertFalse(thread_a.is_alive())
+                self.assertFalse(thread_b.is_alive())
+
+            if errors:
+                raise errors[0]
+
+            self.assertTrue(b_read_started.is_set())
+            self.assertEqual("a=1\nb=2\n", reads.get("writer-a"))
+            self.assertEqual("a=10\nb=2\n", reads.get("writer-b"))
+            self.assertEqual("a=10\nb=2\n", writes.get("writer-a"))
+            self.assertEqual("a=10\nb=20\n", writes.get("writer-b"))
+            self.assertEqual("a=10\nb=20\n", target.read_text(encoding="utf-8"))
