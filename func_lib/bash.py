@@ -181,8 +181,10 @@ class BashSession:
         return False
 
     # -------- external concurrency control --------
-    def try_acquire(self) -> bool:
-        """Attempt to lock this session for exclusive use (non-blocking)."""
+    def try_acquire(self, timeout_sec: float = 0.0) -> bool:
+        """Attempt to lock this session for exclusive use (optionally waiting)."""
+        if timeout_sec > 0:
+            return self._lock.acquire(timeout=timeout_sec)
         return self._lock.acquire(blocking=False)
 
     def release(self) -> None:
@@ -359,6 +361,9 @@ class Bash(CodeFunction):
             uses=[],
         )
 
+    # For insignificant concurrent use of the same session_id, before complaining.
+    LOCK_WAIT_SEC = 3.0
+
     @staticmethod
     def _bag_key(session_id: int) -> str:
         return f"session:{session_id}"
@@ -391,7 +396,7 @@ class Bash(CodeFunction):
             ) from exc
 
         # Acquire exclusive access for the entire operation (restart and/or execute).
-        if not session.try_acquire():
+        if not session.try_acquire(timeout_sec=self.LOCK_WAIT_SEC):
             raise BashSessionRaceException(
                 "Bash session is busy with another command; you are not "
                 "supposed to call the same session concurrently!")
