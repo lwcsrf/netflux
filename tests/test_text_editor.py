@@ -546,8 +546,8 @@ class TestTextEditorConcurrency(unittest.TestCase):
 
                 thread_b.start()
                 self.assertTrue(b_waiting_on_lock.wait(timeout=2))
-                self.assertFalse(b_acquired_lock.wait(timeout=0.2))
-                self.assertFalse(b_read_started.wait(timeout=0.2))
+                self.assertFalse(b_acquired_lock.wait(timeout=1.0))
+                self.assertFalse(b_read_started.wait(timeout=1.0))
 
                 allow_a_write.set()
 
