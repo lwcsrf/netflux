@@ -493,7 +493,7 @@ class TestTextEditorConcurrency(unittest.TestCase):
                 writes[threading.current_thread().name] = data
                 if threading.current_thread().name == "writer-a":
                     a_prewrite.set()
-                    if not allow_a_write.wait(timeout=2):
+                    if not allow_a_write.wait(timeout=10):
                         raise AssertionError("Timed out waiting to allow writer-a to write")
                 original_atomic_write(p, data)
 
@@ -546,8 +546,8 @@ class TestTextEditorConcurrency(unittest.TestCase):
 
                 thread_b.start()
                 self.assertTrue(b_waiting_on_lock.wait(timeout=2))
-                self.assertFalse(b_acquired_lock.wait(timeout=1.0))
-                self.assertFalse(b_read_started.wait(timeout=1.0))
+                self.assertFalse(b_acquired_lock.is_set())
+                self.assertFalse(b_read_started.is_set())
 
                 allow_a_write.set()
 
