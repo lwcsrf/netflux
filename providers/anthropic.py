@@ -471,11 +471,11 @@ class AnthropicAgentNode(AgentNode):
                 if not arg.optional:
                     required.append(arg.name)
 
-            input_schema: InputSchemaTyped = {
+            input_schema = cast(InputSchemaTyped, {
                 "type": "object",
                 "properties": props,
                 "required": required,
-            }
+            })
 
             tools.append(
                 ToolParam(name=f.name, description=f.desc, input_schema=input_schema)
