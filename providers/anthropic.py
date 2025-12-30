@@ -213,7 +213,9 @@ class AnthropicAgentNode(AgentNode):
                     if isinstance(e, anthropic.RateLimitError):
                         is_retriable = True
                     if isinstance(e, anthropic.APIStatusError):
-                        if e.status_code in (408, 409, 429) or e.status_code >= 500:
+                        # WORKAROUND: some HTTP-200 with late overloaded SSE are not `class OverloadedError(APIStatusError)`
+                        # but the SDK is still flagging them as APIStatusError.
+                        if e.status_code in (408, 409, 429) or e.status_code >= 500 or "overloaded" in e.message.lower():
                             is_retriable = True
                     if isinstance(e, httpx.HTTPStatusError):
                         status_code = e.response.status_code
