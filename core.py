@@ -211,13 +211,18 @@ class AgentFunction(Function):
         system_prompt: str,
         user_prompt_template: str,
         uses: Sequence[Function] = (),
+        uses_recursion: bool = False,
         default_model: Provider = Provider.Anthropic,
     ) -> None:
         super().__init__(name, desc, args)
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
         self.uses_funcs: List[Function] = list(uses)
+        self.uses_recursion = uses_recursion
         self.default_model = default_model
+
+        if uses_recursion and self not in self.uses_funcs:
+            self.uses_funcs.append(self)
 
         # Check if any Functions have dup names.
         names = [t.name for t in self.uses_funcs]
