@@ -81,7 +81,7 @@ Good programs decompose behavior into cohesive functions. We encourage the same 
 
 * A high‑level `AgentFunction` **breaks work into sub‑tasks** and delegates to more specialized sub‑`Function`s (including other agents).
 * This disciplined decomposition matters for agents because **focused sub‑tasks with deliberate, limited context** are often the bottleneck to reliable LLM execution.
-* **Circular references are forbidden** and **recursion is disallowed** to prevent runaway scenarios.
+* Agents can opt into **self-recursion** by setting `uses_recursion=True`, which exposes the agent as a callable tool to itself.
 
 There is **no notion of “top” vs. “non‑top”** functions. *Any* `Function` (code or agent) can be invoked as the top‑level entry from your app, or it can be a deeply nested sub‑task inside a broader agent.
 
@@ -99,6 +99,7 @@ Every `AgentFunction` specifies:
 * **First (and only) user turn** (templated; substitutions using the input args).
 * **How to inject specifics**—typically string substitution, but any deterministic transform is fine as long as args ⇒ concrete prompt is well‑defined.
 * **Allowed `Function`s** it may call (task decomposition, sub‑agents, actuators i.e. leaf tools).
+* Optional `uses_recursion` to allow self-invocation as a tool.
 * Opt-in to the built‑in **`RaiseException`** function so the agent can proactively signal failure by raising an `AgentException`.
 
 > **Design note:** *The agent’s logical reasoning replaces a function’s fixed code body. Otherwise, we treat agents and code functions uniformly—which is the foundation of netflux.*
@@ -233,8 +234,7 @@ fix_bug_workflow = CodeFunction(
     ],
     callable=_fix_bug_workflow,
     # For `CodeFunction`s, the `uses` should still be populated because it
-    # helps enforce function hierarchy to prevent risk of agent causing
-    # infinite cycles or recursion runaway.
+    # helps the runtime register dependencies and keeps tool availability explicit.
     uses=[find_bug_ensemble, bugfixer_agent, apply_diff_patch],
 )
 ```
@@ -474,6 +474,7 @@ This refined example shows:
     * user subtypes to define their own agents (could use abstract properties that user must override).
     * subtype must specify: input vars, system prompt, templated user prompt (var substitution). Each var may be given as strings or filepaths (upon instantiation of the agent, files would have to be loaded and then substitution done by the runner infra instead of asking the agent to do it).
     * subtype specifies `uses: List[Function]` — the `Function`s that the agent may invoke.
+    * optional `uses_recursion: bool` — when true, the agent includes itself in `uses` for self-invocation.
 * `CodeFunction`: can also be invoked by any `Function`.
     * some framework built-in subtypes (`Ensemble`, `ThinkMoreDecorator`).
     * mostly user subtypes to define any plain python functions that do some deterministic logic, intended to be invoked most often by `AgentFunction`s or as the top-level request, to coordinate sub-agents doing sub-tasks.
@@ -739,10 +740,4 @@ This is a bucket list of nice-to-haves.
 * Fully migrate to Event-Driven Architecture.
     * Single event loop per Runtime; remove the per-`Node` thread.
 * Smarter caching based on past `Function` instance statistics.
-* Cycle & Recursion Prohibition
-    * Enforce at `Runtime` construction.
-    * Ensure each `Function` has legal references to other `Function`s.
-    * Reject if not a DAG.
-    * Reject if function type annotations do not match the spec in `CodeFunction`.
-
 ---

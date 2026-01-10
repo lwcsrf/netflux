@@ -34,6 +34,36 @@ class TestAgentFunctionConstruction(unittest.TestCase):
                 uses=[tool_a, tool_b],
             )
 
+    def test_agent_function_uses_recursion_adds_self_once(self):
+        """When uses_recursion is set, the agent should include itself exactly once."""
+
+        agent = AgentFunction(
+            name="agent",
+            desc="test",
+            args=(),
+            system_prompt="system",
+            user_prompt_template="user",
+            uses_recursion=True,
+        )
+        self.assertIn(agent, agent.uses)
+        self.assertEqual(1, sum(1 for fn in agent.uses if fn is agent))
+
+        class SelfReferencingAgent(AgentFunction):
+            def __init__(self):
+                tool = _make_noop_code_function("tool")
+                super().__init__(
+                    name="self_ref",
+                    desc="test",
+                    args=(),
+                    system_prompt="system",
+                    user_prompt_template="user",
+                    uses=[self, tool],
+                    uses_recursion=True,
+                )
+
+        self_ref = SelfReferencingAgent()
+        self.assertEqual(1, sum(1 for fn in self_ref.uses if fn is self_ref))
+
 
 class TestCodeFunctionSignatureValidation(unittest.TestCase):
     def test_code_function_requires_runcontext_first_positional(self):
