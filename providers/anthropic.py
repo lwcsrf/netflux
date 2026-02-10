@@ -26,7 +26,7 @@ from anthropic.types import (
     ToolResultBlockParam,
     ToolParam, ToolUnionParam,
     CacheControlEphemeralParam,
-    ToolChoiceAutoParam, ThinkingConfigEnabledParam,
+    ToolChoiceAutoParam, ThinkingConfigAdaptiveParam, OutputConfigParam,
 
 )
 from anthropic.types.tool_param import InputSchemaTyped
@@ -80,7 +80,8 @@ from anthropic.types.tool_param import InputSchemaTyped
           sequence sent and received, unmodified.
         * Continuous reasoning: When this is done properly (Never alter, reorder, trim, or
           re-wrap any assistant block. You only append new tool_result blocks to transcript and
-          then send the request), and the tool-reasoning interleaving beta header is enabled,
+          then send the request), and adaptive thinking is enabled (tool-reasoning interleaving
+          is default as of Opus 4.6 without header),
           and tool choice "auto" is used, you will attain **full fluent context since the last
           user text prompt**: the model's follow-up reasoning step has direct access to the
           entire chain of prior reasoning and actions in its context window. Thus, you get 
@@ -105,14 +106,9 @@ from anthropic.types.tool_param import InputSchemaTyped
     * should be achieved via tools (their arg schema is the output schema)
 """
 
-# Enables: Extended Thinking Interleaved with Tool Use.
-# Since we want agentic task completion end to end, we must always add the
-# header on each of our requests.
-INTERLEAVED_BETA = {"anthropic-beta": "interleaved-thinking-2025-05-14"}
-# "With interleaved thinking, the budget_tokens can exceed the max_tokens parameter,
-# as it represents the total budget across all thinking blocks within one assistant turn."
-MAX_TOKENS = 64_000
-THINKING_CFG = ThinkingConfigEnabledParam(type="enabled", budget_tokens=80_000)
+MAX_TOKENS = 128_000
+THINKING_CFG = ThinkingConfigAdaptiveParam(type="adaptive")
+OUTPUT_CFG = OutputConfigParam(effort="max")
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
@@ -194,7 +190,7 @@ class AnthropicAgentNode(AgentNode):
                         tool_choice=ToolChoiceAutoParam(type="auto"),
                         max_tokens=MAX_TOKENS,
                         thinking=THINKING_CFG,
-                        extra_headers=INTERLEAVED_BETA,
+                        output_config=OUTPUT_CFG,
                     ) as stream:
                         resp = stream.get_final_message()
                         break
