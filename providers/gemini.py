@@ -47,7 +47,7 @@ from google.genai import errors as genai_errors
             - append your functionResponse parts (role can be `tool` or `user`).
         5. Repeat until the model returns a non-thinking text answer and no follow-up function
            calls.
-    * Interleaved reasoning with tools — Gemini 2.5 Pro behaves like Opus 4.1 (strong evidence
+    * Interleaved reasoning with tools — Gemini 3.1 Pro behaves like Opus 4.1 (strong evidence
       for both models).
         * After a reasoning phase, the model can emit one or more functionCalls; once tool
           results are returned, it resumes with new reasoning before deciding whether to call

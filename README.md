@@ -554,7 +554,7 @@ This refined example shows:
     * `AnthropicAgentNode`
         * particular implementation when the `AgentFunction` is invoked with Anthropic LLM (e.g. Opus 4.1).
     * `GeminiAgentNode`
-        * particular implementation when the `AgentFunction` is invoked with Gemini LLM (e.g. Gemini Pro 2.5).
+        * particular implementation when the `AgentFunction` is invoked with Gemini LLM (e.g. Gemini 3.1 Pro).
     * Tracks history of LLM session thus far (which it also uses in tool cycle when doing follow-up request)
         * Subtypes `AnthropicAgentNode` and `GeminiAgentNode` store and use the SDK-specific types in their internal impl.
     * `node.get_transcript() -> List[TranscriptPart]`
