@@ -99,8 +99,9 @@ class GeminiAgentNode(AgentNode):
         parent: Optional['Node'],
         cancel_event: Optional[Event],
         client_factory: Callable[[], Any],
+        tool_use_id: Optional[str] = None,
     ):
-        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory, tool_use_id)
         client: Any = client_factory()
         if not isinstance(client, genai.Client):
             raise TypeError(
@@ -354,7 +355,7 @@ class GeminiAgentNode(AgentNode):
                 self.ctx.post_transcript_update()
 
                 try:
-                    children.append(self.invoke_tool_function(name, tool_args))
+                    children.append(self.invoke_tool_function(name, tool_args, tool_use_id))
                     invoke_exceptions.append(None)
                 except Exception as ex:
                     children.append(None)

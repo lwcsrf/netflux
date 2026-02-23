@@ -135,8 +135,9 @@ class AnthropicAgentNode(AgentNode):
         parent: Optional[Node],
         cancel_event: Optional[Event],
         client_factory: Callable[[], Any],
+        tool_use_id: Optional[str] = None,
     ):
-        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory, tool_use_id)
         client: Any = client_factory()
         if not isinstance(client, anthropic.Anthropic):
             raise TypeError(
@@ -361,7 +362,7 @@ class AnthropicAgentNode(AgentNode):
                 args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
 
                 try:
-                    children.append(self.invoke_tool_function(tu.name, args))
+                    children.append(self.invoke_tool_function(tu.name, args, tu.id))
                     invoke_exceptions.append(None)
                 except Exception as ex:
                     children.append(None)

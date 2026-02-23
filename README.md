@@ -523,7 +523,7 @@ This refined example shows:
     1. top-level task invocation; called by an app that is consuming the framework and a collection of `Function`s (the app or someone else may define these); access via `Runtime.get_ctx()`.
     2. python code for user-defined or framework-builtin `CodeFunction`s that invoke other `Function`s.
     3. when some framework component needs to handle agents doing tool calls, that component delegates invocation to the `RunContext`.
-    * e.g. they all use: `ctx.invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None) -> Node`
+    * e.g. they all use: `ctx.invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None) -> Node`
 * every `Function` invocation has a `RunContext` given to it, providing the interface, but also tracking the particular `Function` using it.
     * when a `Function` invokes another `Function` (including when framework handles `AgentFunction` invoking any `Function` via tool call), the `RunContext` knows its associated invoking `Node` (identity of the caller) and causes creation of the invoked `Node`.
         * this information is used to construct the directed edges relationships of the `Node` tree. A single top-level task invocation is the parent `Node` of a tree.
@@ -537,7 +537,8 @@ This refined example shows:
     * `object_bags: Dict[SessionScope, SessionBag]`: references to session bags accessible at different scopes.
     * `cancel_event: Optional[Event]`: cooperative cancellation token inherited from the caller unless explicitly overridden by the caller.
 * Methods:
-    * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None) -> Node`: invoke a `Function`, optionally overriding the cancellation scope, and return the created `Node`.
+    * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None) -> Node`: invoke a `Function`, optionally overriding the cancellation scope, and return the created `Node`.
+        * `tool_use_id` is primarily for provider/framework internals to correlate agent transcript tool-call entries with created child nodes. Typical top-level and `CodeFunction` call sites should leave it as `None`.
     * `post_status_update(state: NodeState)`: update the current node's status.
     * `post_success(outputs: Any)`: mark the current node as successful with given outputs.
     * `post_exception(exception: Exception)`: mark the current node as failed with given exception.
@@ -678,6 +679,14 @@ This refined example shows:
     * When collecting `Function` invocation results from `ctx.invoke(..).result()`, expect the possibility of an `Exception` being raised and always catch it.
         * Pass on a string representation of the `Exception`'s type and message (with details but never too verbose and never with stacktrace) back to the LLM in the regular follow-up tool cycle, and flag the fault if the provider's SDK has an explicit field for that. Some LLMs are fine-tuned to pay attention to the error flag but most will understand the `Exception` string properly anyway especially if the detail is present.
         * Includes `ValueError` for built-in argument type checking (LLM can respond by re-trying).
+    * For every model function call, the provider must keep one exact `tool_use_id` across all three artifacts it produces:
+        * `ToolUsePart.tool_use_id` in the transcript.
+        * `ToolResultPart.tool_use_id` in the transcript for that same tool call.
+        * The child `Node` created for that function call (pass the same id to `AgentNode.invoke_tool_function(...)`).
+    * `AgentNode.invoke_tool_function(...)` propagates the id to `RunContext.invoke(...)`; provider code must call it with the exact id from the function call (or the provider-synthesized id when the SDK omits one).
+    * Do not create function-call children with missing or mismatched `tool_use_id`.
+    * Do not reuse a `tool_use_id` among siblings under the same parent `AgentNode`.
+    * Violating these `tool_use_id` rules is provider malimplementation and can be treated as fatal.
     * Implement backoff-retry around SDK `Exception`s that are known to be transient only.
     * Intercept `RaiseException` calls and use `ctx.post_exception(e)` where `e` is an instance of `AgentException`. Then exit the run loop.
     * Allow any other unexpected `Exception` to bubble past `run()`. The supertype `AgentNode` will wrap it in a `ModelProviderException` with context.
@@ -701,6 +710,8 @@ This refined example shows:
   - `children: tuple[NodeView, ...]` — immutable ordered children
   - `usage: Optional[TokenUsage]` — deep-copied snapshot for agents
   - `transcript: tuple[TranscriptPart, ...]` — immutable transcript snapshot for agents (empty for `CodeNode`)
+  - `tool_use_id: Optional[str]` — set when this node was created from an agent tool call
+  - `transcript_child_map: Dict[int, NodeView]` — maps `id(part)` of `ToolUsePart`/`ToolResultPart` entries in `transcript` to the corresponding child `NodeView`
   - `update_seqnum: int` — global sequence when this view was produced
   - Plus core fields: `id`, `fn`, `inputs`, `state`, `outputs`, `exception`, `started_at`, `ended_at`
 
@@ -715,6 +726,7 @@ This refined example shows:
 
 - Immutability guarantees
   - `children` and `transcript` are tuples in the snapshot. Provider code appends immutable `TranscriptPart`s; `ToolUsePart.args` are stored as immutable mappings; `TokenUsage` is deep-copied at snapshot time.
+  - `transcript_child_map` keys are Python object ids of the exact `TranscriptPart` instances in `transcript`; values are the exact child `NodeView` objects in `children` for matching `tool_use_id`s.
 
 - Watching for updates
   - Use `node.watch(as_of_seq=prev_seq)` to block until a newer snapshot is available, then set `prev_seq = view.update_seqnum` for the next iteration.

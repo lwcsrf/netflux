@@ -352,6 +352,7 @@ class RunContext:
         args: Dict[str, Any],
         provider: Optional[Provider] = None,
         cancel_event: Optional[Event] = None,
+        tool_use_id: Optional[str] = None,
     ) -> 'Node':
         """
         Proxy to the Runtime to invoke a Function and create associated Node + edges.
@@ -363,6 +364,10 @@ class RunContext:
         When omitted, the Runtime inherits the caller's CancelEvent (if any). It is correct
         practice to make sure a custom `cancel_event` has cancelation criteria that includes
         that of the caller (downward cancelation propagation).
+
+        Provide `tool_use_id` to associate this invocation with a specific model tool call.
+        This is used to correlate AgentNode's transcript ToolUsePart/ToolResultPart
+        entries with child Nodes. When None, no tool_use_id is set on the child Node.
         """
         return self.runtime.invoke(
             self.node,
@@ -370,6 +375,7 @@ class RunContext:
             args,
             provider=provider,
             cancel_event=cancel_event,
+            tool_use_id=tool_use_id,
         )
 
     def post_status_update(self, state: 'NodeState') -> None:
@@ -444,6 +450,14 @@ class NodeView:
     started_at: Optional[float]
     ended_at: Optional[float]  # Any terminal state.
     update_seqnum: int  # Seqnum when this NodeView was generated.
+    tool_use_id: Optional[str] = None  # The tool_use_id that triggered this Node, if any.
+
+    # Maps id(TranscriptPart) -> child NodeView for ToolUsePart and ToolResultPart entries
+    # whose corresponding child exists in `children`. Keyed by Python object id of the exact
+    # TranscriptPart instances in `transcript`; values are the exact NodeView instances in
+    # `children`. Correlation is done via matching tool_use_id. Entries are absent when no
+    # child was created (e.g. invoke_tool_function threw) or not yet created (transient gap).
+    transcript_child_map: Mapping[int, 'NodeView'] = field(default_factory=dict)
 
 class Node(ABC):
     def __init__(
@@ -454,6 +468,7 @@ class Node(ABC):
         inputs: Dict[str, Any],
         parent: Optional['Node'],
         cancel_event: Optional[Event],
+        tool_use_id: Optional[str] = None,  # When created by an AgentNode's function invocation.
     ) -> None:
         self.ctx: RunContext = ctx
         self.id: int = id
@@ -469,6 +484,7 @@ class Node(ABC):
         self.cancel_event: Optional[Event] = cancel_event
         self.started_at: Optional[float] = None
         self.ended_at: Optional[float] = None
+        self.tool_use_id: Optional[str] = tool_use_id
 
         assert isinstance(ctx, RunContext)
         assert isinstance(fn, Function)
@@ -553,8 +569,9 @@ class CodeNode(Node):
         inputs: Dict[str, Any],
         parent: Optional[Node],
         cancel_event: Optional[Event],
+        tool_use_id: Optional[str] = None,
     ):
-        super().__init__(ctx, id, fn, inputs, parent, cancel_event)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, tool_use_id)
         assert isinstance(self.fn, CodeFunction)
 
     def run(self) -> None:
@@ -588,8 +605,9 @@ class AgentNode(Node):
         parent: Optional[Node],
         cancel_event: Optional[Event],
         client_factory: Callable[[], Any],
+        tool_use_id: Optional[str] = None,
     ) -> None:
-        super().__init__(ctx, id, fn, inputs, parent, cancel_event)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, tool_use_id)
         assert isinstance(fn, AgentFunction), "AgentNode must wrap an AgentFunction"
         self.agent_fn: AgentFunction = fn
         self.transcript: List[TranscriptPart] = []
@@ -642,14 +660,14 @@ class AgentNode(Node):
         return self.agent_fn.user_prompt_template.format(**self.inputs)
 
     def invoke_tool_function(
-        self, tool_name: str, tool_args: Dict[str, Any],
+        self, tool_name: str, tool_args: Dict[str, Any], tool_use_id: str,
     ) -> Node:
         if tool_name not in self.func_map:
             raise RuntimeError(
                 f"Invoking unknown tool: '{tool_name}'. Tools available: {self.func_map.keys()}")
         fn: Function = self.func_map[tool_name]
 
-        return self.ctx.invoke(fn, tool_args)
+        return self.ctx.invoke(fn, tool_args, tool_use_id=tool_use_id)
 
     @staticmethod
     def stringify_exception(ex: Exception) -> str:

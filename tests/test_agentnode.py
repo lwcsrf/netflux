@@ -24,8 +24,9 @@ class _FakeAgentNode(AgentNode):
         parent=None,
         cancel_event=None,
         client_factory=None,
+        tool_use_id=None,
     ) -> None:
-        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
+        super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory, tool_use_id)
 
     @property
     def token_usage(self) -> TokenUsage:
@@ -102,7 +103,7 @@ class TestAgentNodeUtilities(unittest.TestCase):
         agent = _FakeAgentNode(ctx, 1, agent_fn, {}, parent=None, client_factory=lambda: None)
 
         with self.assertRaises(RuntimeError) as cm:
-            agent.invoke_tool_function("y", {})
+            agent.invoke_tool_function("y", {}, "test-tool-use-id")
 
         msg = str(cm.exception)
         self.assertIn("unknown tool: 'y".lower(), msg.lower())
