@@ -2,6 +2,7 @@ from dataclasses import dataclass, replace
 import copy
 import logging
 import time
+from types import MappingProxyType
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Union
 import multiprocessing as mp
 from multiprocessing import Lock
@@ -24,6 +25,8 @@ from .core import (
     SessionBag,
     CancellationException,
     TokenUsage,
+    ToolUsePart,
+    ToolResultPart,
 )
 from .providers import Provider, get_AgentNode_impl
 
@@ -117,6 +120,7 @@ class Runtime:
         inputs: Dict[str, Any],
         provider: Optional[Provider] = None,
         cancel_event: Optional[Event] = None,
+        tool_use_id: Optional[str] = None,
     ) -> Node:
         """
         Create and start a Node for `fn` with `inputs`, recording parent/child relationships.
@@ -127,6 +131,9 @@ class Runtime:
         is inherited automatically. This enables cooperative cancellation chaining,
         where the caller being canceled also cancels its children, but children can have
         further customized cancellation scope (e.g. timeouts).
+
+        If `tool_use_id` is provided, it is stored on the created Node to correlate it
+        with the AgentNode function call that triggered the invocation.
         """
         # Ensure the function is registered.
         reg_fn = self._fn_by_name.get(fn.name)
@@ -156,7 +163,7 @@ class Runtime:
         if isinstance(fn, CodeFunction):
             if provider is not None:
                 raise ValueError(f"Provider override is only valid for AgentFunction; invoking CodeFunction '{fn.name}'.")
-            node = CodeNode(ctx, node_id, fn, inputs, caller, cancel_event)
+            node = CodeNode(ctx, node_id, fn, inputs, caller, cancel_event, tool_use_id)
 
         elif isinstance(fn, AgentFunction):
             provider = provider or fn.default_model
@@ -169,7 +176,7 @@ class Runtime:
                     f"No client factory registered for provider '{provider.value}'. "
                     "Update Runtime(client_factories=...) to include this provider."
                 )
-            node = impl(ctx, node_id, fn, inputs, caller, cancel_event, factory)
+            node = impl(ctx, node_id, fn, inputs, caller, cancel_event, factory, tool_use_id)
         else:
             raise TypeError(f"Unknown Function subtype: {type(fn).__name__}")
 
@@ -243,6 +250,22 @@ class Runtime:
             usage = copy.deepcopy(node.token_usage)
             transcript = tuple(node.transcript)
 
+        # Build transcript_child_map: correlate ToolUsePart/ToolResultPart -> child NodeView
+        # via tool_use_id matching. Only populated for `AgentNode`s with transcripts.
+        transcript_child_map: Dict[int, NodeView] = {}
+        if transcript:
+            child_by_tuid: Dict[str, NodeView] = {}
+            for cv in child_views:
+                if cv.tool_use_id is not None:
+                    if cv.tool_use_id in child_by_tuid:
+                        self._fatal(f"Duplicate tool_use_id {cv.tool_use_id!r} found among children of node {node.id}")
+                    child_by_tuid[cv.tool_use_id] = cv
+            for part in transcript:
+                if isinstance(part, (ToolUsePart, ToolResultPart)):
+                    cv = child_by_tuid.get(part.tool_use_id)
+                    if cv is not None:
+                        transcript_child_map[id(part)] = cv
+
         return NodeView(
             id=node.id,
             fn=node.fn,
@@ -256,6 +279,8 @@ class Runtime:
             started_at=node.started_at,
             ended_at=node.ended_at,
             update_seqnum=self._global_seqno,
+            tool_use_id=node.tool_use_id,
+            transcript_child_map=MappingProxyType(transcript_child_map),
         )
 
     def _publish_viewtree_update(self, origin: Node) -> None:
@@ -291,17 +316,32 @@ class Runtime:
             # Recompute children views from observables, enumerating
             # the live children list (safe under Runtime lock).
             child_views: List[NodeView] = []
+            cv_by_tuid: Dict[str, NodeView] = {}
             for child in current.children:
                 child_obs = self._node_observables.get(child.id)
                 if child_obs is None:
                     self._fatal(
                         f"Ancestor node {current.id} missing observable for child {child.id}"
                     )
-                child_views.append(child_obs.view)
+                cv: NodeView = child_obs.view
+                child_views.append(cv)
+                if cv.tool_use_id is not None:
+                    if cv.tool_use_id in cv_by_tuid:
+                        self._fatal(f"Duplicate tool_use_id {cv.tool_use_id!r} found among children of node {current.id}")
+                    cv_by_tuid[cv.tool_use_id] = cv
 
-            # Build a new NodeView, reusing prev fields except children/update_seqnum.
-            # Ancestor Node threads need Runtime lock (we hold) to touch children. So this is safe.            
-            obs.view = replace(prev, children=tuple(child_views), update_seqnum=seq)
+            # Build a new NodeView, reusing prev fields except children, update_seqnum
+            # and transcript_child_map (which references child views that may have changed).
+            # Ancestor Node threads need Runtime lock (we hold) to touch children. So this is safe.
+            new_tc_map: Dict[int, NodeView] = {}
+            if prev.transcript:
+                for part in prev.transcript:
+                    if isinstance(part, (ToolUsePart, ToolResultPart)):
+                        cv = cv_by_tuid.get(part.tool_use_id)
+                        if cv is not None:
+                            new_tc_map[id(part)] = cv
+            obs.view = replace(prev, children=tuple(child_views), update_seqnum=seq,
+                               transcript_child_map=MappingProxyType(new_tc_map))
             obs.touch_seqno = seq
             obs.cond.notify_all()
 

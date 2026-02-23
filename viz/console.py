@@ -141,6 +141,18 @@ class ConsoleRender(Render[str]):
     - The output is a full frame (no cursor control). The caller typically
       clears the screen in their `ui_driver` before writing the frame.
 
+    Transcript ↔ children correlation:
+    - The renderer walks `NodeView.transcript` sequentially. For each
+      `ToolUsePart`, it looks up `NodeView.transcript_child_map` (keyed by
+      `id(part)`) to find the corresponding child `NodeView`. If found, the
+      child subtree is rendered inline; if absent (any kind of function invocation
+      failure, transient gap, or AgentException), the tool use is silently skipped.
+    - `ThinkingBlockPart` entries are rendered inline in transcript order,
+      naturally interleaved with child nodes.
+    - No positional or ordinal assumptions are made between transcript entries
+      and children; correlation is entirely via `tool_use_id` matching done
+      by the framework when building `NodeView`.
+
     Intended usage for a terminal UI:
     - Call `ConsoleRender.pre_console()` before starting the view loop.
     - Start the loop with `ui_driver=ConsoleRender.ui_driver`.
@@ -184,28 +196,6 @@ class ConsoleRender(Render[str]):
                 if content_display:
                     return f"{THOUGHT_GLYPH} thought: {content_display}"
                 return f"{THOUGHT_GLYPH} thought"
-
-            # Precompute thinking slots relative to tool uses for this node.
-            thinking_slots = {}
-            if nv.transcript:
-                tool_uses_seen = 0
-                for part in nv.transcript:
-                    if isinstance(part, ThinkingBlockPart):
-                        thinking_slots.setdefault(tool_uses_seen, []).append(part)
-                    elif isinstance(part, ToolUsePart):
-                        tool_uses_seen += 1
-
-            def emit_thinking(slot_index: int) -> None:
-                if not thinking_slots:
-                    return
-                parts = thinking_slots.get(slot_index)
-                if not parts:
-                    return
-                detail_prefix = prefix + ("   " if is_last else "│  ")
-                for tb in parts:
-                    msg = format_thinking(tb)
-                    if msg:
-                        lines.append(detail_prefix + f"{VERT_GLYPH}    " + _color(msg, dim=True))
 
             glyph, color = _state_glyph(nv.state, tick)
             # If cancellation is pending, visually mark non-terminal states distinctly
@@ -282,15 +272,49 @@ class ConsoleRender(Render[str]):
 
             # Thinking blocks associated with this node appear as their own lines
             # under the node header (and any usage line), aligned with tree rails.
-            emit_thinking(0)
-
+            # Then walk transcript sequentially, rendering thinking blocks and child
+            # nodes as they appear. Each ToolUsePart is looked up in transcript_child_map;
+            # if a child exists it is rendered, otherwise it is silently skipped (invoke
+            # failure, transient gap, or AgentException with no child).
             child_prefix = prefix + ("   " if is_last else "│  ")
-            count = len(nv.children)
-            for idx, child in enumerate(nv.children):
-                has_trailing_thought = bool(thinking_slots.get(idx + 1))
-                is_last_child = (idx == count - 1) and not has_trailing_thought
-                add_node(child, child_prefix, is_last_child)
-                emit_thinking(idx + 1)
+
+            if nv.transcript:
+                # Collect all items to render: thinking blocks and child NodeViews,
+                # in transcript order.
+                render_items: List[object] = []  # ThinkingBlockPart | NodeView
+                for part in nv.transcript:
+                    if isinstance(part, ThinkingBlockPart):
+                        render_items.append(part)
+                    elif isinstance(part, ToolUsePart):
+                        child_view = nv.transcript_child_map.get(id(part))
+                        if child_view is not None:
+                            render_items.append(child_view)
+
+                # Determine last renderable child for tree connector logic.
+                last_child_idx = -1
+                for ri_idx, item in enumerate(render_items):
+                    if isinstance(item, NodeView):
+                        last_child_idx = ri_idx
+
+                for ri_idx, item in enumerate(render_items):
+                    if isinstance(item, ThinkingBlockPart):
+                        detail_prefix = prefix + ("   " if is_last else "│  ")
+                        msg = format_thinking(item)
+                        if msg:
+                            lines.append(detail_prefix + f"{VERT_GLYPH}    " + _color(msg, dim=True))
+                    elif isinstance(item, NodeView):
+                        is_last_child = (ri_idx == last_child_idx)
+                        # Check if there are trailing thinking blocks after this child
+                        has_trailing = any(
+                            isinstance(render_items[j], ThinkingBlockPart)
+                            for j in range(ri_idx + 1, len(render_items))
+                        )
+                        add_node(item, child_prefix, is_last_child and not has_trailing)
+            else:
+                # Non-agent nodes (CodeNodes) have no transcript; render children directly.
+                count = len(nv.children)
+                for idx, child in enumerate(nv.children):
+                    add_node(child, child_prefix, idx == count - 1)
 
         add_node(self._last_view, prefix="", is_last=True)
 

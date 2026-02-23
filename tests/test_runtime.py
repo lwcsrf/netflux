@@ -205,8 +205,9 @@ class TestRuntimeInvocation(unittest.TestCase):
                 parent: Optional[Node],
                 cancel_event=None,
                 client_factory=None,
+                tool_use_id=None,
             ) -> None:
-                super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory)
+                super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory, tool_use_id)
                 type(self).last_client = None
 
             def run(self) -> None:
@@ -513,6 +514,8 @@ class TestRuntimeStateTransitions(unittest.TestCase):
 
         parent_view_before = runtime.get_view(parent.id)
         child_view_before = runtime.get_view(child.id)
+        with self.assertRaises(TypeError):
+            child_view_before.transcript_child_map[0] = child_view_before
 
         with runtime._lock:
             runtime._global_seqno += 1
@@ -526,6 +529,8 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         self.assertIsInstance(child_in_parent, NodeView)
         self.assertEqual(child_in_parent.state, NodeState.Running)
         self.assertGreater(child_in_parent.update_seqnum, child_view_before.update_seqnum)
+        with self.assertRaises(TypeError):
+            parent_view_after.transcript_child_map[0] = child_in_parent
 
 
 class TestRuntimeWatchTimeout(unittest.TestCase):
