@@ -33,7 +33,7 @@ source .venv/bin/activate
 # Install the library in "editable" mode (`-e`), meaning your source code changes
 # are immediately reflected. It also installs the `test` and `all` dependency groups,
 # which include `pytest` and all the provider SDKs (Anthropic, Gemini, etc).
-pip install -e .[test,all]
+pip install -e ".[test,all]"
 
 # Run all tests.
 pytest tests/ -v
