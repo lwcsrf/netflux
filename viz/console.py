@@ -31,13 +31,11 @@ import threading
 import time
 import tty
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from multiprocessing.synchronize import Event
+from typing import Any
 
 from ..core import Function, NodeState, NodeView, ThinkingBlockPart, ToolUsePart
 from .viz import Render
-
-if TYPE_CHECKING:
-    from multiprocessing.synchronize import Event
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ANSI Constants
