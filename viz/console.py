@@ -29,9 +29,10 @@ import shutil
 import sys
 import threading
 import time
+import ctypes
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
-from typing import Any
+from typing import Any, Iterator
 
 from ..core import (
     Function,
@@ -94,13 +95,68 @@ RAIL = "│  "
 BLANK = "   "
 
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+_MOUSE_SCROLL_ROWS = 5
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Helper Functions
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-_RE_ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
-_RE_TRAILING_CSI = re.compile(r"\x1b\[[0-9;?]*$")
+# ANSI CSI grammar:
+#   parameter bytes   0x30-0x3F  => [0-?]
+#   intermediate      0x20-0x2F  => [ -/]
+#   final byte        0x40-0x7E  => [@-~]
+_RE_COMPLETE_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_RE_TRAILING_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*$")
+
+_WIN_STD_OUTPUT_HANDLE = -11
+_WIN_STD_INPUT_HANDLE = -10
+_WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_WIN_ENABLE_EXTENDED_FLAGS = 0x0080
+_WIN_ENABLE_QUICK_EDIT_MODE = 0x0040
+_WIN_ENABLE_MOUSE_INPUT = 0x0010
+_WIN_KEY_EVENT = 0x0001
+_WIN_MOUSE_EVENT = 0x0002
+_WIN_DOUBLE_CLICK = 0x0002
+_WIN_MOUSE_WHEELED = 0x0004
+_WIN_FROM_LEFT_1ST_BUTTON_PRESSED = 0x0001
+_WIN_RIGHTMOST_BUTTON_PRESSED = 0x0002
+_WIN_FROM_LEFT_2ND_BUTTON_PRESSED = 0x0004
+
+
+class _WinCoord(ctypes.Structure):
+    _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
+
+
+class _WinKeyEventRecord(ctypes.Structure):
+    _fields_ = [
+        ("bKeyDown", ctypes.c_int),
+        ("wRepeatCount", ctypes.c_ushort),
+        ("wVirtualKeyCode", ctypes.c_ushort),
+        ("wVirtualScanCode", ctypes.c_ushort),
+        ("uChar", ctypes.c_wchar),
+        ("dwControlKeyState", ctypes.c_uint),
+    ]
+
+
+class _WinMouseEventRecord(ctypes.Structure):
+    _fields_ = [
+        ("dwMousePosition", _WinCoord),
+        ("dwButtonState", ctypes.c_uint),
+        ("dwControlKeyState", ctypes.c_uint),
+        ("dwEventFlags", ctypes.c_uint),
+    ]
+
+
+class _WinEventUnion(ctypes.Union):
+    _fields_ = [
+        ("KeyEvent", _WinKeyEventRecord),
+        ("MouseEvent", _WinMouseEventRecord),
+        ("_padding", ctypes.c_byte * 16),
+    ]
+
+
+class _WinInputRecord(ctypes.Structure):
+    _fields_ = [("EventType", ctypes.c_ushort), ("Event", _WinEventUnion)]
 
 
 def _color(
@@ -230,24 +286,56 @@ def _format_elapsed(nv: NodeView) -> str | None:
     return f" [{body}]"
 
 
-def _crop_line(line: str, max_cols: int) -> str:
-    """Crop a line to *max_cols* visible characters, ANSI-safe."""
-    if _visible_len(line) <= max_cols:
-        return line
+def _skip_csi_sequence(s: str, start: int) -> int:
+    """Return the index after a CSI sequence starting at *start*, or *start* if none."""
+    match = _RE_COMPLETE_CSI.match(s, start)
+    if match is None:
+        match = _RE_TRAILING_CSI.match(s, start)
+        if match is None:
+            return start
+    return match.end()
+
+
+def _iter_visible_chars(s: str) -> Iterator[tuple[int, int, str]]:
+    """Yield (visible_column, slice_end, char) for each non-ANSI character in *s*."""
     visible = 0
     i = 0
-    n = len(line)
+    n = len(s)
+    while i < n:
+        next_i = _skip_csi_sequence(s, i)
+        if next_i != i:
+            i = next_i
+            continue
+        yield visible, i + 1, s[i]
+        visible += 1
+        i += 1
+
+
+def _visible_prefix_end(s: str, max_cols: int) -> int:
+    """Return the string index that spans *max_cols* visible characters."""
+    visible = 0
+    i = 0
+    n = len(s)
     while i < n and visible < max_cols:
-        if line[i] == "\x1b" and (i + 1) < n and line[i + 1] == "[":
-            # Skip full ANSI CSI sequence: ESC [ <params> <letter>
-            j = i + 2
-            while j < n and not line[j].isalpha():
-                j += 1
-            i = min(j + 1, n)
-        else:
-            visible += 1
-            i += 1
-    chunk = line[:i]
+        next_i = _skip_csi_sequence(s, i)
+        if next_i != i:
+            i = next_i
+            continue
+        visible += 1
+        i += 1
+    return i
+
+
+def _needs_crop(line: str, max_cols: int) -> bool:
+    """Return whether cropping should run, preserving legacy handling of malformed CSI."""
+    return len(_RE_COMPLETE_CSI.sub("", line)) > max_cols
+
+
+def _crop_line(line: str, max_cols: int) -> str:
+    """Crop a line to *max_cols* visible characters, ANSI-safe."""
+    if not _needs_crop(line, max_cols):
+        return line
+    chunk = line[:_visible_prefix_end(line, max_cols)]
     chunk = _RE_TRAILING_CSI.sub("", chunk)
     chunk = chunk.removesuffix("\x1b")
     return chunk + RESET
@@ -255,7 +343,15 @@ def _crop_line(line: str, max_cols: int) -> str:
 
 def _visible_len(s: str) -> int:
     """Length of string excluding ANSI escape sequences."""
-    return len(_RE_ANSI_ESCAPE.sub("", s))
+    return sum(1 for _ in _iter_visible_chars(s))
+
+
+def _visible_index_of_any(s: str, targets: set[str]) -> int | None:
+    """Return the visible-column index of the first matching glyph in *s*."""
+    for visible, _, ch in _iter_visible_chars(s):
+        if ch in targets:
+            return visible
+    return None
 
 
 def _highlight_line(line: str, width: int) -> str:
@@ -281,6 +377,7 @@ class LineInfo:
     default_collapsed: bool = False
     is_node_header: bool = False
     is_agent_header: bool = False
+    toggle_col: int | None = None
     anchors: tuple[str, ...] = ()
 
 
@@ -290,6 +387,13 @@ class NodeRange:
     end: int
     key: str
     is_agent: bool
+
+
+@dataclass(frozen=True)
+class MouseEvent:
+    x: int
+    y: int
+    button: str
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -517,6 +621,42 @@ class ConsoleRender:
     def _navigate(self, new_cursor: int) -> None:
         self._set_cursor(new_cursor, disable_follow=True)
 
+    def _toggle_line_locked(self, line_idx: int) -> bool:
+        if not (0 <= line_idx < len(self._line_infos)):
+            return False
+        info = self._line_infos[line_idx]
+        if not info.expandable or info.key is None:
+            return False
+        current = self._is_collapsed(info.key, info.default_collapsed)
+        self._collapse_overrides[info.key] = not current
+        self._remember_selection()
+        self._signal_redraw_locked()
+        return True
+
+    def handle_click(self, x: int, y: int, *, button: str = "left") -> None:
+        with self._lock:
+            if button == "wheel_up":
+                self._navigate(self._cursor - _MOUSE_SCROLL_ROWS)
+                return
+            if button == "wheel_down":
+                self._navigate(self._cursor + _MOUSE_SCROLL_ROWS)
+                return
+            if button != "left":
+                return
+            if y < 0 or y >= self._tree_rows:
+                return
+            line_idx = self._scroll_offset + y
+            if not (0 <= line_idx < len(self._line_infos)):
+                return
+
+            self._set_cursor(line_idx, disable_follow=True)
+
+            info = self._line_infos[line_idx]
+            if info.toggle_col is None:
+                return
+            if x == info.toggle_col:
+                self._toggle_line_locked(line_idx)
+
     def navigate_up(self) -> None:
         with self._lock:
             self._navigate(self._cursor - 1)
@@ -617,12 +757,7 @@ class ConsoleRender:
             if not (0 <= self._cursor < len(self._line_infos)):
                 return
 
-            info = self._line_infos[self._cursor]
-            if info.expandable and info.key is not None:
-                current = self._is_collapsed(info.key, info.default_collapsed)
-                self._collapse_overrides[info.key] = not current
-                self._remember_selection()
-                self._signal_redraw_locked()
+            if self._toggle_line_locked(self._cursor):
                 return
 
             for i in range(self._cursor - 1, -1, -1):
@@ -838,6 +973,7 @@ class ConsoleRender:
                 default_collapsed=default_collapsed,
                 is_node_header=True,
                 is_agent_header=is_agent,
+                toggle_col=_visible_index_of_any(line_text, {FOLD, UNFOLD}),
                 anchors=anchors,
             )
         )
@@ -1123,6 +1259,7 @@ class ConsoleRender:
                 key=key,
                 expandable=True,
                 default_collapsed=True,
+                toggle_col=_visible_index_of_any(label, {FOLD, UNFOLD}),
                 anchors=(key,),
             )
         )
@@ -1166,6 +1303,7 @@ class ConsoleRender:
                 key=key,
                 expandable=True,
                 default_collapsed=True,
+                toggle_col=_visible_index_of_any(line, {FOLD, UNFOLD}),
                 anchors=(key,),
             )
         )
@@ -1217,12 +1355,14 @@ class ConsoleRender:
             result_preview = f" {_color('=>', dim=True)} {_short_repr(result_part.outputs, 60)}"
 
         header = f"{indicator} {FUNCTION_GLYPH} {function_name} [{status}]{suffix}{result_preview}"
-        lines.append(f"{detail_prefix}{_color(header, fg=status_fg)}")
+        line = f"{detail_prefix}{_color(header, fg=status_fg)}"
+        lines.append(line)
         infos.append(
             LineInfo(
                 key=key,
                 expandable=True,
                 default_collapsed=True,
+                toggle_col=_visible_index_of_any(line, {FOLD, UNFOLD}),
                 anchors=(key,),
             )
         )
@@ -1575,12 +1715,14 @@ class ConsoleRender:
                 preview_part = f": {preview}" if preview else ""
             text = f"{indicator} {THINKING} thinking{preview_part}{char_info}"
 
-        lines.append(f"{detail_prefix}{_color(text, dim=True)}")
+        line = f"{detail_prefix}{_color(text, dim=True)}"
+        lines.append(line)
         infos.append(
             LineInfo(
                 key=key,
                 expandable=True,
                 default_collapsed=True,
+                toggle_col=_visible_index_of_any(line, {FOLD, UNFOLD}),
                 anchors=(key,),
             )
         )
@@ -1859,15 +2001,15 @@ class ConsoleRender:
     def _interactive_loop_windows(self, view_thread: threading.Thread) -> None:
         while view_thread.is_alive():
             try:
-                key = _read_key_windows(timeout=0.1)
+                event = _read_key_windows(timeout=0.1)
             except KeyboardInterrupt:
                 if self._cancel_event is not None and not self._sigint_handler_installed:
                     self._request_cancel()
                     continue
                 raise
-            if key is None:
+            if event is None:
                 continue
-            _handle_key(key, self, allow_quit=False)
+            _handle_input_event(event, self, allow_quit=False)
         if self._exit_after_terminal:
             return
         self._browse_until_quit_windows()
@@ -1883,15 +2025,15 @@ class ConsoleRender:
             tty.setcbreak(fd)
             while view_thread.is_alive():
                 try:
-                    key = _read_key(fd, timeout=0.1)
+                    event = _read_key(fd, timeout=0.1)
                 except KeyboardInterrupt:
                     if self._cancel_event is not None and not self._sigint_handler_installed:
                         self._request_cancel()
                         continue
                     raise
-                if key is None:
+                if event is None:
                     continue
-                _handle_key(key, self, allow_quit=False)
+                _handle_input_event(event, self, allow_quit=False)
         finally:
             termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -1904,11 +2046,11 @@ class ConsoleRender:
         last_size = _terminal_size_token()
         while True:
             try:
-                key = _read_key_windows(timeout=0.1)
+                event = _read_key_windows(timeout=0.1)
             except KeyboardInterrupt:
                 return
-            if key is not None:
-                should_exit = _handle_key(key, self, allow_quit=True)
+            if event is not None:
+                should_exit = _handle_input_event(event, self, allow_quit=True)
                 self._ui_driver(self.render(None))
                 last_size = _terminal_size_token()
                 if should_exit:
@@ -1931,11 +2073,11 @@ class ConsoleRender:
             tty.setcbreak(fd)
             while True:
                 try:
-                    key = _read_key(fd, timeout=0.1)
+                    event = _read_key(fd, timeout=0.1)
                 except KeyboardInterrupt:
                     return
-                if key is not None:
-                    should_exit = _handle_key(key, self, allow_quit=True)
+                if event is not None:
+                    should_exit = _handle_input_event(event, self, allow_quit=True)
                     self._ui_driver(self.render(None))
                     last_size = _terminal_size_token()
                     if should_exit:
@@ -1959,7 +2101,11 @@ class ConsoleRender:
             if ConsoleRender._console_ready:
                 return
             _enable_vt_if_windows()
-            sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J")
+            _configure_windows_console_input(enable_mouse=True)
+            sys.stdout.write(
+                "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J"
+                "\x1b[?1000h\x1b[?1006h"
+            )
             sys.stdout.flush()
             ConsoleRender._console_ready = True
 
@@ -1971,7 +2117,8 @@ class ConsoleRender:
         with ConsoleRender._console_lock:
             if not ConsoleRender._console_ready:
                 return
-            sys.stdout.write("\x1b[?25h\x1b[?7h\x1b[?1049l")
+            _configure_windows_console_input(enable_mouse=False)
+            sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?7h\x1b[?1049l")
             sys.stdout.flush()
             ConsoleRender._console_ready = False
 
@@ -1994,24 +2141,49 @@ def _terminal_size_token() -> tuple[int, int]:
 def _enable_vt_if_windows() -> None:
     if os.name != "nt":
         return
-    import ctypes
 
     kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    STD_OUTPUT_HANDLE = -11
-    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-    handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+    handle = kernel32.GetStdHandle(_WIN_STD_OUTPUT_HANDLE)
     mode = ctypes.c_uint()
     if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-        kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+        kernel32.SetConsoleMode(handle, mode.value | _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+
+
+_WINDOWS_INPUT_MODE_SAVED: int | None = None
+
+
+def _configure_windows_console_input(*, enable_mouse: bool) -> None:
+    global _WINDOWS_INPUT_MODE_SAVED
+
+    if os.name != "nt":
+        return
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
+    mode = ctypes.c_uint()
+    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return
+
+    if enable_mouse:
+        if _WINDOWS_INPUT_MODE_SAVED is None:
+            _WINDOWS_INPUT_MODE_SAVED = mode.value
+        new_mode = mode.value | _WIN_ENABLE_EXTENDED_FLAGS | _WIN_ENABLE_MOUSE_INPUT
+        new_mode &= ~_WIN_ENABLE_QUICK_EDIT_MODE
+        kernel32.SetConsoleMode(handle, new_mode)
+        return
+
+    if _WINDOWS_INPUT_MODE_SAVED is not None:
+        kernel32.SetConsoleMode(handle, _WINDOWS_INPUT_MODE_SAVED)
+        _WINDOWS_INPUT_MODE_SAVED = None
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Keyboard Input
+# Keyboard / Mouse Input
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-def _read_key(fd: int, timeout: float = 0.1) -> str | None:
-    """Read a keypress from *fd*, handling escape sequences."""
+def _read_key(fd: int, timeout: float = 0.1) -> str | MouseEvent | None:
+    """Read a keypress or mouse event from *fd*."""
     if select is None:
         return None
     try:
@@ -2028,61 +2200,121 @@ def _read_key(fd: int, timeout: float = 0.1) -> str | None:
     ch = raw.decode("utf-8", errors="ignore")
 
     if ch == "\x1b":
-        # Possible escape sequence: ESC [ <code>
-        try:
-            r2, _, _ = select.select([fd], [], [], 0.05)
-        except (InterruptedError, OSError):
-            return "escape"
-        if not r2:
-            return "escape"
-        ch2 = os.read(fd, 1).decode("utf-8", errors="ignore")
-        if ch2 != "[":
-            return None
-        try:
-            r3, _, _ = select.select([fd], [], [], 0.05)
-        except (InterruptedError, OSError):
-            return None
-        if not r3:
-            return None
-        ch3 = os.read(fd, 1).decode("utf-8", errors="ignore")
-        if ch3 == "A":
-            return "up"
-        if ch3 == "B":
-            return "down"
-        if ch3 in ("5", "6"):
-            # Page Up/Down: ESC [ 5~ / ESC [ 6~
+        seq = ""
+        while True:
             try:
-                r4, _, _ = select.select([fd], [], [], 0.05)
-                if r4:
-                    os.read(fd, 1)  # consume '~'
+                ready, _, _ = select.select([fd], [], [], 0.05)
             except (InterruptedError, OSError):
-                pass
-            return "page_up" if ch3 == "5" else "page_down"
+                return "escape" if not seq else None
+            if not ready:
+                return "escape" if not seq else None
+            piece = os.read(fd, 1).decode("utf-8", errors="ignore")
+            if not piece:
+                return "escape" if not seq else None
+            seq += piece
+            if piece.isalpha() or piece in ("~", "m"):
+                break
+
+        if seq == "[A":
+            return "up"
+        if seq == "[B":
+            return "down"
+        if seq == "[5~":
+            return "page_up"
+        if seq == "[6~":
+            return "page_down"
+        if seq.startswith("[<") and seq[-1] in ("M", "m"):
+            try:
+                cb_s, cx_s, cy_s = seq[2:-1].split(";")
+                cb = int(cb_s)
+                cx = int(cx_s)
+                cy = int(cy_s)
+            except (TypeError, ValueError):
+                return None
+            x = max(0, cx - 1)
+            y = max(0, cy - 1)
+            if cb & 64:
+                if cb & 1:
+                    return MouseEvent(x=x, y=y, button="wheel_down")
+                return MouseEvent(x=x, y=y, button="wheel_up")
+            if seq[-1] == "m" or (cb & 32):
+                return None
+            button_code = cb & 3
+            if button_code == 0:
+                return MouseEvent(x=x, y=y, button="left")
+            if button_code == 1:
+                return MouseEvent(x=x, y=y, button="middle")
+            if button_code == 2:
+                return MouseEvent(x=x, y=y, button="right")
         return None
 
     return ch
 
 
-def _read_key_windows(timeout: float = 0.1) -> str | None:
-    import msvcrt
+def _decode_windows_mouse_event(event: _WinMouseEventRecord) -> MouseEvent | None:
+    x = max(0, int(event.dwMousePosition.X))
+    y = max(0, int(event.dwMousePosition.Y))
+    if event.dwEventFlags == _WIN_MOUSE_WHEELED:
+        delta = ctypes.c_short((event.dwButtonState >> 16) & 0xFFFF).value
+        return MouseEvent(
+            x=x,
+            y=y,
+            button="wheel_up" if delta > 0 else "wheel_down",
+        )
+    # Ignore distinct double-click events; the initial press is already reported.
+    if event.dwEventFlags != 0:
+        return None
+    if event.dwButtonState & _WIN_FROM_LEFT_1ST_BUTTON_PRESSED:
+        return MouseEvent(x=x, y=y, button="left")
+    if event.dwButtonState & _WIN_RIGHTMOST_BUTTON_PRESSED:
+        return MouseEvent(x=x, y=y, button="right")
+    if event.dwButtonState & _WIN_FROM_LEFT_2ND_BUTTON_PRESSED:
+        return MouseEvent(x=x, y=y, button="middle")
+    return None
 
+
+def _read_key_windows(timeout: float = 0.1) -> str | MouseEvent | None:
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if msvcrt.kbhit():
-            ch = msvcrt.getwch()
-            if ch == "\x03":
+        record = _WinInputRecord()
+        count = ctypes.c_uint()
+        if not kernel32.PeekConsoleInputW(handle, ctypes.byref(record), 1, ctypes.byref(count)):
+            time.sleep(0.01)
+            continue
+        if count.value == 0:
+            time.sleep(0.01)
+            continue
+        if not kernel32.ReadConsoleInputW(handle, ctypes.byref(record), 1, ctypes.byref(count)):
+            time.sleep(0.01)
+            continue
+        if record.EventType == _WIN_KEY_EVENT:
+            event = record.Event.KeyEvent
+            if not event.bKeyDown:
+                continue
+            if event.uChar == "\x03":
                 raise KeyboardInterrupt
-            if ch in ("\x00", "\xe0"):
-                special = msvcrt.getwch()
-                return {
-                    "H": "up",
-                    "P": "down",
-                    "I": "page_up",
-                    "Q": "page_down",
-                }.get(special)
-            if ch == "\x1b":
+            vk = event.wVirtualKeyCode
+            if vk == 0x26:
+                return "up"
+            if vk == 0x28:
+                return "down"
+            if vk == 0x21:
+                return "page_up"
+            if vk == 0x22:
+                return "page_down"
+            if vk == 0x1B:
                 return "escape"
-            return ch
+            if vk == 0x0D:
+                return "\r"
+            if event.uChar not in ("", "\x00"):
+                return event.uChar
+            continue
+        if record.EventType == _WIN_MOUSE_EVENT:
+            decoded = _decode_windows_mouse_event(record.Event.MouseEvent)
+            if decoded is not None:
+                return decoded
         time.sleep(0.01)
     return None
 
@@ -2115,6 +2347,18 @@ def _handle_key(key: str, renderer: ConsoleRender, *, allow_quit: bool) -> bool:
         return allow_quit and key in _KEY_BINDINGS
     getattr(renderer, action)()
     return False
+
+
+def _handle_input_event(
+    event: str | MouseEvent,
+    renderer: ConsoleRender,
+    *,
+    allow_quit: bool,
+) -> bool:
+    if isinstance(event, MouseEvent):
+        renderer.handle_click(event.x, event.y, button=event.button)
+        return False
+    return _handle_key(event, renderer, allow_quit=allow_quit)
 
 
 def keyboard_loop(
