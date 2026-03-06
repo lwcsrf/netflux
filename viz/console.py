@@ -2,7 +2,7 @@
 
 An interactive renderer supporting:
 - Collapsible/expandable agent nodes (whole subagent sessions)
-- Collapsible/expandable thinking blocks and tool details
+- Collapsible/expandable thinking blocks and function details
 - Keyboard navigation with cursor and viewport scrolling
 - Status bar with shortcuts and execution state
 
@@ -10,12 +10,13 @@ Keyboard controls during live execution:
     j / ↓       Move cursor down
     k / ↑       Move cursor up
     Space       Toggle expand/collapse (or collapse enclosing block)
+    n / N       Next / previous visible agent
     g           Go to top of enclosing node
     G           Go to bottom of enclosing node
     PgUp/PgDn   Scroll by page
-    Ctrl+C      Cancel execution (via SIGINT handler)
+    Ctrl+C      Cancel execution (sets `cancel_event` when provided)
 
-Additional controls in post-completion browser (/tree):
+Additional controls in post-completion browser:
     q / Esc     Exit browser
 """
 
@@ -23,19 +24,34 @@ from __future__ import annotations
 
 import os
 import re
-import select
+import signal
 import shutil
 import sys
-import termios
 import threading
 import time
-import tty
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
 from typing import Any
 
-from ..core import Function, NodeState, NodeView, ThinkingBlockPart, ToolUsePart
-from .viz import Render
+from ..core import (
+    Function,
+    ModelTextPart,
+    Node,
+    NodeState,
+    NodeView,
+    ThinkingBlockPart,
+    ToolResultPart,
+    ToolUsePart,
+    UserTextPart,
+)
+if os.name != "nt":
+    import select
+    import termios
+    import tty
+else:  # pragma: no cover - runtime guarded use on non-POSIX terminals only
+    select = None
+    termios = None
+    tty = None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ANSI Constants
@@ -68,6 +84,9 @@ UNFOLD = "▾"
 THINKING = "💭"
 RESULT_GLYPH = "📤"
 ARGS_GLYPH = "📋"
+USER_GLYPH = "👤"
+MODEL_GLYPH = "🤖"
+FUNCTION_GLYPH = "🧰"
 VERT = "│"
 TEE = "├─"
 ELBOW = "└─"
@@ -239,6 +258,15 @@ def _visible_len(s: str) -> int:
     return len(_RE_ANSI_ESCAPE.sub("", s))
 
 
+def _highlight_line(line: str, width: int) -> str:
+    """Apply background highlight across the entire visible row width."""
+    padded = line
+    vis_len = _visible_len(padded)
+    if vis_len < width:
+        padded += " " * (width - vis_len)
+    return f"{BG_CURSOR}{padded.replace(RESET, RESET + BG_CURSOR)}{RESET}"
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Line Metadata
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -251,6 +279,17 @@ class LineInfo:
     key: str | None = None
     expandable: bool = False
     default_collapsed: bool = False
+    is_node_header: bool = False
+    is_agent_header: bool = False
+    anchors: tuple[str, ...] = ()
+
+
+@dataclass
+class NodeRange:
+    start: int
+    end: int
+    key: str
+    is_agent: bool
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -258,35 +297,38 @@ class LineInfo:
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
 
-class ConsoleRender(Render[str]):
+class ConsoleRender:
     """Interactive renderer for a `NodeView` tree with cursor navigation and
     collapsible sections that yields an ANSI string intended for display in a
     terminal.
 
-    - Maintains the most recent `NodeView` it has seen; when called with
-      `render(None)`, it re-renders the last view using a time-based spinner.
+    - Maintains the most recent `NodeView` snapshot and can re-render it on
+      demand for spinner ticks, resize handling, and interactive navigation.
     - Renders into a scrollable viewport (terminal height minus one status-bar
       row) with a highlighted cursor line and automatic scroll tracking.
     - Uses ANSI colors, Unicode box-drawing connectors, and fold/unfold
       indicators suitable for modern terminal emulators.
 
     Collapse / expand behaviour:
-    - Every node and detail section (thinking blocks, agent input/output) has
-      a collapse key and a per-item default: agent nodes default *expanded*,
-      code-function nodes and detail sections default *collapsed*.
+    - Every node and detail section (thinking blocks, user/model text blocks,
+      code args/results, and synthetic function rows) has a collapse key and a
+      per-item default: agent nodes default *expanded*, code-function nodes
+      and detail sections default *collapsed*.
     - User overrides are stored in `_collapse_overrides` and persist for the
-      lifetime of the renderer.  `toggle()` flips the item under the cursor;
-      if the cursor sits on non-expandable content it walks backwards to the
-      nearest expandable parent and collapses it, moving the cursor to that
-      header so it stays visible.
+      lifetime of the renderer. `toggle_expanded()` flips the item under the
+      cursor; if the cursor sits on non-expandable content it walks backwards
+      to the nearest expandable parent and collapses it, moving the cursor to
+      that header so it stays visible.
 
     Transcript ↔ children correlation:
     - The renderer walks `NodeView.transcript` sequentially. For each
       `ToolUsePart`, it looks up `NodeView.transcript_child_map` (keyed by
-      `id(part)`) to find the corresponding child `NodeView`. If found, the
-      child subtree is rendered inline; if absent (any kind of function
-      invocation failure, transient gap, or AgentException), the tool use is
-      silently skipped.
+      `id(part)`) to find the corresponding child `NodeView`.
+    - If a child node exists, its subtree is rendered inline at the matching
+      transcript position.
+    - If no child node exists, the function call still renders as a synthetic
+      expandable row backed by the `ToolUsePart` / `ToolResultPart` pair, so
+      pending calls and failures remain visible.
     - `ThinkingBlockPart` entries are rendered as collapsible sections in
       transcript order, naturally interleaved with child nodes.
     - No positional or ordinal assumptions are made between transcript entries
@@ -294,42 +336,60 @@ class ConsoleRender(Render[str]):
       by the framework when building `NodeView`.
 
     Thread safety:
-    - All mutable state is protected by `_lock`.  The `render()` method is
-      called from the netflux view-loop background thread.  Navigation methods
-      (`move_up`, `move_down`, `toggle`, `go_top`, `go_bottom`,
-      `page_up`, `page_down`) are called from the main thread's keyboard
-      loop.
+    - All mutable state is protected by `_lock`.
+    - `ConsoleRender.run(node)` owns the terminal session and manages both the
+      background watch/render loop and the foreground keyboard loop.
+    - Navigation methods (`navigate_up`, `navigate_down`, `toggle_expanded`,
+      `go_top`, `go_bottom`, `page_up`, `page_down`, `jump_prev_agent`,
+      `jump_next_agent`, `collapse_enclosing_agent`, `expand_all_nodes`,
+      `collapse_all_nodes`) are safe to call while the renderer is active.
 
     Follow mode:
     - When `follow=True` (the default), the cursor automatically tracks the
-      last line of output so new content is always visible.  Any manual
-      navigation disables follow mode; `go_bottom` re-enables it when the
+      last line of output so new content is always visible. Any manual
+      navigation disables follow mode; `go_bottom()` re-enables it when the
       cursor reaches the overall last line.
 
     Intended usage for a terminal UI:
-    - Call `ConsoleRender.pre_console()` before starting the view loop.
-    - Start the loop with `ui_driver=ConsoleRender.ui_driver`.
-    - Run a keyboard-read loop on the main thread, dispatching to the
-      navigation methods above.
-    - On exit (e.g., in `finally:`), call `ConsoleRender.restore_console()`.
+    - Create `ConsoleRender(...)` and call `run(node)`.
+    - `run(node)` manages terminal ownership, the live watch/render loop,
+      keyboard handling, and the post-completion browser.
     """
+
+    _console_lock = threading.Lock()
+    _console_ready = False
 
     def __init__(
         self,
         cancel_event: Event | None = None,
         *,
+        width: int | None = None,
+        spinner_hz: float = 10.0,
         follow: bool = True,
     ) -> None:
         """Initialise the interactive tree renderer."""
+        self.width = width
+        self.spinner_hz = max(1.0, float(spinner_hz))
         self._cancel_event = cancel_event
         self._last_view: NodeView | None = None
+        self._root_id: int | None = None
         self._t0 = time.monotonic()
         self._lock = threading.Lock()
+        self._loop_wake = threading.Condition()
+        self._loop_pending_view: NodeView | None = None
+        self._loop_pending_redraw = False
+        self._loop_stop = False
+        self._sigint_handler_installed = False
+        self._exit_after_terminal = False
+        self._console_session_active = False
 
         # Navigation state
         self._cursor: int = 0
         self._scroll_offset: int = 0
         self._follow_mode: bool = follow
+        self._selected_key: str | None = None
+        self._selected_anchor: str | None = None
+        self._selected_anchor_occurrence: int = 0
 
         # Collapse state: per-key overrides over per-item defaults
         self._collapse_overrides: dict[str, bool] = {}
@@ -337,9 +397,10 @@ class ConsoleRender(Render[str]):
         # Cached flat-line output (rebuilt every render tick)
         self._lines: list[str] = []
         self._line_infos: list[LineInfo] = []
+        self._tree_rows: int = 1
 
-        # Node-scoped navigation: (start_line, end_line) per node subtree
-        self._node_ranges: list[tuple[int, int]] = []
+        # Node-scoped navigation ranges.
+        self._node_ranges: list[NodeRange] = []
         # Terminal width cached at each render cycle (used for text wrapping)
         self._cols: int = 80
 
@@ -348,120 +409,262 @@ class ConsoleRender(Render[str]):
     def _is_collapsed(self, key: str, default: bool) -> bool:
         return self._collapse_overrides.get(key, default)
 
+    def request_redraw(self) -> None:
+        with self._lock:
+            self._signal_redraw_locked()
+
+    def _signal_redraw_locked(self) -> None:
+        with self._loop_wake:
+            self._loop_pending_redraw = True
+            self._loop_wake.notify()
+
+    def _stop_view_loop(self) -> None:
+        with self._loop_wake:
+            self._loop_stop = True
+            self._loop_wake.notify_all()
+
+    def _ui_driver(self, s: str) -> None:
+        if not self._console_session_active:
+            return
+        ConsoleRender.ui_driver(s)
+
+    def _request_cancel(self) -> bool:
+        if self._cancel_event is None:
+            return False
+        already_set = self._cancel_event.is_set()
+        self._cancel_event.set()
+        self._exit_after_terminal = True
+        with self._lock:
+            self._signal_redraw_locked()
+        return not already_set
+
+    def _install_sigint_handler(
+        self,
+        view_thread: threading.Thread,
+    ) -> signal.Handlers | None:
+        if self._cancel_event is None:
+            return None
+        if threading.current_thread() is not threading.main_thread():
+            return None
+
+        previous_handler = signal.getsignal(signal.SIGINT)
+
+        def _handle_sigint(signum: int, frame: Any) -> None:
+            del signum, frame
+            if view_thread.is_alive() and self._request_cancel():
+                return
+            self._stop_view_loop()
+            self._console_session_active = False
+            ConsoleRender.restore_console()
+            if callable(previous_handler):
+                previous_handler(signal.SIGINT, None)
+                return
+            if previous_handler == signal.SIG_IGN:
+                return
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGINT, _handle_sigint)
+        self._sigint_handler_installed = True
+        return previous_handler
+
+    def _restore_sigint_handler(
+        self,
+        previous_handler: signal.Handlers | None,
+    ) -> None:
+        if not self._sigint_handler_installed:
+            return
+        signal.signal(signal.SIGINT, previous_handler)
+        self._sigint_handler_installed = False
+
     # ── Navigation (all acquire lock) ─────────────────────────────────────
 
-    def _navigate(self, new_cursor: int) -> None:
-        """Update cursor position and disable follow mode (caller must hold lock)."""
-        self._follow_mode = False
+    def _remember_selection(self) -> None:
+        if 0 <= self._cursor < len(self._line_infos):
+            info = self._line_infos[self._cursor]
+            self._selected_key = info.key
+            self._selected_anchor = info.key or (info.anchors[0] if info.anchors else None)
+            self._selected_anchor_occurrence = 0
+            if self._selected_anchor is not None:
+                for idx in range(self._cursor + 1):
+                    candidate = self._line_infos[idx]
+                    if (
+                        candidate.key == self._selected_anchor
+                        or self._selected_anchor in candidate.anchors
+                    ):
+                        self._selected_anchor_occurrence += 1
+                self._selected_anchor_occurrence = max(
+                    0, self._selected_anchor_occurrence - 1
+                )
+        else:
+            self._selected_key = None
+            self._selected_anchor = None
+            self._selected_anchor_occurrence = 0
+
+    def _iter_node_keys(self, nv: NodeView) -> list[str]:
+        keys = [f"n:{nv.id}"]
+        for child in nv.children:
+            keys.extend(self._iter_node_keys(child))
+        return keys
+
+    def _set_cursor(self, new_cursor: int, *, disable_follow: bool = True) -> None:
+        if disable_follow:
+            self._follow_mode = False
         max_pos = max(0, len(self._lines) - 1)
         self._cursor = max(0, min(new_cursor, max_pos))
+        self._remember_selection()
+        self._signal_redraw_locked()
 
-    def move_up(self) -> None:
-        """Move cursor up one line."""
+    def _navigate(self, new_cursor: int) -> None:
+        self._set_cursor(new_cursor, disable_follow=True)
+
+    def navigate_up(self) -> None:
         with self._lock:
             self._navigate(self._cursor - 1)
 
-    def move_down(self) -> None:
-        """Move cursor down one line."""
+    def navigate_down(self) -> None:
         with self._lock:
             self._navigate(self._cursor + 1)
 
+    def move_up(self) -> None:
+        self.navigate_up()
+
+    def move_down(self) -> None:
+        self.navigate_down()
+
     def page_up(self) -> None:
-        """Scroll up by one page."""
         with self._lock:
-            page = max(1, shutil.get_terminal_size().lines - 3)
+            page = max(1, self._tree_rows - 2)
             self._navigate(self._cursor - page)
 
     def page_down(self) -> None:
-        """Scroll down by one page."""
         with self._lock:
-            page = max(1, shutil.get_terminal_size().lines - 3)
+            page = max(1, self._tree_rows - 2)
             self._navigate(self._cursor + page)
-
-    def go_top(self) -> None:
-        """Move cursor to the top of the enclosing node's subtree.
-
-        When the cursor sits on a collapsed (single-line) element, the
-        smallest enclosing range *is* that line — so we skip it and jump
-        to the parent range instead.
-        """
-        with self._lock:
-            self._follow_mode = False
-            start, end = self._find_node_range(self._cursor)
-            if start == end:
-                start, _ = self._find_node_range(self._cursor, min_size=2)
-            self._cursor = start
-
-    def go_bottom(self) -> None:
-        """Move cursor to the bottom of the enclosing node's subtree.
-
-        See `go_top` for the collapsed-element parent-jump logic.
-        """
-        with self._lock:
-            self._follow_mode = False
-            start, end = self._find_node_range(self._cursor)
-            if start == end:
-                _, end = self._find_node_range(self._cursor, min_size=2)
-            self._cursor = end
-            # Re-enable follow if the bottom of this node is the overall bottom
-            if end >= max(0, len(self._lines) - 1):
-                self._follow_mode = True
 
     def _find_node_range(
         self,
         cursor: int,
         *,
         min_size: int = 1,
-    ) -> tuple[int, int]:
-        """Return the (start, end) of the smallest node subtree containing *cursor*.
-
-        Ranges smaller than *min_size* lines are skipped, so callers can
-        bypass trivial (e.g. collapsed single-line) ranges to find the
-        enclosing parent range.
-        """
-        best_start = 0
-        best_end = max(0, len(self._lines) - 1)
-        best_size = best_end - best_start + 1
-        for start, end in self._node_ranges:
-            if start <= cursor <= end:
-                size = end - start + 1
+        agent_only: bool = False,
+    ) -> NodeRange | None:
+        best: NodeRange | None = None
+        best_size = (max(0, len(self._lines) - 1) + 1) + 1
+        for rng in self._node_ranges:
+            if rng.start <= cursor <= rng.end:
+                if agent_only and not rng.is_agent:
+                    continue
+                size = rng.end - rng.start + 1
                 if size < min_size:
                     continue
                 if size < best_size:
-                    best_start, best_end = start, end
+                    best = rng
                     best_size = size
-        return best_start, best_end
+        return best
+
+    def go_top(self) -> None:
+        with self._lock:
+            rng = self._find_node_range(self._cursor)
+            if rng is None:
+                return
+            if rng.start == rng.end:
+                larger = self._find_node_range(self._cursor, min_size=2)
+                if larger is not None:
+                    rng = larger
+            self._set_cursor(rng.start, disable_follow=True)
+
+    def go_bottom(self) -> None:
+        with self._lock:
+            rng = self._find_node_range(self._cursor)
+            if rng is None:
+                return
+            if rng.start == rng.end:
+                larger = self._find_node_range(self._cursor, min_size=2)
+                if larger is not None:
+                    rng = larger
+            self._set_cursor(rng.end, disable_follow=True)
+            if rng.end >= max(0, len(self._lines) - 1):
+                self._follow_mode = True
+
+    def jump_prev_agent(self) -> None:
+        with self._lock:
+            targets = [
+                idx
+                for idx, info in enumerate(self._line_infos)
+                if info.is_agent_header
+            ]
+            if not targets:
+                return
+            prev = [idx for idx in targets if idx < self._cursor]
+            target = prev[-1] if prev else targets[0]
+            self._set_cursor(target, disable_follow=True)
+
+    def jump_next_agent(self) -> None:
+        with self._lock:
+            targets = [
+                idx
+                for idx, info in enumerate(self._line_infos)
+                if info.is_agent_header
+            ]
+            if not targets:
+                return
+            nxt = [idx for idx in targets if idx > self._cursor]
+            target = nxt[0] if nxt else targets[-1]
+            self._set_cursor(target, disable_follow=True)
+
+    def toggle_expanded(self) -> None:
+        with self._lock:
+            if not (0 <= self._cursor < len(self._line_infos)):
+                return
+
+            info = self._line_infos[self._cursor]
+            if info.expandable and info.key is not None:
+                current = self._is_collapsed(info.key, info.default_collapsed)
+                self._collapse_overrides[info.key] = not current
+                self._remember_selection()
+                self._signal_redraw_locked()
+                return
+
+            for i in range(self._cursor - 1, -1, -1):
+                parent_info = self._line_infos[i]
+                if parent_info.expandable and parent_info.key is not None:
+                    self._collapse_overrides[parent_info.key] = True
+                    self._set_cursor(i, disable_follow=True)
+                    return
 
     def toggle(self) -> None:
-        """Toggle expand/collapse on the current line.
+        self.toggle_expanded()
 
-        If the current line is itself expandable, its collapsed state is
-        toggled.  Otherwise, scan backwards to find the nearest enclosing
-        expandable item and collapse it (the cursor moves to that item's
-        header line so it remains visible after the content disappears).
-        """
+    def expand_all_nodes(self) -> None:
         with self._lock:
-            if 0 <= self._cursor < len(self._line_infos):
-                info = self._line_infos[self._cursor]
-                if info.expandable and info.key is not None:
-                    current = self._is_collapsed(info.key, info.default_collapsed)
-                    self._collapse_overrides[info.key] = not current
-                else:
-                    # Inside expanded content — collapse the nearest parent.
-                    for i in range(self._cursor - 1, -1, -1):
-                        parent_info = self._line_infos[i]
-                        if parent_info.expandable and parent_info.key is not None:
-                            self._collapse_overrides[parent_info.key] = True
-                            self._cursor = i
-                            break
+            if self._last_view is None:
+                return
+            for key in self._iter_node_keys(self._last_view):
+                self._collapse_overrides[key] = False
+            self._signal_redraw_locked()
+
+    def collapse_all_nodes(self) -> None:
+        with self._lock:
+            if self._last_view is None:
+                return
+            for key in self._iter_node_keys(self._last_view):
+                self._collapse_overrides[key] = True
+            self._set_cursor(0, disable_follow=True)
+
+    def collapse_enclosing_agent(self) -> None:
+        with self._lock:
+            rng = self._find_node_range(self._cursor, min_size=1, agent_only=True)
+            if rng is None:
+                return
+            self._collapse_overrides[rng.key] = True
+            self._set_cursor(rng.start, disable_follow=True)
 
     def reset_for_browse(self) -> None:
-        """Reset navigation state for post-completion interactive browsing."""
         with self._lock:
             self._follow_mode = False
-            self._cursor = 0
+            self._set_cursor(0, disable_follow=False)
 
-    # ── Render (Render[str] implementation) ───────────────────────────────
+    # ── Render state update and frame building ────────────────────────────
 
     def render(self, view: NodeView | None) -> str:
         """Render the current tree view to a string."""
@@ -470,6 +673,15 @@ class ConsoleRender(Render[str]):
 
     def _render_locked(self, view: NodeView | None) -> str:
         if view is not None:
+            if self._root_id is not None and view.id != self._root_id:
+                self._collapse_overrides.clear()
+                self._cursor = 0
+                self._scroll_offset = 0
+                self._selected_key = None
+                self._selected_anchor = None
+                self._selected_anchor_occurrence = 0
+                self._follow_mode = True
+            self._root_id = view.id
             self._last_view = view
         if self._last_view is None:
             return "(waiting for data...)"
@@ -477,8 +689,9 @@ class ConsoleRender(Render[str]):
         tick = self._tick()
         cancel_pending = bool(self._cancel_event and self._cancel_event.is_set())
 
-        # Cache terminal width for content wrapping
-        self._cols = max(1, shutil.get_terminal_size(fallback=(80, 24)).columns)
+        sz = shutil.get_terminal_size(fallback=(80, 24))
+        self._cols = max(1, self.width if self.width is not None else sz.columns)
+        self._tree_rows = max(1, sz.lines - 1)
 
         # Build flat line list from tree
         lines: list[str] = []
@@ -505,13 +718,32 @@ class ConsoleRender(Render[str]):
         self._lines = lines
         self._line_infos = infos
 
-        # Follow mode: cursor at bottom
         if self._follow_mode:
             self._cursor = max(0, len(lines) - 1)
+        else:
+            resolved: int | None = None
+            if self._selected_key is not None:
+                for idx, info in enumerate(infos):
+                    if info.key == self._selected_key or self._selected_key in info.anchors:
+                        resolved = idx
+                        break
+            if resolved is None and self._selected_anchor is not None:
+                matching = [
+                    idx
+                    for idx, info in enumerate(infos)
+                    if info.key == self._selected_anchor
+                    or self._selected_anchor in info.anchors
+                ]
+                if matching:
+                    resolved = matching[
+                        min(self._selected_anchor_occurrence, len(matching) - 1)
+                    ]
+            if resolved is not None:
+                self._cursor = resolved
 
-        # Clamp cursor
         max_pos = max(0, len(lines) - 1)
         self._cursor = max(0, min(self._cursor, max_pos))
+        self._remember_selection()
 
         return self._render_viewport()
 
@@ -528,6 +760,7 @@ class ConsoleRender(Render[str]):
         infos: list[LineInfo],
         *,
         depth: int = 0,
+        anchors: tuple[str, ...] = (),
     ) -> None:
         node_start_idx = len(lines)
         key = f"n:{nv.id}"
@@ -535,13 +768,35 @@ class ConsoleRender(Render[str]):
 
         # Determine expandability
         has_children = bool(nv.children)
-        has_thinking = any(isinstance(p, ThinkingBlockPart) for p in nv.transcript)
+        has_transcript_rows = any(
+            isinstance(
+                p,
+                (
+                    ThinkingBlockPart,
+                    UserTextPart,
+                    ModelTextPart,
+                    ToolUsePart,
+                    ToolResultPart,
+                ),
+            )
+            for p in nv.transcript
+        )
         has_usage = nv.usage is not None
         has_inputs = bool(nv.inputs)
         has_result = _has_output(nv)
-        has_details = (
-            has_children or has_thinking or has_usage or has_inputs or has_result
+        has_error = _has_error(nv) or (
+            nv.state is NodeState.Canceled and nv.exception is not None
         )
+        has_details = (
+            has_children
+            or has_transcript_rows
+            or has_usage
+            or has_result
+            or has_error
+            or (not is_agent and has_inputs)
+        )
+        if nv.fn.is_code():
+            has_details = True
 
         # Defaults: agents expanded, code functions collapsed
         default_collapsed = not is_agent
@@ -562,10 +817,10 @@ class ConsoleRender(Render[str]):
             parts = self._build_collapsed_summary(nv, has_children, is_agent)
             if parts:
                 header += f" {_color(' | '.join(parts), dim=True)}"
-        elif not is_agent:
-            suffix = self._build_expanded_inline(nv)
-            if suffix:
-                header += suffix
+        elif is_agent and nv.inputs:
+            args_inline = _format_args(nv.inputs, max_len=140, per_val_len=50)
+            if args_inline:
+                header += f"({_color(args_inline, dim=True)})"
 
         # Emit header
         if depth > 0:
@@ -581,11 +836,21 @@ class ConsoleRender(Render[str]):
                 key=key,
                 expandable=has_details,
                 default_collapsed=default_collapsed,
+                is_node_header=True,
+                is_agent_header=is_agent,
+                anchors=anchors,
             )
         )
 
         if collapsed:
-            self._node_ranges.append((node_start_idx, len(lines) - 1))
+            self._node_ranges.append(
+                NodeRange(
+                    start=node_start_idx,
+                    end=len(lines) - 1,
+                    key=key,
+                    is_agent=is_agent,
+                )
+            )
             return
 
         # ── Expanded content ─────────────────────────────────────────────
@@ -620,8 +885,27 @@ class ConsoleRender(Render[str]):
                 lines,
                 infos,
             )
+            n_children = len(nv.children)
+            for idx, child in enumerate(nv.children):
+                self._build_node(
+                    child,
+                    child_prefix,
+                    idx == (n_children - 1),
+                    tick,
+                    cancel_pending,
+                    lines,
+                    infos,
+                    depth=depth + 1,
+                )
 
-        self._node_ranges.append((node_start_idx, len(lines) - 1))
+        self._node_ranges.append(
+            NodeRange(
+                start=node_start_idx,
+                end=len(lines) - 1,
+                key=key,
+                is_agent=is_agent,
+            )
+        )
 
     # ── Header / summary helpers ──────────────────────────────────────────
 
@@ -641,7 +925,7 @@ class ConsoleRender(Render[str]):
         type_g = _type_glyph(nv.fn)
 
         # Collapse indicator
-        indicator = (f"{FOLD} " if collapsed else f"{UNFOLD} ") if has_details else ""
+        indicator = (f"{FOLD} " if collapsed else f"{UNFOLD} ") if has_details else "  "
 
         header = (
             f"{_color(glyph, fg=color, bold=True)} {indicator}"
@@ -662,19 +946,17 @@ class ConsoleRender(Render[str]):
     ) -> list[str]:
         """Return summary fragments for a collapsed node."""
         parts: list[str] = []
-        if is_agent and nv.inputs.get("user_request"):
-            req = str(nv.inputs["user_request"])
-            if len(req) > 50:
-                req = req[:47] + "..."
-            req = req.replace("\n", " ")
-            parts.append(f'"{req}"')
+        if is_agent and nv.inputs:
+            args = _format_args(nv.inputs, max_len=100, per_val_len=40)
+            if args:
+                parts.append(args)
         if has_children:
-            n_agents = sum(1 for c in nv.children if c.fn.is_agent())
-            n_tools = len(nv.children) - n_agents
-            if n_tools:
-                parts.append(f"{n_tools} tool{'s' if n_tools != 1 else ''}")
-            if n_agents:
-                parts.append(f"{n_agents} sub{'s' if n_agents != 1 else ''}")
+            n_agent_fns = sum(1 for c in nv.children if c.fn.is_agent())
+            n_code_fns = len(nv.children) - n_agent_fns
+            if n_code_fns:
+                parts.append(f"{n_code_fns} CodeFn")
+            if n_agent_fns:
+                parts.append(f"{n_agent_fns} AgentFn")
         if not is_agent and nv.inputs:
             args = _format_args(nv.inputs, max_len=80, per_val_len=40)
             if args:
@@ -717,6 +999,7 @@ class ConsoleRender(Render[str]):
         fg: str | None = None,
         dim: bool = False,
         bold: bool = False,
+        anchors: tuple[str, ...] = (),
     ) -> None:
         """Append a content line, wrapping to fit within the terminal width.
 
@@ -731,14 +1014,14 @@ class ConsoleRender(Render[str]):
 
         if len(raw_text) <= avail:
             lines.append(f"{prefix}{_color(raw_text, fg=fg, dim=dim, bold=bold)}")
-            infos.append(LineInfo())
+            infos.append(LineInfo(anchors=anchors))
             return
 
         pos = 0
         while pos < len(raw_text):
             chunk = raw_text[pos : pos + avail]
             lines.append(f"{prefix}{_color(chunk, fg=fg, dim=dim, bold=bold)}")
-            infos.append(LineInfo())
+            infos.append(LineInfo(anchors=anchors))
             pos += avail
 
     # ── Shared detail-rendering helpers ───────────────────────────────────
@@ -750,18 +1033,20 @@ class ConsoleRender(Render[str]):
         lines: list[str],
         infos: list[LineInfo],
         *,
-        max_lines: int = 200,
+        max_lines: int | None = None,
         fg: str | None = None,
         dim: bool = False,
+        anchors: tuple[str, ...] = (),
     ) -> None:
         """Emit a block of text lines with optional truncation."""
-        for tl in text_lines[:max_lines]:
-            self._append_content(tl, prefix, lines, infos, fg=fg, dim=dim)
-        if len(text_lines) > max_lines:
+        emitted = text_lines if max_lines is None else text_lines[:max_lines]
+        for tl in emitted:
+            self._append_content(tl, prefix, lines, infos, fg=fg, dim=dim, anchors=anchors)
+        if max_lines is not None and len(text_lines) > max_lines:
             lines.append(
                 f"{prefix}{_color(f'... ({len(text_lines)} lines total)', dim=True)}"
             )
-            infos.append(LineInfo())
+            infos.append(LineInfo(anchors=anchors))
 
     def _emit_kv_pairs(
         self,
@@ -771,7 +1056,8 @@ class ConsoleRender(Render[str]):
         lines: list[str],
         infos: list[LineInfo],
         *,
-        max_lines: int = 200,
+        max_lines: int | None = None,
+        anchors: tuple[str, ...] = (),
     ) -> None:
         """Emit key-value pairs, using multi-line display for long values."""
         for k, v in inputs.items():
@@ -781,7 +1067,7 @@ class ConsoleRender(Render[str]):
                 lines.append(
                     f"{header_prefix}{_color(ARGS_GLYPH + ' ' + k + ':', fg='cyan')}"
                 )
-                infos.append(LineInfo())
+                infos.append(LineInfo(anchors=anchors))
                 self._emit_content_block(
                     val_lines,
                     value_prefix,
@@ -789,6 +1075,7 @@ class ConsoleRender(Render[str]):
                     infos,
                     max_lines=max_lines,
                     dim=True,
+                    anchors=anchors,
                 )
             else:
                 lines.append(
@@ -796,7 +1083,186 @@ class ConsoleRender(Render[str]):
                     f"{_color(ARGS_GLYPH + ' ' + k + ': ', fg='cyan')}"
                     f"{_color(val_str, dim=True)}"
                 )
-                infos.append(LineInfo())
+                infos.append(LineInfo(anchors=anchors))
+
+    def _preview_for_header(
+        self,
+        text: str,
+        header_prefix: str,
+        header_plain: str,
+    ) -> str:
+        max_len = max(20, self._cols - _visible_len(header_prefix) - len(header_plain) - 4)
+        return _preview_text(text, max_len)
+
+    def _emit_text_part(
+        self,
+        *,
+        key: str,
+        title: str,
+        glyph: str,
+        text: str,
+        detail_prefix: str,
+        content_prefix: str,
+        lines: list[str],
+        infos: list[LineInfo],
+        fg: str | None = None,
+        dim: bool = False,
+    ) -> None:
+        collapsed = self._is_collapsed(key, default=True)
+        indicator = FOLD if collapsed else UNFOLD
+        n_chars = len(text)
+        header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
+        label = f"{detail_prefix}{_color(header_plain, fg=fg, dim=dim)}"
+        if collapsed:
+            preview = self._preview_for_header(text, detail_prefix, header_plain)
+            if preview:
+                label += f" {_color(preview, dim=True)}"
+        lines.append(label)
+        infos.append(
+            LineInfo(
+                key=key,
+                expandable=True,
+                default_collapsed=True,
+                anchors=(key,),
+            )
+        )
+        if not collapsed:
+            block = text.splitlines() or [""]
+            self._emit_content_block(
+                block,
+                content_prefix,
+                lines,
+                infos,
+                max_lines=None,
+                dim=True,
+                anchors=(key,),
+            )
+
+    def _emit_value_part(
+        self,
+        *,
+        key: str,
+        title: str,
+        glyph: str,
+        text: str,
+        detail_prefix: str,
+        content_prefix: str,
+        lines: list[str],
+        infos: list[LineInfo],
+        fg: str | None = None,
+    ) -> None:
+        collapsed = self._is_collapsed(key, default=True)
+        indicator = FOLD if collapsed else UNFOLD
+        n_chars = len(text)
+        header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
+        line = f"{detail_prefix}{_color(header_plain, fg=fg)}"
+        if collapsed:
+            preview = self._preview_for_header(text, detail_prefix, header_plain)
+            if preview:
+                line += f" {_color(preview, dim=True)}"
+        lines.append(line)
+        infos.append(
+            LineInfo(
+                key=key,
+                expandable=True,
+                default_collapsed=True,
+                anchors=(key,),
+            )
+        )
+        if not collapsed:
+            self._emit_content_block(
+                text.splitlines() or [""],
+                content_prefix,
+                lines,
+                infos,
+                max_lines=None,
+                dim=True,
+                anchors=(key,),
+            )
+
+    def _emit_synthetic_function_row(
+        self,
+        *,
+        node_id: int,
+        invocation_id: str,
+        function_name: str,
+        args: dict[str, Any] | None,
+        result_part: ToolResultPart | None,
+        detail_prefix: str,
+        content_prefix: str,
+        lines: list[str],
+        infos: list[LineInfo],
+    ) -> None:
+        key = f"fncall:{node_id}:{invocation_id}"
+        collapsed = self._is_collapsed(key, default=True)
+        indicator = FOLD if collapsed else UNFOLD
+
+        if result_part is None:
+            status = "pending"
+            status_fg = "yellow"
+        elif result_part.is_error:
+            status = "failed"
+            status_fg = "red"
+        else:
+            status = "completed"
+            status_fg = "green"
+
+        args_preview = _format_args(args or {}, max_len=90, per_val_len=40)
+        suffix = f" ({args_preview})" if args_preview else ""
+        if result_part is None:
+            result_preview = ""
+        elif result_part.is_error:
+            result_preview = f" {_color('!!', fg='red', bold=True)} {_short_repr(result_part.outputs, 60)}"
+        else:
+            result_preview = f" {_color('=>', dim=True)} {_short_repr(result_part.outputs, 60)}"
+
+        header = f"{indicator} {FUNCTION_GLYPH} {function_name} [{status}]{suffix}{result_preview}"
+        lines.append(f"{detail_prefix}{_color(header, fg=status_fg)}")
+        infos.append(
+            LineInfo(
+                key=key,
+                expandable=True,
+                default_collapsed=True,
+                anchors=(key,),
+            )
+        )
+
+        if collapsed:
+            return
+
+        if args:
+            self._emit_kv_pairs(
+                args,
+                content_prefix,
+                content_prefix + "  ",
+                lines,
+                infos,
+                max_lines=None,
+                anchors=(key,),
+            )
+        else:
+            lines.append(f"{content_prefix}{_color('(no args)', dim=True)}")
+            infos.append(LineInfo(anchors=(key,)))
+
+        if result_part is None:
+            lines.append(f"{content_prefix}{_color('waiting for function result...', fg='yellow')}")
+            infos.append(LineInfo(anchors=(key,)))
+            return
+
+        label = "error" if result_part.is_error else "result"
+        color = "red" if result_part.is_error else "green"
+        lines.append(f"{content_prefix}{_color(f'{RESULT_GLYPH} {label}:', fg=color)}")
+        infos.append(LineInfo(anchors=(key,)))
+        self._emit_content_block(
+            str(result_part.outputs).splitlines() or [""],
+            content_prefix + "  ",
+            lines,
+            infos,
+            max_lines=None,
+            fg="red" if result_part.is_error else None,
+            dim=not result_part.is_error,
+            anchors=(key,),
+        )
 
     def _emit_agent_details(
         self,
@@ -811,138 +1277,206 @@ class ConsoleRender(Render[str]):
         *,
         depth: int = 0,
     ) -> None:
-        """Emit expanded content for an agent node.
-
-        Covers: input, usage, thinking, children, output.
-        """
-        # ── Agent input (collapsible) ────────────────────────────────────
-        if nv.inputs:
-            input_key = f"ai:{nv.id}"
-            input_collapsed = self._is_collapsed(input_key, default=True)
-            # Build a combined input string for char count
-            input_text = "\n".join(f"{k}: {v}" for k, v in nv.inputs.items())
-            n_chars = len(input_text)
-            indicator = FOLD if input_collapsed else UNFOLD
-            preview = _preview_text(input_text, 60)
-            preview_part = f": {preview}" if preview else ""
-            label = (
-                f"{indicator} {ARGS_GLYPH}"
-                f" input{preview_part} ({n_chars:,} chars)"
-            )
-            lines.append(
-                f"{detail_prefix}{_color(label, fg='cyan')}"
-            )
-            infos.append(
-                LineInfo(key=input_key, expandable=True, default_collapsed=True)
-            )
-            if not input_collapsed:
-                self._emit_kv_pairs(
-                    nv.inputs,
-                    content_prefix,
-                    content_prefix + "  ",
-                    lines,
-                    infos,
-                )
-
-        # Token usage
         if nv.usage:
             usage_text = self._format_usage(nv.usage)
             lines.append(f"{detail_prefix}{usage_text}")
-            infos.append(LineInfo())
+            infos.append(LineInfo(anchors=(f"n:{nv.id}",)))
 
-        # ── Transcript walk: thinking + children in transcript order ──
-        # Walk nv.transcript sequentially, rendering ThinkingBlockParts inline
-        # and looking up child NodeViews for each ToolUsePart via
-        # nv.transcript_child_map (keyed by id(part)).  No positional or
-        # ordinal assumptions between transcript entries and children;
-        # correlation is entirely via tool_use_id matching done by the runtime
-        # when building NodeView.
-        has_trailing_output = _has_output(nv) or _has_error(nv)
+        tool_use_by_id: dict[str, ToolUsePart] = {}
+        tool_result_by_id: dict[str, ToolResultPart] = {}
+        for part in nv.transcript:
+            if isinstance(part, ToolUsePart):
+                tool_use_by_id.setdefault(part.tool_use_id, part)
+            elif isinstance(part, ToolResultPart):
+                tool_result_by_id[part.tool_use_id] = part
 
-        if nv.transcript:
-            # Collect renderable items from transcript in order.
-            render_items: list[object] = []  # ThinkingBlockPart | NodeView
-            for part in nv.transcript:
-                if isinstance(part, ThinkingBlockPart):
-                    render_items.append(part)
-                elif isinstance(part, ToolUsePart):
-                    child_view = nv.transcript_child_map.get(id(part))
-                    if child_view is not None:
-                        render_items.append(child_view)
+        render_entries: list[tuple[str, int, Any]] = []
+        seen_invocation_ids: set[str] = set()
+        for tx_idx, part in enumerate(nv.transcript):
+            if isinstance(part, UserTextPart):
+                render_entries.append(("user", tx_idx, part))
+            elif isinstance(part, ModelTextPart):
+                render_entries.append(("model", tx_idx, part))
+            elif isinstance(part, ThinkingBlockPart):
+                render_entries.append(("thinking", tx_idx, part))
+            elif isinstance(part, ToolUsePart):
+                if part.tool_use_id in seen_invocation_ids:
+                    continue
+                seen_invocation_ids.add(part.tool_use_id)
+                render_entries.append(("call", tx_idx, part))
+            elif isinstance(part, ToolResultPart):
+                if part.tool_use_id in seen_invocation_ids:
+                    continue
+                seen_invocation_ids.add(part.tool_use_id)
+                render_entries.append(("call_result_only", tx_idx, part))
 
-            # Render items in transcript order.
-            n_items = len(render_items)
-            thinking_seq = 0
-            for ri_idx, item in enumerate(render_items):
-                if isinstance(item, ThinkingBlockPart):
-                    self._emit_thinking_slot(
-                        item,
-                        nv.id,
-                        thinking_seq,
-                        detail_prefix,
-                        content_prefix,
-                        lines,
-                        infos,
-                    )
-                    thinking_seq += 1
-                elif isinstance(item, NodeView):
-                    # Last-child connector: only use └── when nothing follows
-                    # (no more render items and no trailing output/error).
-                    is_last_item = (ri_idx == n_items - 1) and not has_trailing_output
-                    self._build_node(
-                        item,
-                        child_prefix,
-                        is_last_item,
-                        tick,
-                        cancel_pending,
-                        lines,
-                        infos,
-                        depth=depth + 1,
-                    )
-        else:
-            # No transcript yet (early agent state): render children directly.
-            n_children = len(nv.children)
-            for idx, child in enumerate(nv.children):
+        rendered_child_ids: set[int] = set()
+        for child in nv.children:
+            if child.tool_use_id and child.tool_use_id in seen_invocation_ids:
+                continue
+            render_entries.append(("child_only", len(nv.transcript), child))
+
+        has_model_text = any(isinstance(p, ModelTextPart) for p in nv.transcript)
+        has_error_outcome = _has_error(nv) or (
+            nv.state is NodeState.Canceled and nv.exception is not None
+        )
+        has_trailing_output = has_error_outcome or (_has_output(nv) and not has_model_text)
+
+        for idx, (kind, tx_idx, payload) in enumerate(render_entries):
+            is_last_item = (idx == len(render_entries) - 1) and not has_trailing_output
+
+            if kind == "user":
+                part = payload
+                assert isinstance(part, UserTextPart)
+                self._emit_text_part(
+                    key=f"tp:{nv.id}:{tx_idx}:user",
+                    title="user",
+                    glyph=USER_GLYPH,
+                    text=part.text,
+                    detail_prefix=detail_prefix,
+                    content_prefix=content_prefix,
+                    lines=lines,
+                    infos=infos,
+                    fg="blue",
+                )
+                continue
+
+            if kind == "model":
+                part = payload
+                assert isinstance(part, ModelTextPart)
+                self._emit_text_part(
+                    key=f"tp:{nv.id}:{tx_idx}:model",
+                    title="result",
+                    glyph=RESULT_GLYPH,
+                    text=part.text,
+                    detail_prefix=detail_prefix,
+                    content_prefix=content_prefix,
+                    lines=lines,
+                    infos=infos,
+                    fg="green",
+                )
+                continue
+
+            if kind == "thinking":
+                part = payload
+                assert isinstance(part, ThinkingBlockPart)
+                self._emit_thinking_slot(
+                    part,
+                    key=f"tp:{nv.id}:{tx_idx}:thinking",
+                    detail_prefix=detail_prefix,
+                    content_prefix=content_prefix,
+                    lines=lines,
+                    infos=infos,
+                )
+                continue
+
+            if kind == "child_only":
+                child = payload
+                assert isinstance(child, NodeView)
+                rendered_child_ids.add(child.id)
                 self._build_node(
                     child,
                     child_prefix,
-                    (idx == n_children - 1) and not has_trailing_output,
+                    is_last_item,
                     tick,
                     cancel_pending,
                     lines,
                     infos,
                     depth=depth + 1,
                 )
+                continue
 
-        # ── Agent output (collapsible) ───────────────────────────────────
-        if _has_output(nv):
-            output_key = f"ao:{nv.id}"
-            output_collapsed = self._is_collapsed(output_key, default=True)
-            result_str = str(nv.outputs)
-            n_chars = len(result_str)
-            indicator = FOLD if output_collapsed else UNFOLD
-            preview = _preview_text(result_str, 60)
-            preview_part = f": {preview}" if preview else ""
-            label = (
-                f"{indicator} {RESULT_GLYPH}"
-                f" output{preview_part} ({n_chars:,} chars)"
-            )
-            lines.append(
-                f"{detail_prefix}{_color(label, fg='green')}"
-            )
-            infos.append(
-                LineInfo(key=output_key, expandable=True, default_collapsed=True)
-            )
-            if not output_collapsed:
-                self._emit_content_block(
-                    result_str.splitlines(),
-                    content_prefix,
+            if kind == "call":
+                part = payload
+                assert isinstance(part, ToolUsePart)
+                tool_use_id = part.tool_use_id
+                tool_name = part.tool_name
+                child_view = nv.transcript_child_map.get(id(part))
+            else:
+                part = payload
+                assert isinstance(part, ToolResultPart)
+                tool_use_id = part.tool_use_id
+                tool_name = part.tool_name
+                child_view = nv.transcript_child_map.get(id(part))
+
+            use_part = tool_use_by_id.get(tool_use_id)
+            result_part = tool_result_by_id.get(tool_use_id)
+            if child_view is None and use_part is not None:
+                child_view = nv.transcript_child_map.get(id(use_part))
+            if child_view is None and result_part is not None:
+                child_view = nv.transcript_child_map.get(id(result_part))
+
+            if child_view is not None:
+                rendered_child_ids.add(child_view.id)
+                self._build_node(
+                    child_view,
+                    child_prefix,
+                    is_last_item,
+                    tick,
+                    cancel_pending,
                     lines,
                     infos,
-                    dim=True,
+                    depth=depth + 1,
+                    anchors=(f"fncall:{nv.id}:{tool_use_id}",),
                 )
-        elif _has_error(nv):
-            self._emit_error_block(nv, detail_prefix, content_prefix, lines, infos)
+                continue
+
+            if kind == "call":
+                assert isinstance(part, ToolUsePart)
+                args = dict(part.args)
+                tool_name = part.tool_name
+            elif use_part is not None:
+                args = dict(use_part.args)
+                tool_name = use_part.tool_name
+            else:
+                args = {}
+
+            self._emit_synthetic_function_row(
+                node_id=nv.id,
+                invocation_id=tool_use_id,
+                function_name=tool_name,
+                args=args,
+                result_part=result_part,
+                detail_prefix=detail_prefix,
+                content_prefix=content_prefix,
+                lines=lines,
+                infos=infos,
+            )
+
+        orphan_children = [child for child in nv.children if child.id not in rendered_child_ids]
+        for orphan_idx, child in enumerate(orphan_children):
+            self._build_node(
+                child,
+                child_prefix,
+                (orphan_idx == len(orphan_children) - 1) and not has_trailing_output,
+                tick,
+                cancel_pending,
+                lines,
+                infos,
+                depth=depth + 1,
+            )
+
+        if _has_output(nv) and not has_model_text:
+            self._emit_text_part(
+                key=f"ao:{nv.id}",
+                title="result",
+                glyph=RESULT_GLYPH,
+                text=str(nv.outputs),
+                detail_prefix=detail_prefix,
+                content_prefix=content_prefix,
+                lines=lines,
+                infos=infos,
+                fg="green",
+            )
+        elif has_error_outcome:
+            self._emit_error_block(
+                nv,
+                detail_prefix,
+                content_prefix,
+                lines,
+                infos,
+                anchors=(f"ae:{nv.id}",),
+            )
 
     def _emit_code_details(
         self,
@@ -953,30 +1487,41 @@ class ConsoleRender(Render[str]):
         infos: list[LineInfo],
     ) -> None:
         """Emit expanded content for a code function: args and result."""
-        # Arguments
         if nv.inputs:
-            self._emit_kv_pairs(nv.inputs, detail_prefix, content_prefix, lines, infos)
+            for arg_name, arg_value in nv.inputs.items():
+                self._emit_value_part(
+                    key=f"ca:{nv.id}:{arg_name}",
+                    title=arg_name,
+                    glyph=ARGS_GLYPH,
+                    text=str(arg_value),
+                    detail_prefix=detail_prefix,
+                    content_prefix=content_prefix,
+                    lines=lines,
+                    infos=infos,
+                    fg="cyan",
+                )
 
-        # Result
         if _has_output(nv):
-            result_str = str(nv.outputs)
-            n_chars = len(result_str)
-            lines.append(
-                f"{detail_prefix}"
-                f"{_color(RESULT_GLYPH + f' result ({n_chars} chars):', fg='green')}"
+            self._emit_value_part(
+                key=f"cr:{nv.id}",
+                title="result",
+                glyph=RESULT_GLYPH,
+                text=str(nv.outputs),
+                detail_prefix=detail_prefix,
+                content_prefix=content_prefix,
+                lines=lines,
+                infos=infos,
+                fg="green",
             )
-            infos.append(LineInfo())
-            self._emit_content_block(
-                result_str.splitlines(),
+        elif _has_error(nv) or (nv.state is NodeState.Canceled and nv.exception is not None):
+            self._emit_error_block(
+                nv,
+                detail_prefix,
                 content_prefix,
                 lines,
                 infos,
-                dim=True,
+                anchors=(f"n:{nv.id}",),
             )
-
-        # Error details
-        elif _has_error(nv):
-            self._emit_error_block(nv, detail_prefix, content_prefix, lines, infos)
 
     def _emit_error_block(
         self,
@@ -985,31 +1530,34 @@ class ConsoleRender(Render[str]):
         content_prefix: str,
         lines: list[str],
         infos: list[LineInfo],
+        *,
+        anchors: tuple[str, ...] = (),
     ) -> None:
-        """Emit a standardised error block for a failed node."""
-        lines.append(f"{detail_prefix}{_color('✖ error:', fg='red', bold=True)}")
-        infos.append(LineInfo())
+        is_cancel = nv.state is NodeState.Canceled
+        label = "canceled" if is_cancel else "error"
+        color = "yellow" if is_cancel else "red"
+        lines.append(f"{detail_prefix}{_color(f'✖ {label}:', fg=color, bold=True)}")
+        infos.append(LineInfo(anchors=anchors))
         self._emit_content_block(
-            str(nv.exception).splitlines(),
+            str(nv.exception).splitlines() if nv.exception is not None else [""],
             content_prefix,
             lines,
             infos,
-            max_lines=50,
-            fg="red",
+            max_lines=None,
+            fg=color,
+            anchors=anchors,
         )
 
     def _emit_thinking_slot(
         self,
         part: ThinkingBlockPart,
-        node_id: int,
-        slot_idx: int,
+        *,
+        key: str,
         detail_prefix: str,
         content_prefix: str,
         lines: list[str],
         infos: list[LineInfo],
     ) -> None:
-        """Emit a single thinking block for a given slot."""
-        key = f"t:{node_id}:{slot_idx}:0"
         collapsed = self._is_collapsed(key, default=True)
 
         # Character count
@@ -1021,12 +1569,21 @@ class ConsoleRender(Render[str]):
         if part.redacted:
             text = f"{indicator} {THINKING} thinking [redacted]"
         else:
-            preview = _preview_text(part.content or "", 60)
-            preview_part = f": {preview}" if preview else ""
+            preview_part = ""
+            if collapsed:
+                preview = _preview_text(part.content or "", 60)
+                preview_part = f": {preview}" if preview else ""
             text = f"{indicator} {THINKING} thinking{preview_part}{char_info}"
 
         lines.append(f"{detail_prefix}{_color(text, dim=True)}")
-        infos.append(LineInfo(key=key, expandable=True, default_collapsed=True))
+        infos.append(
+            LineInfo(
+                key=key,
+                expandable=True,
+                default_collapsed=True,
+                anchors=(key,),
+            )
+        )
 
         if not collapsed and part.content:
             self._emit_content_block(
@@ -1034,8 +1591,9 @@ class ConsoleRender(Render[str]):
                 content_prefix,
                 lines,
                 infos,
-                max_lines=500,
+                max_lines=None,
                 dim=True,
+                anchors=(key,),
             )
 
     # ── Token usage formatting ────────────────────────────────────────────
@@ -1078,10 +1636,9 @@ class ConsoleRender(Render[str]):
     def _render_viewport(self) -> str:
         sz = shutil.get_terminal_size(fallback=(80, 24))
         rows = max(1, sz.lines)
-        cols = max(1, sz.columns)
-
-        # Reserve 1 row for status bar
+        cols = max(1, self.width if self.width is not None else sz.columns)
         tree_rows = max(1, rows - 1)
+        self._tree_rows = tree_rows
 
         # Adjust scroll to keep cursor visible
         if self._cursor < self._scroll_offset:
@@ -1093,17 +1650,17 @@ class ConsoleRender(Render[str]):
         output: list[str] = []
         end = min(self._scroll_offset + tree_rows, len(self._lines))
         for i in range(self._scroll_offset, end):
-            line = self._lines[i]
+            line = _crop_line(self._lines[i], cols - 1)
             if i == self._cursor:
-                line = f"{BG_CURSOR}{line}{RESET}"
-            output.append(_crop_line(line, cols - 1))
+                line = _highlight_line(line, cols - 1)
+            output.append(f"{line}\x1b[K")
 
         # Pad to fill viewport
         while len(output) < tree_rows:
-            output.append("")
+            output.append("\x1b[K")
 
         # Status bar
-        output.append(self._status_bar(cols))
+        output.append(f"{self._status_bar(cols)}\x1b[K")
 
         return "\n".join(output)
 
@@ -1116,51 +1673,336 @@ class ConsoleRender(Render[str]):
             if s is NodeState.Running:
                 tick = self._tick()
                 frame = _SPINNER_FRAMES[tick % len(_SPINNER_FRAMES)]
-                state_text = _color(f" {frame} Running", fg="cyan")
+                state_text = _color(f"{frame} Running", fg="cyan")
             elif s is NodeState.Success:
-                state_text = _color(" ✔ Complete", fg="green")
+                state_text = _color("✔ Complete", fg="green")
             elif s is NodeState.Error:
-                state_text = _color(" ✖ Error", fg="red")
+                state_text = _color("✖ Error", fg="red")
             elif s is NodeState.Canceled:
-                state_text = _color(" ⏹ Canceled", fg="yellow")
+                state_text = _color("⏹ Canceled", fg="yellow")
+
+        can_cancel = (
+            self._cancel_event is not None
+            and self._last_view is not None
+            and self._last_view.state not in _TERMINAL_STATES
+        )
 
         # Show q:quit only when execution is complete
         is_terminal = self._last_view and self._last_view.state in _TERMINAL_STATES
         quit_hint = "  q:quit" if is_terminal else ""
+        cancel_hint = "  ^C:cancel" if can_cancel else ""
+        right = pos if not state_text else f"{pos}  {state_text}"
+        shortcut_variants = [
+            "↑↓/jk:move  ␣:toggle  PgUp/PgDn:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
+            "↑↓/jk:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
+            "jk/↑↓:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
+            "jk:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
+            "jk:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  E/C:all",
+            "jk ␣ Pg n/N c g/G E/C",
+            "jk ␣ Pg n/N c E/C",
+            "jk ␣ n/N c E/C",
+            "jk ␣ n/N",
+        ]
+        suffix = f" │ {right} "
+        shortcuts = shortcut_variants[-1]
+        for candidate in shortcut_variants:
+            full = f" {candidate}{cancel_hint}{quit_hint}{suffix}"
+            if _visible_len(full) <= cols:
+                shortcuts = candidate
+                break
 
-        shortcuts = f"↑↓/jk:move  ␣:toggle  g/G:top/btm{quit_hint}"
-        bar = f" {shortcuts} │ {pos}{state_text} "
+        left = f"{shortcuts}{cancel_hint}{quit_hint}"
+        max_left = max(0, cols - _visible_len(suffix) - 1)
+        if _visible_len(left) > max_left:
+            if max_left <= 1:
+                left = ""
+            elif max_left == 2:
+                left = "…"
+            else:
+                left = left[: max_left - 1] + "…"
+
+        bar = f" {left}{suffix}"
 
         # Pad to terminal width (use visible length for calculation)
         vis_len = _visible_len(bar)
         if vis_len < cols:
             bar = bar + " " * (cols - vis_len)
+        elif vis_len > cols:
+            bar = _crop_line(bar, cols)
 
         return f"{REVERSE}{bar}{RESET}"
 
     def _tick(self) -> int:
-        return int((time.monotonic() - self._t0) * 10)
+        return int((time.monotonic() - self._t0) * self.spinner_hz)
+
+    def run(
+        self,
+        node: Node,
+    ) -> None:
+        """Run the standard interactive console session for *node*."""
+        self._exit_after_terminal = False
+        self._console_session_active = True
+        self.pre_console()
+        view_thread = self._start_view_thread(node)
+        try:
+            self.interact(view_thread)
+        finally:
+            self._stop_view_loop()
+            if view_thread.is_alive():
+                view_thread.join(timeout=1.0)
+            self._console_session_active = False
+            self.restore_console()
+
+    def _start_view_thread(self, node: Node) -> threading.Thread:
+        tick_interval = 1.0 / self.spinner_hz
+
+        with self._loop_wake:
+            self._loop_stop = False
+            self._loop_pending_view = None
+            self._loop_pending_redraw = True
+
+        def _watch_loop() -> None:
+            prev_seq = 0
+            while True:
+                with self._loop_wake:
+                    if self._loop_stop:
+                        return
+                view = node.watch(as_of_seq=prev_seq, timeout=0.1)
+                if view is None:
+                    continue
+                prev_seq = view.update_seqnum
+                with self._loop_wake:
+                    self._loop_pending_view = view
+                    self._loop_wake.notify()
+                if view.state in _TERMINAL_STATES:
+                    return
+
+        def _loop() -> None:
+            last_view: NodeView | None = None
+            next_at = time.monotonic()
+            watch_thread = threading.Thread(
+                target=_watch_loop,
+                name="netflux-view-watch",
+                daemon=True,
+            )
+            watch_thread.start()
+            try:
+                while True:
+                    current = last_view
+                    timeout: float | None = None
+                    if current is None or current.state not in _TERMINAL_STATES:
+                        timeout = max(0.0, next_at - time.monotonic())
+
+                    with self._loop_wake:
+                        if self._loop_pending_view is None and not self._loop_pending_redraw:
+                            self._loop_wake.wait(timeout)
+                        if self._loop_stop:
+                            break
+                        view = self._loop_pending_view
+                        self._loop_pending_view = None
+                        self._loop_pending_redraw = False
+
+                    payload = self.render(view)
+                    self._ui_driver(payload)
+
+                    if view is not None:
+                        last_view = view
+
+                    current = view if view is not None else last_view
+                    if current is not None and current.state in _TERMINAL_STATES:
+                        break
+
+                    now = time.monotonic()
+                    if next_at <= now:
+                        next_at = now + tick_interval
+            finally:
+                with self._loop_wake:
+                    self._loop_stop = True
+                    self._loop_wake.notify_all()
+
+        view_thread = threading.Thread(
+            target=_loop,
+            name="netflux-view-loop",
+            daemon=True,
+        )
+        view_thread.start()
+        return view_thread
+
+    def interact(self, view_thread: threading.Thread) -> None:
+        """
+        Handle live keyboard interaction for *view_thread* and keep the
+        completed tree open until the user quits.
+        """
+        self.pre_console()
+        previous_sigint_handler = self._install_sigint_handler(view_thread)
+        try:
+            if not sys.stdin.isatty():
+                self._wait_non_interactive(view_thread)
+                return
+            if os.name == "nt":
+                self._interactive_loop_windows(view_thread)
+            else:
+                self._interactive_loop_posix(view_thread)
+        finally:
+            self._restore_sigint_handler(previous_sigint_handler)
+
+    def _wait_non_interactive(self, view_thread: threading.Thread) -> None:
+        while view_thread.is_alive():
+            try:
+                view_thread.join(timeout=0.1)
+            except KeyboardInterrupt:
+                if self._cancel_event is not None and not self._sigint_handler_installed:
+                    self._request_cancel()
+                    continue
+                raise
+
+    def _interactive_loop_windows(self, view_thread: threading.Thread) -> None:
+        while view_thread.is_alive():
+            try:
+                key = _read_key_windows(timeout=0.1)
+            except KeyboardInterrupt:
+                if self._cancel_event is not None and not self._sigint_handler_installed:
+                    self._request_cancel()
+                    continue
+                raise
+            if key is None:
+                continue
+            _handle_key(key, self, allow_quit=False)
+        if self._exit_after_terminal:
+            return
+        self._browse_until_quit_windows()
+
+    def _interactive_loop_posix(self, view_thread: threading.Thread) -> None:
+        if termios is None or tty is None:
+            self._wait_non_interactive(view_thread)
+            return
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while view_thread.is_alive():
+                try:
+                    key = _read_key(fd, timeout=0.1)
+                except KeyboardInterrupt:
+                    if self._cancel_event is not None and not self._sigint_handler_installed:
+                        self._request_cancel()
+                        continue
+                    raise
+                if key is None:
+                    continue
+                _handle_key(key, self, allow_quit=False)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        if self._exit_after_terminal:
+            return
+        self._browse_until_quit_posix()
+
+    def _browse_until_quit_windows(self) -> None:
+        self._ui_driver(self.render(None))
+        last_size = _terminal_size_token()
+        while True:
+            try:
+                key = _read_key_windows(timeout=0.1)
+            except KeyboardInterrupt:
+                return
+            if key is not None:
+                should_exit = _handle_key(key, self, allow_quit=True)
+                self._ui_driver(self.render(None))
+                last_size = _terminal_size_token()
+                if should_exit:
+                    return
+                continue
+            size = _terminal_size_token()
+            if size != last_size:
+                last_size = size
+                self._ui_driver(self.render(None))
+
+    def _browse_until_quit_posix(self) -> None:
+        if termios is None or tty is None:
+            return
+
+        self._ui_driver(self.render(None))
+        last_size = _terminal_size_token()
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            while True:
+                try:
+                    key = _read_key(fd, timeout=0.1)
+                except KeyboardInterrupt:
+                    return
+                if key is not None:
+                    should_exit = _handle_key(key, self, allow_quit=True)
+                    self._ui_driver(self.render(None))
+                    last_size = _terminal_size_token()
+                    if should_exit:
+                        return
+                    continue
+                size = _terminal_size_token()
+                if size != last_size:
+                    last_size = size
+                    self._ui_driver(self.render(None))
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
     # ── Static terminal management ────────────────────────────────────────
 
     @staticmethod
     def pre_console() -> None:
         """Enter alt screen, hide cursor, disable wrap, clear scrollback."""
-        sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J")
-        sys.stdout.flush()
+        if not sys.stdout.isatty():
+            return
+        with ConsoleRender._console_lock:
+            if ConsoleRender._console_ready:
+                return
+            _enable_vt_if_windows()
+            sys.stdout.write("\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J")
+            sys.stdout.flush()
+            ConsoleRender._console_ready = True
 
     @staticmethod
     def restore_console() -> None:
         """Show cursor, re-enable wrap, leave alt screen."""
-        sys.stdout.write("\x1b[?25h\x1b[?7h\x1b[?1049l")
-        sys.stdout.flush()
+        if not sys.stdout.isatty():
+            return
+        with ConsoleRender._console_lock:
+            if not ConsoleRender._console_ready:
+                return
+            sys.stdout.write("\x1b[?25h\x1b[?7h\x1b[?1049l")
+            sys.stdout.flush()
+            ConsoleRender._console_ready = False
 
     @staticmethod
     def ui_driver(s: str) -> None:
-        """Clear screen and write the rendered frame."""
-        sys.stdout.write("\x1b[3J\x1b[2J\x1b[H")
+        """Home the cursor and write the rendered frame."""
+        if not sys.stdout.isatty():
+            return
+        ConsoleRender.pre_console()
+        sys.stdout.write("\x1b[H")
         sys.stdout.write(s)
         sys.stdout.flush()
+
+
+def _terminal_size_token() -> tuple[int, int]:
+    sz = shutil.get_terminal_size(fallback=(80, 24))
+    return (sz.columns, sz.lines)
+
+
+def _enable_vt_if_windows() -> None:
+    if os.name != "nt":
+        return
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    STD_OUTPUT_HANDLE = -11
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+    handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
+    mode = ctypes.c_uint()
+    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        kernel32.SetConsoleMode(handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -1170,6 +2012,8 @@ class ConsoleRender(Render[str]):
 
 def _read_key(fd: int, timeout: float = 0.1) -> str | None:
     """Read a keypress from *fd*, handling escape sequences."""
+    if select is None:
+        return None
     try:
         r, _, _ = select.select([fd], [], [], timeout)
     except (InterruptedError, OSError):
@@ -1219,27 +2063,56 @@ def _read_key(fd: int, timeout: float = 0.1) -> str | None:
     return ch
 
 
+def _read_key_windows(timeout: float = 0.1) -> str | None:
+    import msvcrt
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if msvcrt.kbhit():
+            ch = msvcrt.getwch()
+            if ch == "\x03":
+                raise KeyboardInterrupt
+            if ch in ("\x00", "\xe0"):
+                special = msvcrt.getwch()
+                return {
+                    "H": "up",
+                    "P": "down",
+                    "I": "page_up",
+                    "Q": "page_down",
+                }.get(special)
+            if ch == "\x1b":
+                return "escape"
+            return ch
+        time.sleep(0.01)
+    return None
+
+
 _KEY_BINDINGS: dict[str, str | None] = {
-    "j": "move_down",
-    "down": "move_down",
-    "k": "move_up",
-    "up": "move_up",
-    " ": "toggle",
-    "\r": "toggle",
+    "j": "navigate_down",
+    "down": "navigate_down",
+    "k": "navigate_up",
+    "up": "navigate_up",
+    " ": "toggle_expanded",
+    "\r": "toggle_expanded",
     "g": "go_top",
     "G": "go_bottom",
     "page_up": "page_up",
     "page_down": "page_down",
+    "n": "jump_next_agent",
+    "N": "jump_prev_agent",
+    "c": "collapse_enclosing_agent",
+    "E": "expand_all_nodes",
+    "C": "collapse_all_nodes",
     "q": None,
     "escape": None,
 }
 
 
-def _handle_key(key: str, renderer: ConsoleRender) -> bool:
+def _handle_key(key: str, renderer: ConsoleRender, *, allow_quit: bool) -> bool:
     """Process a key event, returning True if the browser should exit."""
     action = _KEY_BINDINGS.get(key)
     if action is None:
-        return key in _KEY_BINDINGS  # True for quit keys, False for unmapped
+        return allow_quit and key in _KEY_BINDINGS
     getattr(renderer, action)()
     return False
 
@@ -1248,25 +2121,17 @@ def keyboard_loop(
     renderer: ConsoleRender,
     view_thread: threading.Thread,
 ) -> None:
-    """Handle keyboard input during live execution.
-
-    Runs on the main thread.  Exits when the view-loop thread dies
-    (i.e. execution reaches a terminal state).
-    """
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    """Run the renderer-managed interactive session for an existing view loop."""
+    renderer._console_session_active = True
+    renderer.pre_console()
     try:
-        tty.setcbreak(fd)
-        while view_thread.is_alive():
-            key = _read_key(fd, timeout=0.1)
-            if key is None:
-                continue
-            _handle_key(key, renderer)
-    except (KeyboardInterrupt, EOFError):
-        # Ctrl+C during cbreak → SIGINT → let existing handler deal with it
-        pass
+        if os.name == "nt":
+            renderer._interactive_loop_windows(view_thread)
+        else:
+            renderer._interactive_loop_posix(view_thread)
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        renderer._console_session_active = False
+        renderer.restore_console()
 
 
 def interactive_browse(renderer: ConsoleRender, last_view: NodeView) -> None:
@@ -1276,25 +2141,14 @@ def interactive_browse(renderer: ConsoleRender, last_view: NodeView) -> None:
     expand/collapse the completed execution tree.  Exits on 'q' or Esc.
     """
     renderer.reset_for_browse()
-
-    # Initial render
-    output = renderer.render(last_view)
-    ConsoleRender.ui_driver(output)
-
-    fd = sys.stdin.fileno()
-    old_settings = termios.tcgetattr(fd)
+    renderer._console_session_active = True
+    renderer.pre_console()
     try:
-        tty.setcbreak(fd)
-        while True:
-            key = _read_key(fd, timeout=0.15)
-            if key is not None:
-                should_exit = _handle_key(key, renderer)
-                if should_exit:
-                    break
-            # Re-render (handles viewport/cursor updates and status bar animation)
-            output = renderer.render(None)
-            ConsoleRender.ui_driver(output)
-    except (KeyboardInterrupt, EOFError):
-        pass
+        renderer._ui_driver(renderer.render(last_view))
+        if os.name == "nt":
+            renderer._browse_until_quit_windows()
+        else:
+            renderer._browse_until_quit_posix()
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        renderer._console_session_active = False
+        renderer.restore_console()

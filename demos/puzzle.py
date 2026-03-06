@@ -14,7 +14,7 @@ from ..core import (
 )
 from ..runtime import Runtime
 from .client_factory import CLIENT_FACTORIES
-from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
+from ..viz import ConsoleRender
 
 
 PUZZLE_SOLVER_SYSTEM_PROMPT = (
@@ -183,8 +183,6 @@ INTERLEAVE_AGENT, INTERLEAVE_TOOLS = build_interleave_agent(
 def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     """Execute the shared puzzle with a live tree view (single loop thread)."""
 
-    enable_vt_if_windows()
-
     runtime = Runtime(
         specs=[INTERLEAVE_AGENT, *INTERLEAVE_TOOLS],
         client_factories=CLIENT_FACTORIES,
@@ -197,43 +195,19 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     # Ensure the root node participates in cooperative cancellation chaining.
     node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider, cancel_event=cancel_evt)
 
-    # Enter alternative screen buffer; hide cursor; disable auto-wrap; clear scrollback
-    ConsoleRender.pre_console()
-
-    # UI: start a single-thread view loop using TextRender
     render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
-    view_thread = start_view_loop(
-        node,
-        render=render,
-        ui_driver=ConsoleRender.ui_driver,
-        update_interval=0.1,
-    )
 
     final_result: Optional[Any] = None
     run_exception: Optional[Exception] = None
     try:
-       # Block until tree finished.
-       final_result = node.result()
-    except KeyboardInterrupt:
-        # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
-        cancel_evt.set()
-        # Wait for the node to conclude (may still finish success/exception per guidance).
-        try:
-            node.result()
-        except CancellationException:
-            pass
+        render.run(node)
+        final_result = node.result()
+    except CancellationException:
+        pass
     except Exception as e:
         run_exception = e
     finally:
-        # Ensure UI watcher/ticker threads exit.
         cancel_evt.set()
-        # Synchronize: ensure the view loop has exited
-        try:
-            view_thread.join(timeout=2.0)
-        except Exception:
-            pass
-        # Restore cursor, re-enable auto-wrap and leave alternative screen buffer on exit
-        ConsoleRender.restore_console()    
 
     # Final render to show final state.
     print(str(render.render(runtime.watch(node))))
