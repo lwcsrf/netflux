@@ -9,6 +9,12 @@ By default it reads API keys from the following files in this directory:
 Create each file and paste your API key as the only line of text. If you use a different
 authentication flow, update the callables in `client_factory.py` before running the demos.
 
+### Interactive console viewer
+
+The interactive demos use `ConsoleRender.run(node)` directly. The renderer owns the
+terminal session, streams live `NodeView` updates, handles keyboard navigation, and leaves
+the completed tree open for browsing until you quit.
+
 ### Gauntlet (`puzzle.py`)
 
 The LLM needs to solve a series of puzzles and can't advance to the next stage until it has solved this stage's puzzle.

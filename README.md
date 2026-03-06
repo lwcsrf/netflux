@@ -33,7 +33,7 @@ source .venv/bin/activate
 # Install the library in "editable" mode (`-e`), meaning your source code changes
 # are immediately reflected. It also installs the `test` and `all` dependency groups,
 # which include `pytest` and all the provider SDKs (Anthropic, Gemini, etc).
-pip install -e .[test,all]
+pip install -e ".[test,all]"
 
 # Run all tests.
 pytest tests/ -v
@@ -290,6 +290,17 @@ while True:
 ```
 
 This ensures your UI only sees **consistent** views of the task tree.
+
+If you just want a pretty good interactive terminal viewer, use `ConsoleRender` included in the `viz` subpackage directly instead of writing your own watch loop:
+
+```python
+from netflux.viz import ConsoleRender
+
+render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+render.run(node)
+```
+
+`ConsoleRender` gives you a collapsible execution tree, keyboard navigation, agent-to-agent jumping, expand/collapse-all actions, and a post-completion browser. It redraws when either: (1) a newer `NodeView` snapshot arrives, (2) the animation (e.g. spinner / timer) advances while work is still running, (3) when the user presses a bound key to navigate the tree, and (4) when the terminal size changes.
 
 ---
 

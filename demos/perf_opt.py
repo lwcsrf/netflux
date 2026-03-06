@@ -15,7 +15,7 @@ from typing import Dict, List, Optional
 
 from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider, RunContext, CancellationException
 from ..runtime import Runtime
-from ..viz import ConsoleRender, start_view_loop, enable_vt_if_windows
+from ..viz import ConsoleRender
 from .client_factory import CLIENT_FACTORIES
 from ..func_lib.text_editor import text_editor
 from ..func_lib.raise_exception import raise_exception
@@ -414,7 +414,6 @@ def make_demo_workspace() -> Dict[str, str]:
 
 
 def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> Optional[str]:
-    enable_vt_if_windows()
     ws = make_demo_workspace()
 
     # Ensure the agents uses the same provider as the top-level optimizer
@@ -443,42 +442,22 @@ def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> Optional[str
         cancel_event=cancel_evt,
     )
 
-    # Enter alternate screen buffer, hide cursor, disable wrap, clear scrollback
-    ConsoleRender.pre_console()
-
-    # UI: start a single-thread background view loop to console.
     render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
-    view_thread = start_view_loop(
-        node,
-        render=render,
-        ui_driver=ConsoleRender.ui_driver,
-        update_interval=0.1,
-    )
 
     final_path: Optional[str] = None
     try:
-       # Block until tree finished.
-       final_path = str(node.result())
-    except KeyboardInterrupt:
-        # Propagate Ctrl-C via cooperative cancel so all children stop promptly.
-        cancel_evt.set()
-    except:
-        # Handle below.
-        pass
-    
-    # Wait for terminal state.
-    node.wait()
-    # Ensure UI watcher/ticker threads exit.
-    cancel_evt.set()
-    # Synchronize: ensure the view loop has exited
-    try:
-        view_thread.join(timeout=2.0)
+        render.run(node)
     except Exception:
         pass
-    # Restore cursor, re-enable auto-wrap and leave alternative screen buffer on exit
-    ConsoleRender.restore_console()
 
-    # Final render to show final state (regardless of success, error, canceled).
+    node.wait()
+    cancel_evt.set()
+
+    try:
+        final_path = str(node.result())
+    except Exception:
+        pass
+
     print(str(render.render(runtime.watch(node))))
 
     if node.state == NodeState.Error:

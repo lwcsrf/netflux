@@ -7,7 +7,7 @@ from typing import List, Optional, Tuple
 
 from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider
 from ..runtime import Runtime
-from ..viz import ConsoleRender, start_view_loop
+from ..viz import ConsoleRender
 from .client_factory import CLIENT_FACTORIES
 from ..func_lib.apply_diff import apply_diff_patch
 
@@ -263,15 +263,8 @@ def _run_applydiff(
             provider=provider,
         )
 
-        # Simple live view in console
-        ConsoleRender.pre_console()
         render = ConsoleRender(spinner_hz=10.0)
-        view_thread = start_view_loop(
-            node,
-            render=render,
-            ui_driver=ConsoleRender.ui_driver,
-            update_interval=0.1,
-        )
+        render.run(node)
 
         result_text: Optional[str] = None
         exc: Optional[Exception] = None
@@ -279,13 +272,6 @@ def _run_applydiff(
             result_text = str(node.result())
         except Exception as e:
             exc = e
-
-        node.wait()
-        try:
-            view_thread.join(timeout=1.0)
-        except Exception:
-            pass
-        ConsoleRender.restore_console()
 
         # Final static frame
         print(str(render.render(runtime.watch(node))))
@@ -403,4 +389,3 @@ def main(argv: Optional[List[str]] = None) -> None:
 
 if __name__ == "__main__":
     main()
-
