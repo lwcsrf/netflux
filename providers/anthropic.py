@@ -162,6 +162,11 @@ class AnthropicAgentNode(AgentNode):
     def token_usage(self) -> TokenUsage:
         return self._token_usage
 
+    @property
+    @override
+    def provider(self) -> Provider:
+        return Provider.Anthropic
+
     def run(self) -> None:
         # Agent loop.
         for _ in range(MAX_STEPS):

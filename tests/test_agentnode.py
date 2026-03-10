@@ -32,6 +32,10 @@ class _FakeAgentNode(AgentNode):
     def token_usage(self) -> TokenUsage:
         return TokenUsage()
 
+    @property
+    def provider(self) -> Provider:
+        return Provider.Anthropic
+
     def run(self) -> None:  # pragma: no cover - behavior overridden per test when needed
         # By default, succeed immediately with a placeholder result
         self.ctx.post_success({"ok": True})

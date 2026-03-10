@@ -9,7 +9,7 @@ class Provider(Enum):
 
 # Framework assumes only using single best LLM from each provider for now.
 ModelNames: Dict[Provider, str] = {
-    Provider.OpenAI: "gpt-5-2025-08-07",
+    Provider.OpenAI: "gpt-5-4",
     Provider.Anthropic: "claude-opus-4-6",
     Provider.Gemini: "gemini-3.1-pro-preview",
     Provider.xAI: "grok-4",
