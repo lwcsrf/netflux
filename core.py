@@ -459,6 +459,7 @@ class NodeView:
     ended_at: Optional[float]  # Any terminal state.
     update_seqnum: int  # Seqnum when this NodeView was generated.
     tool_use_id: Optional[str] = None  # The tool_use_id that triggered this Node, if any.
+    provider: Optional[Provider] = None
 
     # Maps id(TranscriptPart) -> child NodeView for ToolUsePart and ToolResultPart entries
     # whose corresponding child exists in `children`. Keyed by Python object id of the exact
@@ -467,19 +468,30 @@ class NodeView:
     # child was created (e.g. invoke_tool_function threw) or not yet created (transient gap).
     transcript_child_map: Mapping[int, 'NodeView'] = field(default_factory=dict)
 
-    def total_tree_token_bill(self) -> TokenBill:
-        usage = self.usage
-        cache_read = usage.input_tokens_cache_read if usage else 0
-        cache_write = (usage.input_tokens_cache_write or 0) if usage else 0
-        regular = usage.input_tokens_regular if usage else 0
-        output = usage.output_tokens_total if usage else 0
+    def total_tree_token_bill(self) -> Dict[Provider, TokenBill]:
+        bills: Dict[Provider, TokenBill] = {}
+        if self.usage is not None:
+            if self.provider is None:
+                raise ValueError(f"NodeView {self.id} has token usage but no provider")
+            bills[self.provider] = TokenBill(
+                input_tokens_cache_read=self.usage.input_tokens_cache_read,
+                input_tokens_cache_write=self.usage.input_tokens_cache_write or 0,
+                input_tokens_regular=self.usage.input_tokens_regular,
+                output_tokens_total=self.usage.output_tokens_total,
+            )
         for child in self.children:
-            child_bill = child.total_tree_token_bill()
-            cache_read += child_bill.input_tokens_cache_read
-            cache_write += child_bill.input_tokens_cache_write
-            regular += child_bill.input_tokens_regular
-            output += child_bill.output_tokens_total
-        return TokenBill(cache_read, cache_write, regular, output)
+            for provider, child_bill in child.total_tree_token_bill().items():
+                current = bills.get(provider)
+                if current is None:
+                    bills[provider] = child_bill
+                else:
+                    bills[provider] = TokenBill(
+                        input_tokens_cache_read=current.input_tokens_cache_read + child_bill.input_tokens_cache_read,
+                        input_tokens_cache_write=current.input_tokens_cache_write + child_bill.input_tokens_cache_write,
+                        input_tokens_regular=current.input_tokens_regular + child_bill.input_tokens_regular,
+                        output_tokens_total=current.output_tokens_total + child_bill.output_tokens_total,
+                    )
+        return bills
 
 class Node(ABC):
     def __init__(
@@ -648,6 +660,11 @@ class AgentNode(Node):
     @property
     @abstractmethod
     def token_usage(self) -> TokenUsage:
+        raise NotImplementedError
+
+    @property
+    @abstractmethod
+    def provider(self) -> Provider:
         raise NotImplementedError
 
     @override

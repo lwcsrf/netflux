@@ -20,6 +20,7 @@ from ..core import (
     NodeView,
     RunContext,
     SessionScope,
+    TokenBill,
     TokenUsage,
     CancellationException,
 )
@@ -218,6 +219,10 @@ class TestRuntimeInvocation(unittest.TestCase):
             def token_usage(self) -> TokenUsage:
                 return TokenUsage()
 
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
         FakeAgentNode.last_client = None
 
         with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
@@ -229,6 +234,7 @@ class TestRuntimeInvocation(unittest.TestCase):
             self.assertIs(FakeAgentNode.last_client, factory_result)
             assert isinstance(node, AgentNode)  # silences pylance
             self.assertIs(node.agent_fn, agent_fn)
+            self.assertEqual(runtime.get_view(node.id).provider, Provider.Anthropic)
 
     def test_invoke_links_parent_child_relationship(self) -> None:
         child_result = "child-value"
@@ -623,6 +629,89 @@ class TestNodeViewStructure(unittest.TestCase):
         self.assertEqual(invocation_order, [1, 2])
         self.assertEqual(view.children[0].id, parent_node.children[0].id)
         self.assertEqual(view.children[1].id, parent_node.children[1].id)
+
+    def test_total_tree_token_bill_groups_by_provider(self) -> None:
+        agent_fn = _make_agent_function("agent")
+
+        class FakeAnthropicAgentNode(AgentNode):
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage(
+                    input_tokens_cache_read=1,
+                    input_tokens_cache_write=2,
+                    input_tokens_regular=3,
+                    output_tokens_total=4,
+                )
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
+            def run(self) -> None:
+                self.ctx.post_success("anthropic")
+
+        class FakeGeminiAgentNode(AgentNode):
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage(
+                    input_tokens_cache_read=10,
+                    input_tokens_regular=20,
+                    output_tokens_total=30,
+                )
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Gemini
+
+            def run(self) -> None:
+                self.ctx.post_success("gemini")
+
+        def fake_impl(provider: Provider) -> type[AgentNode]:
+            if provider == Provider.Anthropic:
+                return FakeAnthropicAgentNode
+            if provider == Provider.Gemini:
+                return FakeGeminiAgentNode
+            raise ValueError(provider)
+
+        def parent_callable(ctx: RunContext) -> str:
+            default_node = ctx.invoke(agent_fn, {})
+            gemini_node = ctx.invoke(agent_fn, {}, provider=Provider.Gemini)
+            self.assertEqual(default_node.result(), "anthropic")
+            self.assertEqual(gemini_node.result(), "gemini")
+            return "parent"
+
+        parent_fn = _make_code_function("parent", callable=parent_callable, uses=[agent_fn])
+
+        with patch("netflux.runtime.get_AgentNode_impl", side_effect=fake_impl):
+            runtime = Runtime(
+                [parent_fn],
+                client_factories={
+                    Provider.Anthropic: lambda: object(),
+                    Provider.Gemini: lambda: object(),
+                },
+            )
+            parent_node = runtime.invoke(None, parent_fn, {})
+            self.assertEqual(parent_node.result(), "parent")
+
+        view = runtime.get_view(parent_node.id)
+        self.assertIsNone(view.provider)
+        self.assertEqual(
+            view.total_tree_token_bill(),
+            {
+                Provider.Anthropic: TokenBill(
+                    input_tokens_cache_read=1,
+                    input_tokens_cache_write=2,
+                    input_tokens_regular=3,
+                    output_tokens_total=4,
+                ),
+                Provider.Gemini: TokenBill(
+                    input_tokens_cache_read=10,
+                    input_tokens_cache_write=0,
+                    input_tokens_regular=20,
+                    output_tokens_total=30,
+                ),
+            },
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

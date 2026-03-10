@@ -127,6 +127,11 @@ class GeminiAgentNode(AgentNode):
     def token_usage(self) -> TokenUsage:
         return self._token_usage
 
+    @property
+    @override
+    def provider(self) -> Provider:
+        return Provider.Gemini
+
     def _new_tool_use_id(self, tool_name: str) -> str:
         self._tool_call_counter += 1
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"

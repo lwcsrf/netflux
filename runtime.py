@@ -245,10 +245,12 @@ class Runtime:
 
         usage: Optional[TokenUsage] = None
         transcript: tuple = ()
+        provider: Optional[Provider] = None
         if isinstance(node, AgentNode):
             # Snapshot token usage and transcript as immutables.
             usage = copy.deepcopy(node.token_usage)
             transcript = tuple(node.transcript)
+            provider = node.provider
 
         # Build transcript_child_map: correlate ToolUsePart/ToolResultPart -> child NodeView
         # via tool_use_id matching. Only populated for `AgentNode`s with transcripts.
@@ -280,6 +282,7 @@ class Runtime:
             ended_at=node.ended_at,
             update_seqnum=self._global_seqno,
             tool_use_id=node.tool_use_id,
+            provider=provider,
             transcript_child_map=MappingProxyType(transcript_child_map),
         )
 
