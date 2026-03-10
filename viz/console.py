@@ -633,6 +633,20 @@ class ConsoleRender:
         self._signal_redraw_locked()
         return True
 
+    def _toggle_expanded_locked(self) -> None:
+        if not (0 <= self._cursor < len(self._line_infos)):
+            return
+
+        if self._toggle_line_locked(self._cursor):
+            return
+
+        for i in range(self._cursor - 1, -1, -1):
+            parent_info = self._line_infos[i]
+            if parent_info.expandable and parent_info.key is not None:
+                self._collapse_overrides[parent_info.key] = True
+                self._set_cursor(i, disable_follow=True)
+                return
+
     def handle_click(self, x: int, y: int, *, button: str = "left") -> None:
         with self._lock:
             if button == "wheel_up":
@@ -649,12 +663,13 @@ class ConsoleRender:
             if not (0 <= line_idx < len(self._line_infos)):
                 return
 
-            self._set_cursor(line_idx, disable_follow=True)
-
             info = self._line_infos[line_idx]
-            if info.toggle_col is None:
+            if line_idx == self._cursor:
+                self._toggle_expanded_locked()
                 return
-            if x == info.toggle_col:
+
+            self._set_cursor(line_idx, disable_follow=True)
+            if info.toggle_col is not None and x == info.toggle_col:
                 self._toggle_line_locked(line_idx)
 
     def navigate_up(self) -> None:
@@ -754,18 +769,7 @@ class ConsoleRender:
 
     def toggle_expanded(self) -> None:
         with self._lock:
-            if not (0 <= self._cursor < len(self._line_infos)):
-                return
-
-            if self._toggle_line_locked(self._cursor):
-                return
-
-            for i in range(self._cursor - 1, -1, -1):
-                parent_info = self._line_infos[i]
-                if parent_info.expandable and parent_info.key is not None:
-                    self._collapse_overrides[parent_info.key] = True
-                    self._set_cursor(i, disable_follow=True)
-                    return
+            self._toggle_expanded_locked()
 
     def toggle(self) -> None:
         self.toggle_expanded()
