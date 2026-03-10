@@ -32,7 +32,7 @@ import time
 import ctypes
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
-from typing import Any, Iterator
+from typing import Any, Iterator, Mapping
 
 from ..core import (
     Function,
@@ -40,11 +40,14 @@ from ..core import (
     Node,
     NodeState,
     NodeView,
+    TokenBill,
     ThinkingBlockPart,
     ToolResultPart,
     ToolUsePart,
     UserTextPart,
 )
+from ..providers import ModelNames, Provider
+
 if os.name != "nt":
     import select
     import termios
@@ -61,7 +64,6 @@ else:  # pragma: no cover - runtime guarded use on non-POSIX terminals only
 RESET = "\x1b[0m"
 BOLD = "\x1b[1m"
 DIM = "\x1b[2m"
-REVERSE = "\x1b[7m"
 
 FG: dict[str, str] = {
     "red": "\x1b[31m",
@@ -75,6 +77,9 @@ FG: dict[str, str] = {
 }
 
 BG_CURSOR = "\x1b[48;5;237m"
+BG_STATUS_BAR = "\x1b[48;5;238m"
+BG_STATUS_STATE = "\x1b[48;5;24m"
+BG_STATUS_TOKENS = "\x1b[48;5;52m"
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Glyphs
@@ -82,11 +87,12 @@ BG_CURSOR = "\x1b[48;5;237m"
 
 FOLD = "▸"
 UNFOLD = "▾"
-THINKING = "💭"
+THINKING = "➰"
+AGENT_GLYPH = "✨"
+CODE_GLYPH = "⚙️ "
 RESULT_GLYPH = "📤"
 ARGS_GLYPH = "📋"
 USER_GLYPH = "👤"
-MODEL_GLYPH = "🤖"
 FUNCTION_GLYPH = "🧰"
 VERT = "│"
 TEE = "├─"
@@ -179,6 +185,14 @@ def _color(
     return "".join(codes) + text + RESET
 
 
+def _style_block(text: str, *codes: str) -> str:
+    """Apply persistent ANSI styles across embedded RESET codes."""
+    prefix = "".join(code for code in codes if code)
+    if not prefix or not text:
+        return text
+    return prefix + text.replace(RESET, RESET + prefix) + RESET
+
+
 _STATE_GLYPHS: dict[NodeState, tuple[str, str]] = {
     NodeState.Waiting: ("…", "yellow"),
     NodeState.Success: ("✔", "green"),
@@ -210,9 +224,9 @@ def _has_error(nv: NodeView) -> bool:
 def _type_glyph(fn: Function) -> str:
     """Return a type glyph for the function."""
     if fn.is_agent():
-        return "✨"
+        return AGENT_GLYPH
     if fn.is_code():
-        return "⚙️ "
+        return CODE_GLYPH
     return "•"
 
 
@@ -633,6 +647,20 @@ class ConsoleRender:
         self._signal_redraw_locked()
         return True
 
+    def _toggle_expanded_locked(self) -> None:
+        if not (0 <= self._cursor < len(self._line_infos)):
+            return
+
+        if self._toggle_line_locked(self._cursor):
+            return
+
+        for i in range(self._cursor - 1, -1, -1):
+            parent_info = self._line_infos[i]
+            if parent_info.expandable and parent_info.key is not None:
+                self._collapse_overrides[parent_info.key] = True
+                self._set_cursor(i, disable_follow=True)
+                return
+
     def handle_click(self, x: int, y: int, *, button: str = "left") -> None:
         with self._lock:
             if button == "wheel_up":
@@ -649,12 +677,13 @@ class ConsoleRender:
             if not (0 <= line_idx < len(self._line_infos)):
                 return
 
-            self._set_cursor(line_idx, disable_follow=True)
-
             info = self._line_infos[line_idx]
-            if info.toggle_col is None:
+            if line_idx == self._cursor:
+                self._toggle_expanded_locked()
                 return
-            if x == info.toggle_col:
+
+            self._set_cursor(line_idx, disable_follow=True)
+            if info.toggle_col is not None and x == info.toggle_col:
                 self._toggle_line_locked(line_idx)
 
     def navigate_up(self) -> None:
@@ -754,18 +783,7 @@ class ConsoleRender:
 
     def toggle_expanded(self) -> None:
         with self._lock:
-            if not (0 <= self._cursor < len(self._line_infos)):
-                return
-
-            if self._toggle_line_locked(self._cursor):
-                return
-
-            for i in range(self._cursor - 1, -1, -1):
-                parent_info = self._line_infos[i]
-                if parent_info.expandable and parent_info.key is not None:
-                    self._collapse_overrides[parent_info.key] = True
-                    self._set_cursor(i, disable_follow=True)
-                    return
+            self._toggle_expanded_locked()
 
     def toggle(self) -> None:
         self.toggle_expanded()
@@ -1773,6 +1791,37 @@ class ConsoleRender:
 
         return ", ".join(segs)
 
+    @staticmethod
+    def _provider_model_abbrev(provider: Provider) -> str:
+        model_name = ModelNames[provider].replace(".", "-")
+        return "".join(part[0] for part in model_name.split("-") if part)
+
+    @staticmethod
+    def _format_token_bill_fields(bill: TokenBill) -> str:
+        fields: list[str] = []
+        if bill.input_tokens_cache_read:
+            fields.append(f"CR:{bill.input_tokens_cache_read}")
+        if bill.input_tokens_cache_write:
+            fields.append(f"CW:{bill.input_tokens_cache_write}")
+        if bill.input_tokens_regular:
+            fields.append(f"Reg:{bill.input_tokens_regular}")
+        if bill.output_tokens_total:
+            fields.append(f"Out:{bill.output_tokens_total}")
+        return " ".join(fields)
+
+    @classmethod
+    def _format_total_token_bill(
+        cls,
+        bills: Mapping[Provider, TokenBill],
+    ) -> str:
+        rendered: list[str] = []
+        for provider, bill in bills.items():
+            fields = cls._format_token_bill_fields(bill)
+            if not fields:
+                continue
+            rendered.append(f"{cls._provider_model_abbrev(provider)}[{fields}]")
+        return "  ".join(rendered)
+
     # ── Viewport rendering ────────────────────────────────────────────────
 
     def _render_viewport(self) -> str:
@@ -1828,12 +1877,17 @@ class ConsoleRender:
             and self._last_view is not None
             and self._last_view.state not in _TERMINAL_STATES
         )
-
-        # Show q:quit only when execution is complete
         is_terminal = self._last_view and self._last_view.state in _TERMINAL_STATES
+
         quit_hint = "  q:quit" if is_terminal else ""
         cancel_hint = "  ^C:cancel" if can_cancel else ""
-        right = pos if not state_text else f"{pos}  {state_text}"
+        status_text = pos if not state_text else f"{pos}  {state_text}"
+        token_text = ""
+        if self._last_view is not None:
+            token_text = self._format_total_token_bill(
+                self._last_view.total_tree_token_bill()
+            )
+
         shortcut_variants = [
             "↑↓/jk:move  ␣:toggle  PgUp/PgDn:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
             "↑↓/jk:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
@@ -1845,34 +1899,55 @@ class ConsoleRender:
             "jk ␣ n/N c E/C",
             "jk ␣ n/N",
         ]
-        suffix = f" │ {right} "
-        shortcuts = shortcut_variants[-1]
+
+        status_raw = f" {status_text} "
+        token_raw = f" {token_text} " if token_text else ""
+
+        status_len = _visible_len(status_raw)
+        token_len = _visible_len(token_raw)
+        if status_len + token_len > cols:
+            remaining = max(0, cols - status_len)
+            if remaining <= 0:
+                status_raw = _crop_line(status_raw, cols)
+                token_raw = ""
+            elif token_raw:
+                token_raw = _crop_line(token_raw, remaining) if remaining >= 8 else ""
+
+        right_len = _visible_len(status_raw) + _visible_len(token_raw)
+        left_budget = max(0, cols - right_len)
+        left_text_budget = max(0, left_budget - 1)
+
+        left = f"{shortcut_variants[-1]}{cancel_hint}{quit_hint}"
         for candidate in shortcut_variants:
-            full = f" {candidate}{cancel_hint}{quit_hint}{suffix}"
-            if _visible_len(full) <= cols:
-                shortcuts = candidate
+            candidate_left = f"{candidate}{cancel_hint}{quit_hint}"
+            if _visible_len(candidate_left) <= left_text_budget:
+                left = candidate_left
                 break
 
-        left = f"{shortcuts}{cancel_hint}{quit_hint}"
-        max_left = max(0, cols - _visible_len(suffix) - 1)
-        if _visible_len(left) > max_left:
-            if max_left <= 1:
+        if _visible_len(left) > left_text_budget:
+            if left_text_budget <= 1:
                 left = ""
-            elif max_left == 2:
+            elif left_text_budget == 2:
                 left = "…"
             else:
-                left = left[: max_left - 1] + "…"
+                left = left[: left_text_budget - 1] + "…"
 
-        bar = f" {left}{suffix}"
+        left_raw = ""
+        if left_budget > 0:
+            left_raw = f" {left}"
+            vis_len = _visible_len(left_raw)
+            if vis_len < left_budget:
+                left_raw = left_raw + " " * (left_budget - vis_len)
+            elif vis_len > left_budget:
+                left_raw = _crop_line(left_raw, left_budget)
 
-        # Pad to terminal width (use visible length for calculation)
-        vis_len = _visible_len(bar)
-        if vis_len < cols:
-            bar = bar + " " * (cols - vis_len)
-        elif vis_len > cols:
-            bar = _crop_line(bar, cols)
-
-        return f"{REVERSE}{bar}{RESET}"
+        segments: list[str] = []
+        if left_raw:
+            segments.append(_style_block(left_raw, FG["white"], BG_STATUS_BAR))
+        segments.append(_style_block(status_raw, BOLD, FG["white"], BG_STATUS_STATE))
+        if token_raw:
+            segments.append(_style_block(token_raw, BOLD, FG["white"], BG_STATUS_TOKENS))
+        return "".join(segments)
 
     def _tick(self) -> int:
         return int((time.monotonic() - self._t0) * self.spinner_hz)
@@ -2261,8 +2336,8 @@ def _decode_windows_mouse_event(event: _WinMouseEventRecord) -> MouseEvent | Non
             y=y,
             button="wheel_up" if delta > 0 else "wheel_down",
         )
-    # Ignore distinct double-click events; the initial press is already reported.
-    if event.dwEventFlags != 0:
+    # Treat double-click as a second press; ignore other flagged mouse events.
+    if event.dwEventFlags not in (0, _WIN_DOUBLE_CLICK):
         return None
     if event.dwButtonState & _WIN_FROM_LEFT_1ST_BUTTON_PRESSED:
         return MouseEvent(x=x, y=y, button="left")
