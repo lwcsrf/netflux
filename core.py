@@ -67,6 +67,14 @@ class TokenUsage:
     context_window_in: int = 0
     context_window_out: int = 0
 
+@dataclass(frozen=True)
+class TokenBill:
+    # Mutually exclusive totals of token types for billing purposes.
+    input_tokens_cache_read: int = 0
+    input_tokens_cache_write: int = 0
+    input_tokens_regular: int = 0
+    output_tokens_total: int = 0
+
 class SessionBag:
     """Thread-safe namespace/key object registry for a Node scope."""
     def __init__(self) -> None:
@@ -458,6 +466,20 @@ class NodeView:
     # `children`. Correlation is done via matching tool_use_id. Entries are absent when no
     # child was created (e.g. invoke_tool_function threw) or not yet created (transient gap).
     transcript_child_map: Mapping[int, 'NodeView'] = field(default_factory=dict)
+
+    def total_tree_token_bill(self) -> TokenBill:
+        usage = self.usage
+        cache_read = usage.input_tokens_cache_read if usage else 0
+        cache_write = (usage.input_tokens_cache_write or 0) if usage else 0
+        regular = usage.input_tokens_regular if usage else 0
+        output = usage.output_tokens_total if usage else 0
+        for child in self.children:
+            child_bill = child.total_tree_token_bill()
+            cache_read += child_bill.input_tokens_cache_read
+            cache_write += child_bill.input_tokens_cache_write
+            regular += child_bill.input_tokens_regular
+            output += child_bill.output_tokens_total
+        return TokenBill(cache_read, cache_write, regular, output)
 
 class Node(ABC):
     def __init__(
