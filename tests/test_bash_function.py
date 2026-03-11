@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -5,6 +6,21 @@ from typing import Dict, Optional
 
 from ..core import RunContext, SessionBag, SessionScope
 from ..func_lib.bash import Bash, BashSession, BashCommandTimeoutException
+
+
+def _bash_path(p) -> str:
+    """Convert a path to a form usable inside bash.
+
+    On Windows (MSYS2/Git Bash) this turns ``C:\\Users\\foo`` into
+    ``/c/Users/foo`` so that the persistent bash process can resolve it.
+    On POSIX systems the path is returned unchanged.
+    """
+    s = str(p)
+    if os.name == "nt" and len(s) >= 2 and s[1] == ":":
+        drive = s[0].lower()
+        rest = s[2:].replace("\\", "/")
+        return f"/{drive}{rest}"
+    return s
 
 
 class _DummyNode:
@@ -56,9 +72,10 @@ class TestBashFunctionCommands(unittest.TestCase):
     def test_heredoc_without_trailing_newline_creates_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "hello.txt"
+            bp = _bash_path(target)
             command = "\n".join(
                 [
-                    f"cat <<'EOF' > {target}",
+                    f"cat <<'EOF' > {bp}",
                     "hello from heredoc",
                     "EOF",
                 ]
@@ -74,15 +91,17 @@ class TestBashFunctionCommands(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             first = Path(tmpdir) / "first.txt"
             second = Path(tmpdir) / "second.txt"
+            bp_first = _bash_path(first)
+            bp_second = _bash_path(second)
             command = "\n".join(
                 [
-                    f"cat <<'ONE' > {first}",
+                    f"cat <<'ONE' > {bp_first}",
                     "alpha",
                     "ONE",
-                    f"cat <<'TWO' > {second}",
+                    f"cat <<'TWO' > {bp_second}",
                     "beta",
                     "TWO",
-                    f"paste -d',' {first} {second}",
+                    f"paste -d',' {bp_first} {bp_second}",
                 ]
             )
 
@@ -96,13 +115,14 @@ class TestBashFunctionCommands(unittest.TestCase):
     def test_heredoc_with_tab_stripping(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "tabs.txt"
+            bp = _bash_path(target)
             command = "\n".join(
                 [
-                    f"cat <<-'EOF' > {target}",
+                    f"cat <<-'EOF' > {bp}",
                     "\tline one",
                     "\tline two",
                     "EOF",
-                    f"cat {target}",
+                    f"cat {bp}",
                 ]
             )
 
@@ -200,10 +220,10 @@ class TestBashFunctionCommands(unittest.TestCase):
 
     def test_brace_expansion_and_globbing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
-            target = Path(tmpdir)
+            bp = _bash_path(tmpdir)
             command = "\n".join(
                 [
-                    f"pushd {target} >/dev/null",
+                    f"pushd {bp} >/dev/null",
                     "touch file{1..3}.txt",
                     "printf '%s\\n' file?.txt",
                     "popd >/dev/null",
@@ -268,9 +288,10 @@ class TestBashFunctionCommands(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             script = Path(tmpdir) / "helper.sh"
             script.write_text("say() { echo sourced; }\n")
+            bp = _bash_path(tmpdir)
             command = "\n".join(
                 [
-                    f"pushd {tmpdir} >/dev/null",
+                    f"pushd {bp} >/dev/null",
                     ". ./helper.sh",
                     "say",
                     "popd >/dev/null",
@@ -280,6 +301,44 @@ class TestBashFunctionCommands(unittest.TestCase):
             output = self.bash._call(self.ctx, command=command, session_id=0)
 
             self.assertEqual(output.strip(), "sourced")
+
+    def test_no_sentinel_leakage_across_sequential_commands(self) -> None:
+        """Sentinel must never appear in command output, even across rapid sequential calls."""
+        import re as _re
+        sentinel_pat = _re.compile(r"__NETFLUX_BASH_DONE__")
+
+        for i in range(20):
+            # Use a pipe (the pattern that originally triggered the bug).
+            out1 = self.bash._call(self.ctx, command="echo 'hello world' | cat", session_id=0)
+            self.assertNotRegex(out1, sentinel_pat, f"Sentinel leaked on piped command, iteration {i}")
+
+            # Immediate follow-up, echoing a unique string.
+            out2 = self.bash._call(self.ctx, command=f"echo 'check-{i}'", session_id=0)
+            self.assertNotRegex(out2, sentinel_pat, f"Sentinel leaked on follow-up command, iteration {i}")
+            self.assertEqual(out2.strip(), f"check-{i}")
+
+    def test_no_sentinel_leakage_with_stderr_redirect(self) -> None:
+        """Reproduce the original report: piped command with 2>/dev/null followed by more commands."""
+        import re as _re
+        sentinel_pat = _re.compile(r"__NETFLUX_BASH_DONE__")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "sample.txt"
+            # Create a small file.
+            target.write_text("\n".join(f"line {n}" for n in range(1, 52)) + "\n")
+            bp = _bash_path(target)
+
+            for _ in range(10):
+                command = "\n".join([
+                    f"cat {bp} 2>/dev/null | head -5",
+                    'echo "---"',
+                    f"wc -l < {bp}",
+                ])
+                output = self.bash._call(self.ctx, command=command, session_id=0)
+                self.assertNotRegex(output, sentinel_pat, "Sentinel leaked into output")
+                lines = [l for l in output.strip().splitlines() if l]
+                self.assertIn("---", lines)
+                self.assertTrue(lines[-1].strip() == "51", f"Expected 51 lines, got: {lines[-1]}")
 
 if __name__ == "__main__":
     unittest.main()

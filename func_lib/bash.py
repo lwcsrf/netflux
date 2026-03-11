@@ -1,7 +1,7 @@
 import os
-import platform
 import re
 import queue
+import shutil
 import signal
 import subprocess
 import threading
@@ -56,21 +56,34 @@ class BashSession:
         self.requires_restart: bool = False   # set true on timeout, etc.
         self._alive_once_started: bool = False
 
-    def start(self) -> None:
-        if platform.system().lower() not in ("linux", "darwin"):
-            raise BashException("Bash tool currently supports Unix-like systems only.")
+    @staticmethod
+    def _find_bash() -> str:
+        """Locate a usable bash executable, or raise."""
+        # Prefer /bin/bash on POSIX; fall back to PATH lookup (covers Windows/Git Bash/MSYS2).
+        if os.path.isfile("/bin/bash"):
+            return "/bin/bash"
+        found = shutil.which("bash")
+        if found:
+            return found
+        raise BashException(
+            "Cannot locate a bash executable. "
+            "On Windows, install Git for Windows (includes Git Bash) and ensure it is on PATH."
+        )
 
+    def start(self) -> None:
         if self._proc and self._proc.poll() is None:
             return
 
         # Ensure clean slate.
         self._terminate_group_if_alive()
 
+        bash_path = self._find_bash()
         preexec = os.setsid if os.name == "posix" else None
-        creationflags = 0
+        # On Windows, create a new process group so we can cleanly terminate the tree.
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
 
         self._proc = subprocess.Popen(  # noqa: S603, S607 (we intentionally run bash)
-            ["/bin/bash", "--noprofile", "--norc", "-s"],  # read from stdin; skip user rc/profile
+            [bash_path, "--noprofile", "--norc", "-s"],  # read from stdin; skip user rc/profile
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -86,9 +99,12 @@ class BashSession:
         self._start_readers()
 
         # Set pipeline semantics, disable history, quiet PS1, and block until ready.
+        # Save the original stdout pipe to fd 254 for resilient sentinel delivery in execute().
+        # This is resilient to user doing `exec 1>/dev/null` or similar redirections
+        # they may do within their commands.
         self._write(
             "set -o pipefail; export HISTFILE=/dev/null; export PS1=''; "
-            "shopt -s expand_aliases; echo __NETFLUX_BASH_READY__\n"
+            "shopt -s expand_aliases; exec 254>&1; echo __NETFLUX_BASH_READY__\n"
         )
         # Require readiness; if not reached, mark for restart and fail.
         if not self._drain_until("__NETFLUX_BASH_READY__", timeout=10):
@@ -218,7 +234,10 @@ class BashSession:
         sentinel = f"__NETFLUX_BASH_DONE__{uuid.uuid4().hex}"
         # Ensure the user command ends with a newline so here-doc delimiters stand alone.
         cmd = command if command.endswith("\n") else command + "\n"
-        # Make sentinel resilient to `set -e` and common fd redirections; print to both stdout and stderr.
+        # Make sentinel resilient to `set -e` and common fd redirections.
+        # Write sentinel to fd 254 (a saved dup of the
+        # original stdout pipe, created during session start). Using a dedicated fd means we
+        # emit exactly one sentinel line and ensure our pump thread will reliably play it back to us.
         block = (
             "was_e=false; case $- in *e*) was_e=true;; esac\n"
             # The curly braces are intentionally placed on their own lines to ensure heredoc delimiters
@@ -228,8 +247,7 @@ class BashSession:
             "}\n"
             "__nf_ec=$?\n"
             "$was_e && set -e\n"
-            f"printf '\\n{sentinel} %d\\n' \"$__nf_ec\"\n"
-            f"printf '\\n{sentinel} %d\\n' \"$__nf_ec\" 1>&2\n"
+            f"printf '\\n{sentinel} %d\\n' \"$__nf_ec\" >&254\n"
         )
         try:
             self._write(block)
