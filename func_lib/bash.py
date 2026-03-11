@@ -242,7 +242,9 @@ class BashSession:
             "__nf_was_e=false; case $- in *e*) __nf_was_e=true;; esac\n"
             # The curly braces are intentionally placed on their own lines to ensure heredoc delimiters
             # are recognized correctly by bash. Do not merge them with other lines.
-            "set +e; {\n"
+            # The `:` no-op ensures the group always contains at least one command,
+            # preventing a syntax error when the user command is only comments or blank lines.
+            "set +e; { :\n"
             f"{cmd}"
             "}\n"
             "__nf_ec=$?\n"

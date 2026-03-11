@@ -5,7 +5,15 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from ..core import RunContext, SessionBag, SessionScope
-from ..func_lib.bash import Bash, BashSession, BashCommandTimeoutException
+from ..func_lib.bash import (
+    Bash,
+    BashSession,
+    BashException,
+    BashCommandTimeoutException,
+    BashNonZeroExitCodeException,
+    BashSessionCrashedException,
+    BashRequiresRestartException,
+)
 
 
 def _bash_path(p) -> str:
@@ -346,6 +354,228 @@ class TestBashFunctionCommands(unittest.TestCase):
 
         follow_up = self.bash._call(self.ctx, command="echo after", session_id=0)
         self.assertIn("after", follow_up.splitlines())
+
+
+class TestBashEdgeCases(unittest.TestCase):
+    """Edge-case tests for unusual but plausible Bash session scenarios."""
+
+    def setUp(self) -> None:
+        self.top_bag = SessionBag()
+        self.parent_node = _DummyNode()
+        self.child_node = _DummyNode(parent=self.parent_node)
+        self.ctx = RunContext(runtime=None, node=self.child_node)  # type: ignore[arg-type]
+        self.ctx.object_bags = {
+            SessionScope.TopLevel: self.top_bag,
+            SessionScope.Parent: self.parent_node.session_bag,
+            SessionScope.Self: self.child_node.session_bag,
+        }
+        self.bash = Bash()
+
+    def tearDown(self) -> None:
+        bag_values: Dict[str, Dict[str, object]] = getattr(self.parent_node.session_bag, "_values", {})
+        for namespace in bag_values.values():
+            for obj in namespace.values():
+                if isinstance(obj, BashSession):
+                    proc = obj._proc
+                    obj._terminate_group_if_alive()
+                    if proc is not None:
+                        if proc.stdin:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
+                        if proc.stdout:
+                            try:
+                                proc.stdout.close()
+                            except Exception:
+                                pass
+                        if proc.stderr:
+                            try:
+                                proc.stderr.close()
+                            except Exception:
+                                pass
+                    thread = obj._stdout_thread
+                    if thread is not None and thread.is_alive():
+                        thread.join(timeout=0.5)
+
+    # ── State persistence ──
+
+    def test_cwd_persists_across_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bp = _bash_path(tmpdir)
+            self.bash._call(self.ctx, command=f"cd {bp}", session_id=0)
+            output = self.bash._call(self.ctx, command="pwd", session_id=0)
+            self.assertIn(os.path.basename(tmpdir), output)
+
+    def test_env_var_persists_across_calls(self) -> None:
+        self.bash._call(self.ctx, command="export NF_TEST_VAR=hello_netflux", session_id=0)
+        output = self.bash._call(self.ctx, command="echo $NF_TEST_VAR", session_id=0)
+        self.assertEqual(output.strip(), "hello_netflux")
+
+    def test_shell_function_persists_across_calls(self) -> None:
+        self.bash._call(self.ctx, command="nf_fn() { echo fn_output; }", session_id=0)
+        output = self.bash._call(self.ctx, command="nf_fn", session_id=0)
+        self.assertEqual(output.strip(), "fn_output")
+
+    def test_alias_persists_across_calls(self) -> None:
+        self.bash._call(self.ctx, command="alias nfalias='echo aliased'", session_id=0)
+        output = self.bash._call(self.ctx, command="nfalias", session_id=0)
+        self.assertEqual(output.strip(), "aliased")
+
+    def test_separate_sessions_independent_state(self) -> None:
+        self.bash._call(self.ctx, command="export X=session10", session_id=10)
+        self.bash._call(self.ctx, command="export X=session11", session_id=11)
+        out10 = self.bash._call(self.ctx, command="echo $X", session_id=10)
+        out11 = self.bash._call(self.ctx, command="echo $X", session_id=11)
+        self.assertEqual(out10.strip(), "session10")
+        self.assertEqual(out11.strip(), "session11")
+
+    # ── Restart behavior ──
+
+    def test_restart_clears_env(self) -> None:
+        self.bash._call(self.ctx, command="export EPHEMERAL=123", session_id=0)
+        self.bash._call(self.ctx, command=None, restart=True, session_id=0)
+        output = self.bash._call(self.ctx, command='echo "${EPHEMERAL:-unset}"', session_id=0)
+        self.assertEqual(output.strip(), "unset")
+
+    def test_restart_with_command(self) -> None:
+        self.bash._call(self.ctx, command="export BEFORE=yes", session_id=0)
+        output = self.bash._call(
+            self.ctx, command='echo "${BEFORE:-gone}"', restart=True, session_id=0
+        )
+        self.assertEqual(output.strip(), "gone")
+
+    def test_restart_only_returns_message(self) -> None:
+        result = self.bash._call(self.ctx, command=None, restart=True, session_id=0)
+        self.assertIn("restarted", result)
+
+    # ── fd 254 resilience ──
+
+    def test_exec_stdout_to_dev_null_sentinel_survives(self) -> None:
+        """Redirecting fd 1 to /dev/null must not break sentinel delivery on fd 254."""
+        output = self.bash._call(
+            self.ctx, command="exec 1>/dev/null; echo invisible", session_id=0
+        )
+        self.assertNotIn("invisible", output)
+        # Session still works (fd 1 remains /dev/null but sentinel on 254 is fine)
+        output2 = self.bash._call(self.ctx, command="echo still_invisible", session_id=0)
+        self.assertNotIn("still_invisible", output2)
+
+    # ── exit behavior ──
+
+    def test_exit_kills_session(self) -> None:
+        """Running `exit` inside the command block kills bash; session should crash."""
+        with self.assertRaises((BashSessionCrashedException, BashCommandTimeoutException)):
+            self.bash._call(self.ctx, command="exit 0", session_id=20)
+
+    def test_subshell_exit_does_not_kill_session(self) -> None:
+        """(exit N) only exits the subshell; parent shell remains healthy."""
+        with self.assertRaises(BashNonZeroExitCodeException) as cm:
+            self.bash._call(self.ctx, command="(exit 42)", session_id=0)
+        self.assertEqual(cm.exception.exit_code, 42)
+        # Session still alive
+        output = self.bash._call(self.ctx, command="echo alive", session_id=0)
+        self.assertEqual(output.strip(), "alive")
+
+    # ── Input validation ──
+
+    def test_empty_command_rejected(self) -> None:
+        with self.assertRaises(BashException):
+            self.bash._call(self.ctx, command="", session_id=0)
+        with self.assertRaises(BashException):
+            self.bash._call(self.ctx, command="   \n  ", session_id=0)
+
+    def test_zero_timeout_rejected(self) -> None:
+        with self.assertRaises(BashException):
+            self.bash._call(self.ctx, command="echo hi", timeout_sec=0, session_id=0)
+
+    def test_negative_timeout_rejected(self) -> None:
+        with self.assertRaises(BashException):
+            self.bash._call(self.ctx, command="echo hi", timeout_sec=-5, session_id=0)
+
+    # ── Non-zero exit codes ──
+
+    def test_nonzero_exit_carries_code_and_output(self) -> None:
+        with self.assertRaises(BashNonZeroExitCodeException) as cm:
+            self.bash._call(
+                self.ctx, command="echo before_error; sh -c 'exit 42'", session_id=0
+            )
+        self.assertEqual(cm.exception.exit_code, 42)
+        self.assertIn("before_error", cm.exception.output)
+
+    def test_session_healthy_after_nonzero_exit(self) -> None:
+        """A non-zero exit should NOT mark the session as requiring restart."""
+        with self.assertRaises(BashNonZeroExitCodeException):
+            self.bash._call(self.ctx, command="false", session_id=0)
+        output = self.bash._call(self.ctx, command="echo healthy", session_id=0)
+        self.assertEqual(output.strip(), "healthy")
+
+    # ── Comment-only / no-op commands ──
+
+    def test_comment_only_command(self) -> None:
+        output = self.bash._call(self.ctx, command="# just a comment", session_id=0)
+        self.assertEqual(output.strip(), "")
+
+    def test_multiline_blank_command(self) -> None:
+        with self.assertRaises(BashException):
+            self.bash._call(self.ctx, command="\n\n\n", session_id=0)
+
+    # ── Output truncation ──
+
+    def test_output_truncated_at_limit(self) -> None:
+        """Output exceeding MAX_OUTPUT_CHARS should be truncated with a notice."""
+        output = self.bash._call(self.ctx, command="seq 1 10000", session_id=0)
+        self.assertIn("Output truncated", output)
+        # Total should be roughly MAX + length of the truncation notice
+        self.assertLessEqual(
+            len(output), BashSession.MAX_OUTPUT_CHARS + 200
+        )
+
+    # ── set -e wrapper semantics ──
+
+    def test_set_e_restored_between_calls(self) -> None:
+        """The wrapper suppresses -e during execution for safety (prevents the
+        shell from dying on failed commands) but preserves it at the shell level
+        between calls.  Because set +e runs before each command, the user's code
+        observes -e as off — this is the documented design trade-off.
+        Verify the session stays healthy and the wrapper's save/restore cycle
+        does not corrupt other shell state."""
+        self.bash._call(self.ctx, command="set -e", session_id=30)
+        self.bash._call(self.ctx, command="echo middle", session_id=30)
+        # The wrapper always does set +e before the user's command for safety,
+        # so $- will NOT contain 'e' inside the command (by design).
+        output = self.bash._call(self.ctx, command='case $- in *e*) echo YES;; *) echo NO;; esac', session_id=30)
+        self.assertEqual(output.strip(), "NO")
+        # Session is still healthy after the set -e round-trip
+        output2 = self.bash._call(self.ctx, command="echo still_ok", session_id=30)
+        self.assertEqual(output2.strip(), "still_ok")
+
+    def test_set_e_wrapper_prevents_premature_exit(self) -> None:
+        """Even with set -e, the wrapper's set +e prevents the shell from dying
+        mid-block. Both echos should run."""
+        self.bash._call(self.ctx, command="set -e", session_id=31)
+        # Without the wrapper's set +e, `false` would kill the shell.
+        output = self.bash._call(
+            self.ctx, command="echo before; false; echo after", session_id=31
+        )
+        self.assertIn("before", output)
+        self.assertIn("after", output)
+
+    # ── Timeout → restart recovery ──
+
+    def test_timeout_requires_restart_then_recovers(self) -> None:
+        sid = 40
+        with self.assertRaises(BashCommandTimeoutException):
+            self.bash._call(self.ctx, command="sleep 5", session_id=sid, timeout_sec=1)
+        # Next call should refuse (requires restart)
+        with self.assertRaises(BashRequiresRestartException):
+            self.bash._call(self.ctx, command="echo hi", session_id=sid)
+        # Restart
+        self.bash._call(self.ctx, command=None, restart=True, session_id=sid)
+        # Should work now
+        output = self.bash._call(self.ctx, command="echo recovered", session_id=sid)
+        self.assertEqual(output.strip(), "recovered")
+
 
 if __name__ == "__main__":
     unittest.main()
