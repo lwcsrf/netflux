@@ -568,6 +568,37 @@ class TestBashEdgeCases(unittest.TestCase):
         output = self.bash._call(self.ctx, command="echo healthy", session_id=0)
         self.assertEqual(output.strip(), "healthy")
 
+    def test_multiline_parse_errors_do_not_require_restart(self) -> None:
+        cases = {
+            "missing_fi": "if true; then\n  echo hi",
+            "unclosed_single_quote": "echo 'hello",
+        }
+
+        for sid, (name, command) in enumerate(cases.items(), start=70):
+            with self.subTest(name=name):
+                with self.assertRaises(BashNonZeroExitCodeException) as cm:
+                    self.bash._call(self.ctx, command=command, session_id=sid, timeout_sec=2)
+                self.assertEqual(cm.exception.exit_code, 2)
+                self.assertIn("<command>", cm.exception.output)
+
+                follow_up = self.bash._call(self.ctx, command="echo alive", session_id=sid, timeout_sec=2)
+                self.assertEqual(follow_up.strip(), "alive")
+
+    def test_eof_terminated_constructs_do_not_poison_session(self) -> None:
+        cases = [
+            ("missing_heredoc_terminator", "cat <<'EOF'\nhello", ["<command>", "hello"]),
+            ("trailing_backslash", "echo hello \\", ["hello"]),
+        ]
+
+        for sid, (name, command, expected_parts) in enumerate(cases, start=80):
+            with self.subTest(name=name):
+                output = self.bash._call(self.ctx, command=command, session_id=sid, timeout_sec=2)
+                for expected_part in expected_parts:
+                    self.assertIn(expected_part, output)
+
+                follow_up = self.bash._call(self.ctx, command="echo alive", session_id=sid, timeout_sec=2)
+                self.assertEqual(follow_up.strip(), "alive")
+
     # ── Comment-only / no-op commands ──
 
     def test_comment_only_command(self) -> None:
@@ -680,6 +711,19 @@ class TestBashEdgeCases(unittest.TestCase):
         # Should work now
         output = self.bash._call(self.ctx, command="echo recovered", session_id=sid)
         self.assertEqual(output.strip(), "recovered")
+
+    def test_timeout_hint_mentions_noexec_only_when_pattern_matches(self) -> None:
+        hint = "Ensure you avoid 'set -n' / 'set -o noexec' in commands run in the session"
+
+        for sid, command in enumerate(("set -n", "set -o noexec"), start=47):
+            with self.subTest(command=command):
+                with self.assertRaises(BashCommandTimeoutException) as cm:
+                    self.bash._call(self.ctx, command=command, session_id=sid, timeout_sec=1)
+                self.assertIn(hint, str(cm.exception))
+
+        with self.assertRaises(BashCommandTimeoutException) as cm:
+            self.bash._call(self.ctx, command="sleep 5", session_id=49, timeout_sec=1)
+        self.assertNotIn(hint, str(cm.exception))
 
     def test_terminate_closes_process_pipes(self) -> None:
         session = BashSession(41)
@@ -798,6 +842,30 @@ class TestBashDiscovery(unittest.TestCase):
             self.assertEqual(BashSession._find_bash(), real)
 
 
+class TestBashSyntaxPreflight(unittest.TestCase):
+    def test_syntax_check_flags_hard_parse_errors_only(self) -> None:
+        session = BashSession(0)
+        bad_host, bad_bash = BashSession._write_command_file("if true; then\n  echo hi")
+        warn_host, warn_bash = BashSession._write_command_file("cat <<'EOF'\nhello")
+
+        try:
+            bad = session._syntax_check_command_file(bad_host, bad_host, bad_bash)
+            self.assertIsNotNone(bad)
+            assert bad is not None
+            bad_output, bad_code = bad
+            self.assertEqual(bad_code, 2)
+            self.assertIn("<command>", bad_output)
+
+            warn = session._syntax_check_command_file(warn_host, warn_host, warn_bash)
+            self.assertIsNone(warn)
+        finally:
+            for path in (bad_host, warn_host):
+                try:
+                    os.unlink(path)
+                except FileNotFoundError:
+                    pass
+
+
 class TestBashChunkedReader(unittest.TestCase):
     def setUp(self) -> None:
         self.top_bag = SessionBag()
@@ -846,6 +914,16 @@ class TestBashChunkedReader(unittest.TestCase):
             timeout_sec=3,
         )
         self.assertIn("done", output)
+
+    def test_large_inline_script_executes_and_persists_state(self) -> None:
+        sid = 65
+        command = "\n".join([f"v{i}={i}" for i in range(5000)] + ['echo "${v4999}"'])
+
+        output = self.bash._call(self.ctx, command=command, session_id=sid, timeout_sec=10)
+        self.assertEqual(output.strip(), "4999")
+
+        follow_up = self.bash._call(self.ctx, command='echo "${v0}-${v4999}"', session_id=sid, timeout_sec=3)
+        self.assertEqual(follow_up.strip(), "0-4999")
 
     def test_binary_pipe_path_preserves_plain_output(self) -> None:
         output = self.bash._call(self.ctx, command="printf 'hello\\n'", session_id=62)

@@ -4,8 +4,10 @@ import os
 import re
 import queue
 import shutil
+import shlex
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 import uuid
@@ -236,6 +238,104 @@ class BashSession:
         except queue.Empty:
             return
 
+    @staticmethod
+    def _command_file_path(path: str) -> str:
+        """Convert a host path to a form the bash process can source.
+
+        On Windows, translates native paths (e.g. C:\\tmp\\foo.sh) to the
+        MSYS/Git-Bash mount format (/c/tmp/foo.sh) that bash understands.
+        No python stdlib exists for this conversion.
+        """
+        if os.name == "nt" and len(path) >= 2 and path[1] == ":":
+            drive = path[0].lower()
+            rest = path[2:].replace("\\", "/")
+            return f"/{drive}{rest}"
+        return path
+
+    @staticmethod
+    def _normalize_command_output(text: str, *paths: str) -> str:
+        """Scrub internal temp-file paths from command output before surfacing it.
+        Bash errors may reference the temp .sh file we staged the command in;
+        replacing those paths with ``<command>`` keeps the output clean.
+
+        Args:
+            text:   Raw stdout+stderr from the bash process.
+            *paths: Temp-file paths used to stage the command (native + MSYS forms).
+
+        Each path is expanded into backslash and forward-slash variants, then
+        all occurrences are replaced with the literal ``<command>`` (longest-first
+        to avoid partial matches).
+        """
+        if not text:
+            return text
+        variants = set()
+        for path in paths:
+            if not path:
+                continue
+            variants.add(path)
+            variants.add(path.replace("\\", "/"))
+        for variant in sorted(variants, key=len, reverse=True):
+            text = text.replace(variant, "<command>")
+        return text
+
+    @staticmethod
+    def _write_command_file(command: str) -> Tuple[str, str]:
+        fd, path = tempfile.mkstemp(prefix="netflux-bash-", suffix=".sh")
+        try:
+            payload = command if command.endswith("\n") else command + "\n"
+            with os.fdopen(fd, "wb") as f:
+                f.write(payload.encode("utf-8", errors="replace"))
+        except Exception:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+            _silent_unlink(path)
+            raise
+        return path, BashSession._command_file_path(path)
+
+    def _syntax_check_command_file(
+        self,
+        script_path: str,
+        *normalize_paths: str,
+    ) -> Optional[Tuple[str, int]]:
+        """Best-effort hard syntax preflight for the staged command file."""
+        try:
+            proc = subprocess.run(
+                [self._find_bash(), "--noprofile", "--norc", "-n", script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+                env=_sanitized_bash_env(),
+            )
+        except Exception as e:
+            raise BashException(f"Failed to validate bash command syntax: {e}") from e
+
+        if proc.returncode == 0:
+            return None
+
+        combined = self._normalize_command_output(
+            (proc.stdout or "") + (proc.stderr or ""),
+            *normalize_paths,
+        )
+        return combined, proc.returncode
+
+    @staticmethod
+    def _timeout_hint_for_command(command: str) -> str:
+        # Keep this as a post-timeout heuristic only: a raw text scan is too imprecise
+        # to block execution because these strings may legitimately appear inside heredocs,
+        # generated script content, comments, or commands run in a child bash process. If found,
+        # these may be the cause of the timeout, so we give the agent a fighting chance to try again.
+        if "set -n" not in command and "set -o noexec" not in command:
+            return ""
+        return (
+            "\nEnsure you avoid 'set -n' / 'set -o noexec' in commands run in the session "
+            "(okay in scripts run via a separate bash process)."
+        )
+
     def _drain_until(self, token: str, timeout: float) -> bool:
         end = time.time() + timeout
         pending = ""
@@ -251,75 +351,14 @@ class BashSession:
                 pass
         return False
 
-    # -------- external concurrency control --------
-    def try_acquire(self, timeout_sec: float = 0.0) -> bool:
-        """Attempt to lock this session for exclusive use (optionally waiting)."""
-        if timeout_sec > 0:
-            return self._lock.acquire(timeout=timeout_sec)
-        return self._lock.acquire(blocking=False)
-
-    def release(self) -> None:
-        """Release the session lock if held by this thread."""
-        if self._lock.locked():
-            self._lock.release()
-
-    # -------- execute --------
-    def execute(self, command: str, timeout_sec: Optional[int]) -> Tuple[str, int, str]:
-        """
-        Returns (combined_output, exit_code, sentinel_id).
-        Raises BashCommandTimeoutException if sentinel not observed within timeout.
-        The returned output is stdout+stderr (sentinel trimmed).
-        """
-        if self.requires_restart:
-            raise BashRequiresRestartException(
-                "Bash session is marked as requiring restart due to a previous timeout or failure. "
-                "Please call the tool with restart=true."
-            )
-
-        if not self.alive():
-            if self._alive_once_started:
-                # Was started before but is now dead → require explicit restart.
-                raise BashSessionCrashedException("Bash session has crashed; tool must be restarted.")
-            self.start()
-
-        # Clear any buffered leftovers before running the next command.
-        self._drain_queue_nowait()
-
-        # Single sentinel line that also carries the exit code (Y's format).
-        token = uuid.uuid4().hex
-        sentinel = f"__NETFLUX_BASH_DONE__{token}"
-        was_e_var = f"__nf_was_e_{token}"
-        ec_var = f"__nf_ec_{token}"
-        # Ensure the user command ends with a newline so here-doc delimiters stand alone.
-        cmd = command if command.endswith("\n") else command + "\n"
-        # Make sentinel resilient to `set -e` and common fd redirections.
-        # Default the user block's stdin to /dev/null so accidental stdin
-        # readers cannot consume wrapper/control-plane input from `bash -s`.
-        # Write sentinel to fd 254 (a saved dup of the
-        # original stdout pipe, created during session start). Using a dedicated fd means we
-        # emit exactly one sentinel line and ensure our pump thread will reliably play it back to us.
-        block = (
-            f"{was_e_var}=false; case $- in *e*) {was_e_var}=true;; esac\n"
-            # The curly braces are intentionally placed on their own lines to ensure heredoc delimiters
-            # are recognized correctly by bash. Do not merge them with other lines.
-            # The `:` no-op ensures the group always contains at least one command,
-            # preventing a syntax error when the user command is only comments or blank lines.
-            "builtin set +e; { :\n"
-            f"{cmd}"
-            "} </dev/null\n"
-            f"{ec_var}=$?\n"
-            "if [[ \"${" + was_e_var + ":-}\" == true ]]; then builtin set -e; fi\n"
-            "builtin printf '\\n" + sentinel + " %d\\n' \"${" + ec_var + "}\" >&254\n"
-            "builtin unset -v " + was_e_var + " " + ec_var + " 2>/dev/null || builtin true\n"
-        )
-        try:
-            self._write(block)
-        except Exception as e:
-            self.requires_restart = True
-            raise BashSessionCrashedException(
-                f"Bash stdin is not writable (session exited?): {e}. Tool must be restarted."
-            ) from e
-
+    def _read_until_sentinel(
+        self,
+        sentinel: str,
+        timeout_sec: Optional[int],
+        *,
+        normalize_paths: Tuple[str, ...] = (),
+        timeout_hint: str = "",
+    ) -> Tuple[str, int]:
         # Read until we see the sentinel; preserve arrival order (stdout+stderr interleaving).
         effective_timeout = self.DEFAULT_TIMEOUT_SEC if (timeout_sec is None) else float(timeout_sec)
         deadline = time.time() + effective_timeout
@@ -360,7 +399,7 @@ class BashSession:
                 if self._proc and self._proc.poll() is not None:
                     self.requires_restart = True
                     append_output(pending)
-                    partial = "".join(chunks)
+                    partial = self._normalize_command_output("".join(chunks), *normalize_paths)
                     if truncated or overflow_newlines > 0:
                         partial += (
                             f"\n\n... Output truncated (showing {self.MAX_OUTPUT_CHARS} characters; "
@@ -385,7 +424,7 @@ class BashSession:
                 if m:
                     exit_code = int(m.group(1))
                     found = True
-                    # Do NOT append the sentinel line to output.
+                    # Do not append the sentinel line to output.
                     break
                 append_output(line)
 
@@ -401,7 +440,7 @@ class BashSession:
             self.requires_restart = True
             self._terminate_group_if_alive()
             append_output(pending)
-            partial = "".join(chunks)
+            partial = self._normalize_command_output("".join(chunks), *normalize_paths)
             if truncated or overflow_newlines > 0:
                 partial += (
                     f"\n\n... Output truncated (showing {self.MAX_OUTPUT_CHARS} characters; "
@@ -410,12 +449,13 @@ class BashSession:
             raise BashCommandTimeoutException(
                 f"Command timed out after {int(effective_timeout)} seconds. "
                 f"The session has been marked as requiring restart. "
-                "Invoke the tool again with restart=true to continue.\n\n"
+                f"Invoke the tool again with restart=true to continue."
+                f"{timeout_hint}\n\n"
                 f"--- partial output ---\n"
                 f"{partial}"
             )
 
-        combined = "".join(chunks)
+        combined = self._normalize_command_output("".join(chunks), *normalize_paths)
         if truncated or overflow_newlines > 1:
             combined += (
                 f"\n\n... Output truncated (showing {self.MAX_OUTPUT_CHARS} characters; "
@@ -423,13 +463,88 @@ class BashSession:
             )
 
         if exit_code is None:
-            # Sentinel observed but exit code unparsable → mark unhealthy and force restart.
             self.requires_restart = True
             self._terminate_group_if_alive()
             raise BashSessionCrashedException(
                 "Malformed sentinel line; tool must be restarted."
             )
-        return combined, exit_code, sentinel
+        return combined, exit_code
+
+    # -------- external concurrency control --------
+    def try_acquire(self, timeout_sec: float = 0.0) -> bool:
+        """Attempt to lock this session for exclusive use (optionally waiting)."""
+        if timeout_sec > 0:
+            return self._lock.acquire(timeout=timeout_sec)
+        return self._lock.acquire(blocking=False)
+
+    def release(self) -> None:
+        """Release the session lock if held by this thread."""
+        if self._lock.locked():
+            self._lock.release()
+
+    # -------- execute --------
+    def execute(self, command: str, timeout_sec: Optional[int]) -> Tuple[str, int, str]:
+        """
+        Returns (combined_output, exit_code, sentinel_id).
+        Raises BashCommandTimeoutException if sentinel not observed within timeout.
+        The returned output is stdout+stderr (sentinel trimmed).
+        """
+        if self.requires_restart:
+            raise BashRequiresRestartException(
+                "Bash session is marked as requiring restart due to a previous timeout or failure. "
+                "Please call the tool with restart=true."
+            )
+
+        if not self.alive():
+            if self._alive_once_started:
+                raise BashSessionCrashedException("Bash session has crashed; tool must be restarted.")
+            self.start()
+
+        self._drain_queue_nowait()
+
+        token = uuid.uuid4().hex
+        sentinel = f"__NETFLUX_BASH_DONE__{token}"
+        was_e_var = f"__nf_was_e_{token}"
+        ec_var = f"__nf_ec_{token}"
+        timeout_hint = self._timeout_hint_for_command(command)
+        try:
+            script_path, bash_script_path = self._write_command_file(command)
+        except Exception as e:
+            raise BashException(f"Failed to stage bash command in a temp file: {e}") from e
+
+        syntax_error = self._syntax_check_command_file(script_path, script_path, bash_script_path)
+        if syntax_error is not None:
+            _silent_unlink(script_path)
+            combined, exit_code = syntax_error
+            return combined, exit_code, sentinel
+
+        block = (
+            f"{was_e_var}=false; case $- in *e*) {was_e_var}=true;; esac\n"
+            "builtin set +e\n"
+            f"builtin source {shlex.quote(bash_script_path)} </dev/null\n"
+            f"{ec_var}=$?\n"
+            "if [[ \"${" + was_e_var + ":-}\" == true ]]; then builtin set -e; fi\n"
+            "builtin printf '\\n" + sentinel + " %d\\n' \"${" + ec_var + "}\" >&254\n"
+            "builtin unset -v " + was_e_var + " " + ec_var + " 2>/dev/null || builtin true\n"
+        )
+        try:
+            self._write(block)
+            combined, exit_code = self._read_until_sentinel(
+                sentinel,
+                timeout_sec,
+                normalize_paths=(script_path, bash_script_path),
+                timeout_hint=timeout_hint,
+            )
+            return combined, exit_code, sentinel
+        except Exception as e:
+            if isinstance(e, BashException):
+                raise
+            self.requires_restart = True
+            raise BashSessionCrashedException(
+                f"Bash stdin is not writable (session exited?): {e}. Tool must be restarted."
+            ) from e
+        finally:
+            _silent_unlink(script_path)
 
 
 class Bash(CodeFunction):
@@ -537,7 +652,16 @@ bash = Bash()
 
 
 def _sanitized_bash_env() -> dict[str, str]:
-    """Preserve a normal shell environment while blocking bash startup injection via envvars."""
+    """Strip inherited env vars that bash would use to inject startup behaviour.
+
+    The child bash process inherits the parent environment (in which the agent
+    harness is being run), which is mostly desirable (PATH, HOME, etc.).
+    However, a few inherited variables let the parent silently alter the
+    child's startup, so we remove them:
+      - BASH_ENV / ENV      — sourced automatically by bash/sh on startup.
+      - SHELLOPTS / BASHOPTS — force shell options onto the child process.
+      - BASH_FUNC_*          — exported functions that could shadow commands.
+    """
     env = dict(os.environ)
     blocked_exact = {"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
 
@@ -587,3 +711,11 @@ def _windows_bash_candidates() -> List[str]:
                 seen.add(key)
                 paths.append(candidate)
     return paths
+
+
+def _silent_unlink(path: str) -> None:
+    """Remove *path* ignoring any error (file missing, permissions, etc.)."""
+    try:
+        os.unlink(path)
+    except Exception:
+        pass
