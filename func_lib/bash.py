@@ -52,6 +52,10 @@ class BashSession:
     MAX_OUTPUT_CHARS = 40_000
     READ_CHUNK_BYTES = 4096
     PENDING_TAIL_CHARS = 8192
+    REPEAT_FAILURE_GUIDANCE = (
+        "If this error repeats, bring it to the maintainer's attention because "
+        "this bash function may not work in this host environment."
+    )
 
     def __init__(self, session_id: int) -> None:
         self.session_id = session_id
@@ -92,36 +96,56 @@ class BashSession:
         # On Windows, create a new process group so we can cleanly terminate the tree.
         creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == "nt" else 0
 
-        self._proc = subprocess.Popen(  # noqa: S603, S607 (we intentionally run bash)
-            [bash_path, "--noprofile", "--norc", "-s"],  # read from stdin; skip user rc/profile
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=-1,
-            preexec_fn=preexec,
-            creationflags=creationflags,
-            env=_sanitized_bash_env(),
-        )
+        try:
+            self._proc = subprocess.Popen(  # noqa: S603, S607 (we intentionally run bash)
+                [bash_path, "--noprofile", "--norc", "-s"],  # read from stdin; skip user rc/profile
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=-1,
+                preexec_fn=preexec,
+                creationflags=creationflags,
+                env=_sanitized_bash_env(),
+            )
+        except Exception as e:
+            raise BashException(
+                "Failed to start bash process: "
+                f"{self._describe_exception(e)}. "
+                f"{self.REPEAT_FAILURE_GUIDANCE}"
+            ) from e
+
         self._alive_once_started = True
         self.requires_restart = False
-        self._start_readers()
+        try:
+            self._start_readers()
 
-        # Set pipeline semantics, disable history, quiet PS1, and block until ready.
-        # Save the original stdout pipe to fd 254 for resilient sentinel delivery in execute(),
-        # and prove that writes through fd 254 actually work before declaring the session ready.
-        self._write(
-            "set -o pipefail; export HISTFILE=/dev/null; export PS1=''; "
-            "shopt -s expand_aliases; exec 254>&1; "
-            "builtin printf '__NETFLUX_BASH_READY__\\n' >&254\n"
-        )
+            # Set pipeline semantics, disable history, quiet PS1, and block until ready.
+            # Save the original stdout pipe to fd 254 for resilient sentinel delivery in execute(),
+            # and prove that writes through fd 254 actually work before declaring the session ready.
+            self._write(
+                "set -o pipefail; export HISTFILE=/dev/null; export PS1=''; "
+                "shopt -s expand_aliases; exec 254>&1; "
+                "builtin printf '__NETFLUX_BASH_READY__\\n' >&254\n"
+            )
+        except BashException:
+            raise
+        except Exception as e:
+            self.requires_restart = True
+            self._terminate_group_if_alive()
+            raise BashException(
+                "Bash session startup failed: "
+                f"{self._describe_exception(e)}. "
+                "Tool must be restarted. "
+                f"{self.REPEAT_FAILURE_GUIDANCE}"
+            ) from e
         # Require readiness; if not reached, mark for restart and fail.
         if not self._drain_until("__NETFLUX_BASH_READY__", timeout=3):
             self.requires_restart = True
             self._terminate_group_if_alive()
             raise BashSessionCrashedException(
                 "Bash session failed to initialize fd 254 or failed to reach ready state; "
-                "tool must be restarted. If this repeats, this bash function is probably not going "
-                "to work on this host environment."
+                "tool must be restarted. "
+                f"{self.REPEAT_FAILURE_GUIDANCE}"
             )
 
     def restart(self) -> None:
@@ -255,6 +279,13 @@ class BashSession:
             rest = path[2:].replace("\\", "/")
             return f"/{drive}{rest}"
         return path
+
+    @staticmethod
+    def _describe_exception(e: BaseException) -> str:
+        detail = str(e)
+        if detail:
+            return f"{type(e).__name__}: {detail}"
+        return type(e).__name__
 
     @staticmethod
     def _normalize_command_output(text: str, *paths: str) -> str:
@@ -510,8 +541,10 @@ class BashSession:
                 raise
             self.requires_restart = True
             raise BashSessionCrashedException(
-                f"Bash command transport failed while sending the command or waiting for completion: {e}. "
-                "The session may have exited unexpectedly and must be restarted."
+                "Bash command transport failed while sending the command or waiting for completion: "
+                f"{self._describe_exception(e)}. "
+                "The session may have exited unexpectedly and must be restarted. "
+                f"{self.REPEAT_FAILURE_GUIDANCE}"
             ) from e
         finally:
             _silent_unlink(script_path)

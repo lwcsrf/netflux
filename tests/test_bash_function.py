@@ -784,27 +784,67 @@ class TestBashEdgeCases(unittest.TestCase):
         self.assertTrue(proc.stdout is None or proc.stdout.closed)
         self.assertTrue(proc.stderr is None or proc.stderr.closed)
 
+    def test_start_wraps_popen_failure_with_underlying_exception_details(self) -> None:
+        from unittest import mock
+        from ..func_lib import bash as bash_mod
+
+        session = BashSession(41)
+        with mock.patch.object(BashSession, "_find_bash", return_value="/bin/bash"), \
+             mock.patch.object(bash_mod.subprocess, "Popen", side_effect=OSError("spawn failed")):
+            with self.assertRaises(BashException) as cm:
+                session.start()
+
+        message = str(cm.exception)
+        self.assertIn("Failed to start bash process", message)
+        self.assertIn("OSError: spawn failed", message)
+        self.assertIn("If this error repeats", message)
+
+    def test_start_wraps_bootstrap_transport_failure_with_underlying_exception_details(self) -> None:
+        from unittest import mock
+        from ..func_lib import bash as bash_mod
+
+        session = BashSession(42)
+        proc = mock.Mock()
+        proc.poll.return_value = 0
+        proc.stdin = None
+        proc.stdout = object()
+        proc.stderr = None
+
+        with mock.patch.object(BashSession, "_find_bash", return_value="/bin/bash"), \
+             mock.patch.object(bash_mod.subprocess, "Popen", return_value=proc), \
+             mock.patch.object(BashSession, "_start_readers", return_value=None), \
+             mock.patch.object(BashSession, "_write", side_effect=BrokenPipeError("pipe down")):
+            with self.assertRaises(BashException) as cm:
+                session.start()
+
+        message = str(cm.exception)
+        self.assertIn("Bash session startup failed", message)
+        self.assertIn("BrokenPipeError: pipe down", message)
+        self.assertIn("If this error repeats", message)
+        self.assertTrue(session.requires_restart)
+        self.assertIsNone(session._proc)
+
     def test_legacy_internal_var_names_do_not_collide_with_wrapper(self) -> None:
         self.bash._call(
             self.ctx,
             command="readonly __nf_ec=7; readonly __nf_was_e=1",
-            session_id=42,
+            session_id=43,
         )
-        output = self.bash._call(self.ctx, command="echo hi", session_id=42)
+        output = self.bash._call(self.ctx, command="echo hi", session_id=43)
         self.assertEqual(output.strip(), "hi")
 
     def test_set_u_and_legacy_internal_var_names_do_not_crash_wrapper(self) -> None:
         output = self.bash._call(
             self.ctx,
             command="set -u; unset __nf_was_e; echo body",
-            session_id=43,
+            session_id=44,
         )
         self.assertEqual(output.strip(), "body")
-        follow_up = self.bash._call(self.ctx, command="echo alive", session_id=43)
+        follow_up = self.bash._call(self.ctx, command="echo alive", session_id=44)
         self.assertEqual(follow_up.strip(), "alive")
 
     def test_per_call_internal_vars_do_not_accumulate_in_session(self) -> None:
-        sid = 44
+        sid = 45
         count_cmd = r"compgen -A variable | grep -Ec '^__nf_.*_[0-9a-f]{32}$' || true"
 
         baseline = self.bash._call(self.ctx, command=count_cmd, session_id=sid)
@@ -822,7 +862,7 @@ class TestBashEdgeCases(unittest.TestCase):
         from unittest import mock
         from ..func_lib import bash as bash_mod
 
-        session = BashSession(45)
+        session = BashSession(46)
         proc = mock.Mock()
         proc.pid = 1234
         proc.poll.return_value = None
@@ -845,7 +885,7 @@ class TestBashEdgeCases(unittest.TestCase):
         from unittest import mock
         from ..func_lib import bash as bash_mod
 
-        session = BashSession(46)
+        session = BashSession(47)
         proc = mock.Mock()
         proc.pid = 1234
         proc.poll.return_value = None
