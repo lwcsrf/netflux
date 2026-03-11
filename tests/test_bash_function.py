@@ -576,6 +576,23 @@ class TestBashEdgeCases(unittest.TestCase):
         output = self.bash._call(self.ctx, command="echo recovered", session_id=sid)
         self.assertEqual(output.strip(), "recovered")
 
+    def test_terminate_closes_process_pipes(self) -> None:
+        session = BashSession(41)
+        session.start()
+        proc = session._proc
+
+        self.assertIsNotNone(proc)
+        session._terminate_group_if_alive()
+
+        thread = session._stdout_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.5)
+
+        assert proc is not None
+        self.assertTrue(proc.stdin is None or proc.stdin.closed)
+        self.assertTrue(proc.stdout is None or proc.stdout.closed)
+        self.assertTrue(proc.stderr is None or proc.stderr.closed)
+
 
 class TestBashDiscovery(unittest.TestCase):
     def test_find_bash_skips_windowsapps_stub(self) -> None:

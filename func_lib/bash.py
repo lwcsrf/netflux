@@ -136,29 +136,37 @@ class BashSession:
         return self._proc is not None and self._proc.poll() is None
 
     def _terminate_group_if_alive(self) -> None:
-        if not self._proc:
+        proc = self._proc
+        if not proc:
             return
         try:
-            if self._proc.poll() is None:
+            if proc.poll() is None:
                 if os.name == "posix":
                     try:
-                        os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                     except Exception:
                         # Fall back to process terminate if group kill fails
-                        self._proc.terminate()
+                        proc.terminate()
                 else:
-                    self._proc.terminate()
+                    proc.terminate()
                 try:
-                    self._proc.wait(timeout=2)
+                    proc.wait(timeout=2)
                 except Exception:
                     if os.name == "posix":
                         try:
-                            os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
+                            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
                         except Exception:
                             pass
                     else:
-                        self._proc.kill()
+                        proc.kill()
         finally:
+            for stream in (proc.stdin, proc.stdout, proc.stderr):
+                if stream is None:
+                    continue
+                try:
+                    stream.close()
+                except Exception:
+                    pass
             self._proc = None
 
     def _start_readers(self) -> None:
