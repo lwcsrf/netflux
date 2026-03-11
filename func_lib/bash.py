@@ -59,12 +59,16 @@ class BashSession:
     @staticmethod
     def _find_bash() -> str:
         """Locate a usable bash executable, or raise."""
-        # Prefer /bin/bash on POSIX; fall back to PATH lookup (covers Windows/Git Bash/MSYS2).
         if os.path.isfile("/bin/bash"):
             return "/bin/bash"
-        found = shutil.which("bash")
-        if found:
-            return found
+        if os.name == "nt":
+            for path in _windows_bash_candidates():
+                if _bash_works(path):
+                    return path
+        else:
+            found = shutil.which("bash")
+            if found:
+                return found
         raise BashException(
             "Cannot locate a bash executable. "
             "On Windows, install Git for Windows (includes Git Bash) and ensure it is on PATH."
@@ -440,3 +444,42 @@ class Bash(CodeFunction):
 
 # Built-in global singleton for author reference.
 bash = Bash()
+
+
+def _bash_works(path: Optional[str]) -> bool:
+    if not path or not os.path.isfile(path):
+        return False
+    low = os.path.normcase(path)
+    if os.name == "nt" and ("windowsapps" in low or low.endswith("\\system32\\bash.exe")):
+        return False
+    try:
+        proc = subprocess.run(
+            [path, "--noprofile", "--norc", "-lc", "printf ok"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+    except Exception:
+        return False
+    return proc.returncode == 0 and proc.stdout == "ok"
+
+
+def _windows_bash_candidates() -> List[str]:
+    seen, paths = set(), []
+    for base in filter(None, os.environ.get("PATH", "").split(os.pathsep)):
+        candidate = os.path.join(base, "bash.exe")
+        key = os.path.normcase(os.path.normpath(candidate))
+        if key not in seen:
+            seen.add(key)
+            paths.append(candidate)
+    for root in filter(None, [os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")]):
+        for suffix in (("Git", "bin", "bash.exe"), ("Git", "usr", "bin", "bash.exe")):
+            candidate = os.path.join(root, *suffix)
+            key = os.path.normcase(os.path.normpath(candidate))
+            if key not in seen:
+                seen.add(key)
+                paths.append(candidate)
+    return paths

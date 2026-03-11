@@ -577,5 +577,19 @@ class TestBashEdgeCases(unittest.TestCase):
         self.assertEqual(output.strip(), "recovered")
 
 
+class TestBashDiscovery(unittest.TestCase):
+    def test_find_bash_skips_windowsapps_stub(self) -> None:
+        from unittest import mock
+        from ..func_lib import bash as bash_mod
+
+        stub = r"C:\Users\andre\AppData\Local\Microsoft\WindowsApps\bash.exe"
+        real = r"C:\Program Files\Git\bin\bash.exe"
+        with mock.patch.object(bash_mod.os, "name", "nt"), \
+             mock.patch.object(bash_mod.os.path, "isfile", return_value=False), \
+             mock.patch.object(bash_mod, "_windows_bash_candidates", return_value=[stub, real]), \
+             mock.patch.object(bash_mod, "_bash_works", side_effect=lambda path: path == real):
+            self.assertEqual(BashSession._find_bash(), real)
+
+
 if __name__ == "__main__":
     unittest.main()
