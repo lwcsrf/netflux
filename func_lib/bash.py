@@ -293,6 +293,8 @@ class BashSession:
         # Ensure the user command ends with a newline so here-doc delimiters stand alone.
         cmd = command if command.endswith("\n") else command + "\n"
         # Make sentinel resilient to `set -e` and common fd redirections.
+        # Default the user block's stdin to /dev/null so accidental stdin
+        # readers cannot consume wrapper/control-plane input from `bash -s`.
         # Write sentinel to fd 254 (a saved dup of the
         # original stdout pipe, created during session start). Using a dedicated fd means we
         # emit exactly one sentinel line and ensure our pump thread will reliably play it back to us.
@@ -304,7 +306,7 @@ class BashSession:
             # preventing a syntax error when the user command is only comments or blank lines.
             "builtin set +e; { :\n"
             f"{cmd}"
-            "}\n"
+            "} </dev/null\n"
             f"{ec_var}=$?\n"
             "if [[ \"${" + was_e_var + ":-}\" == true ]]; then builtin set -e; fi\n"
             "builtin printf '\\n" + sentinel + " %d\\n' \"${" + ec_var + "}\" >&254\n"

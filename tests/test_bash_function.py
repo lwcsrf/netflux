@@ -578,6 +578,27 @@ class TestBashEdgeCases(unittest.TestCase):
         with self.assertRaises(BashException):
             self.bash._call(self.ctx, command="\n\n\n", session_id=0)
 
+    def test_accidental_stdin_reader_gets_eof_not_wrapper_input(self) -> None:
+        output = self.bash._call(self.ctx, command="cat", session_id=44, timeout_sec=2)
+        self.assertEqual(output.strip(), "")
+
+    def test_read_builtin_does_not_consume_wrapper_lines(self) -> None:
+        output = self.bash._call(
+            self.ctx,
+            command="\n".join(
+                [
+                    'if read var; then echo "read:$var"; else echo "eof"; fi',
+                    'printf "var=<%s>\\n" "${var:-}"',
+                ]
+            ),
+            session_id=45,
+            timeout_sec=2,
+        )
+        self.assertEqual(
+            [line for line in output.splitlines() if line],
+            ["eof", "var=<>"],
+        )
+
     # ── Output truncation ──
 
     def test_output_truncated_at_limit(self) -> None:
