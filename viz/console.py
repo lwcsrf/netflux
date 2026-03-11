@@ -1797,16 +1797,28 @@ class ConsoleRender:
         return "".join(part[0] for part in model_name.split("-") if part)
 
     @staticmethod
+    def _format_tokens_in_k(value: int, *, decimals: int) -> str:
+        if decimals == 0:
+            return f"{(value + 500) // 1000}k"
+
+        scale = 10**decimals
+        rounded = (value * scale + 500) // 1000
+        whole, frac = divmod(rounded, scale)
+        return f"{whole}.{frac:0{decimals}d}k"
+
+    @staticmethod
     def _format_token_bill_fields(bill: TokenBill) -> str:
         fields: list[str] = []
         if bill.input_tokens_cache_read:
-            fields.append(f"CR:{bill.input_tokens_cache_read}")
+            fields.append(f"CR:{ConsoleRender._format_tokens_in_k(bill.input_tokens_cache_read, decimals=0)}")
         if bill.input_tokens_cache_write:
-            fields.append(f"CW:{bill.input_tokens_cache_write}")
+            fields.append(
+                f"CW:{ConsoleRender._format_tokens_in_k(bill.input_tokens_cache_write, decimals=0)}"
+            )
         if bill.input_tokens_regular:
-            fields.append(f"Reg:{bill.input_tokens_regular}")
+            fields.append(f"Reg:{ConsoleRender._format_tokens_in_k(bill.input_tokens_regular, decimals=0)}")
         if bill.output_tokens_total:
-            fields.append(f"Out:{bill.output_tokens_total}")
+            fields.append(f"Out:{ConsoleRender._format_tokens_in_k(bill.output_tokens_total, decimals=1)}")
         return " ".join(fields)
 
     @classmethod

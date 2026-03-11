@@ -40,3 +40,13 @@ The script prints the workspace path, streams a live view of the agent’s work,
 Run:
 
 `python3 -m netflux.demos.apply_diff --provider={gemini,anthropic} [--fail-first]`
+
+### Bash Stress (`bash_stress.py`)
+
+Runs a relatively bare `AgentFunction` whose job is to stress-test the built-in `bash` tool the way an agent would actually use it. By default it performs a broad progression of shell workflows, starting simple and becoming more sophisticated. Optionally, pass `--custom-instruction` to steer the run toward a narrower behavior or failure mode you want to probe.
+
+The script creates a disposable workspace, changes into it before invoking the agent, streams a live tree view, and leaves the workspace on disk so you can inspect what the agent did afterward.
+
+Run:
+
+`python3 -m netflux.demos.bash_stress --provider={gemini,anthropic} [--custom-instruction "..."]`
