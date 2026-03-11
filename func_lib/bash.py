@@ -510,7 +510,8 @@ class BashSession:
                 raise
             self.requires_restart = True
             raise BashSessionCrashedException(
-                f"Bash stdin is not writable (session exited?): {e}. Tool must be restarted."
+                f"Bash command transport failed while sending the command or waiting for completion: {e}. "
+                "The session may have exited unexpectedly and must be restarted."
             ) from e
         finally:
             _silent_unlink(script_path)
