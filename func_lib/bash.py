@@ -294,35 +294,6 @@ class BashSession:
             raise
         return path, BashSession._command_file_path(path)
 
-    def _syntax_check_command_file(
-        self,
-        script_path: str,
-        *normalize_paths: str,
-    ) -> Optional[Tuple[str, int]]:
-        """Best-effort hard syntax preflight for the staged command file."""
-        try:
-            proc = subprocess.run(
-                [self._find_bash(), "--noprofile", "--norc", "-n", script_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-                env=_sanitized_bash_env(),
-            )
-        except Exception as e:
-            raise BashException(f"Failed to validate bash command syntax: {e}") from e
-
-        if proc.returncode == 0:
-            return None
-
-        combined = self._normalize_command_output(
-            (proc.stdout or "") + (proc.stderr or ""),
-            *normalize_paths,
-        )
-        return combined, proc.returncode
-
     @staticmethod
     def _timeout_hint_for_command(command: str) -> str:
         # Keep this as a post-timeout heuristic only: a raw text scan is too imprecise
@@ -512,12 +483,6 @@ class BashSession:
         except Exception as e:
             raise BashException(f"Failed to stage bash command in a temp file: {e}") from e
 
-        syntax_error = self._syntax_check_command_file(script_path, script_path, bash_script_path)
-        if syntax_error is not None:
-            _silent_unlink(script_path)
-            combined, exit_code = syntax_error
-            return combined, exit_code, sentinel
-
         block = (
             f"{was_e_var}=false; case $- in *e*) {was_e_var}=true;; esac\n"
             "builtin set +e\n"
@@ -566,6 +531,7 @@ class Bash(CodeFunction):
         "* heredocs and multi-line commands supported.\n"
         "* Success returns merged stdout/stderr, preserving interleaved order.\n"
         "* On non-zero exit, raises exception with exit code and the stdout/stderr.\n"
+        "* Syntax errors are normal command failures and may leave earlier lines' side effects in place.\n"
         "* Timeout (default 120s) raises and marks the session as requiring restart.\n"
         f"* Output truncated to {BashSession.MAX_OUTPUT_CHARS} characters per call.\n"
         "* Avoid concurrent calls to the same session (use different `session_id`s if necessary).\n"

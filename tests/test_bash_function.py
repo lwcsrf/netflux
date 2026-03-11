@@ -584,6 +584,48 @@ class TestBashEdgeCases(unittest.TestCase):
                 follow_up = self.bash._call(self.ctx, command="echo alive", session_id=sid, timeout_sec=2)
                 self.assertEqual(follow_up.strip(), "alive")
 
+    def test_session_dependent_extglob_syntax_uses_live_shell_state(self) -> None:
+        sid = 78
+        self.bash._call(self.ctx, command="shopt -s extglob", session_id=sid, timeout_sec=2)
+
+        output = self.bash._call(
+            self.ctx,
+            command="case x in @(x|y)) echo matched;; *) echo missed;; esac",
+            session_id=sid,
+            timeout_sec=2,
+        )
+        self.assertEqual(output.strip(), "matched")
+
+    def test_alias_can_contribute_syntax_across_calls(self) -> None:
+        sid = 79
+        self.bash._call(self.ctx, command="alias nf_if='if true; then'", session_id=sid, timeout_sec=2)
+
+        output = self.bash._call(
+            self.ctx,
+            command="nf_if echo alias_ok; fi",
+            session_id=sid,
+            timeout_sec=2,
+        )
+        self.assertEqual(output.strip(), "alias_ok")
+
+    def test_syntax_error_can_leave_earlier_side_effects_in_place(self) -> None:
+        sid = 80
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bp = _bash_path(tmpdir)
+            with self.assertRaises(BashNonZeroExitCodeException) as cm:
+                self.bash._call(
+                    self.ctx,
+                    command=f"cd {bp}\nif then",
+                    session_id=sid,
+                    timeout_sec=2,
+                )
+
+            self.assertEqual(cm.exception.exit_code, 2)
+            self.assertIn("<command>", cm.exception.output)
+
+            cwd = self.bash._call(self.ctx, command="pwd", session_id=sid, timeout_sec=2)
+            self.assertEqual(cwd.strip(), bp)
+
     def test_eof_terminated_constructs_do_not_poison_session(self) -> None:
         cases = [
             ("missing_heredoc_terminator", "cat <<'EOF'\nhello", ["<command>", "hello"]),
@@ -840,30 +882,6 @@ class TestBashDiscovery(unittest.TestCase):
              mock.patch.object(bash_mod, "_windows_bash_candidates", return_value=[stub, real]), \
              mock.patch.object(bash_mod, "_bash_works", side_effect=lambda path: path == real):
             self.assertEqual(BashSession._find_bash(), real)
-
-
-class TestBashSyntaxPreflight(unittest.TestCase):
-    def test_syntax_check_flags_hard_parse_errors_only(self) -> None:
-        session = BashSession(0)
-        bad_host, bad_bash = BashSession._write_command_file("if true; then\n  echo hi")
-        warn_host, warn_bash = BashSession._write_command_file("cat <<'EOF'\nhello")
-
-        try:
-            bad = session._syntax_check_command_file(bad_host, bad_host, bad_bash)
-            self.assertIsNotNone(bad)
-            assert bad is not None
-            bad_output, bad_code = bad
-            self.assertEqual(bad_code, 2)
-            self.assertIn("<command>", bad_output)
-
-            warn = session._syntax_check_command_file(warn_host, warn_host, warn_bash)
-            self.assertIsNone(warn)
-        finally:
-            for path in (bad_host, warn_host):
-                try:
-                    os.unlink(path)
-                except FileNotFoundError:
-                    pass
 
 
 class TestBashChunkedReader(unittest.TestCase):
