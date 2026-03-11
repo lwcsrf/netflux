@@ -107,18 +107,22 @@ class BashSession:
         self._start_readers()
 
         # Set pipeline semantics, disable history, quiet PS1, and block until ready.
-        # Save the original stdout pipe to fd 254 for resilient sentinel delivery in execute().
-        # This is resilient to user doing `exec 1>/dev/null` or similar redirections
-        # they may do within their commands.
+        # Save the original stdout pipe to fd 254 for resilient sentinel delivery in execute(),
+        # and prove that writes through fd 254 actually work before declaring the session ready.
         self._write(
             "set -o pipefail; export HISTFILE=/dev/null; export PS1=''; "
-            "shopt -s expand_aliases; exec 254>&1; echo __NETFLUX_BASH_READY__\n"
+            "shopt -s expand_aliases; exec 254>&1; "
+            "builtin printf '__NETFLUX_BASH_READY__\\n' >&254\n"
         )
         # Require readiness; if not reached, mark for restart and fail.
-        if not self._drain_until("__NETFLUX_BASH_READY__", timeout=10):
+        if not self._drain_until("__NETFLUX_BASH_READY__", timeout=3):
             self.requires_restart = True
             self._terminate_group_if_alive()
-            raise BashSessionCrashedException("Bash session failed to reach ready state; tool must be restarted.")
+            raise BashSessionCrashedException(
+                "Bash session failed to initialize fd 254 or failed to reach ready state; "
+                "tool must be restarted. If this repeats, this bash function is probably not going "
+                "to work on this host environment."
+            )
 
     def restart(self) -> None:
         # Caller must hold the session lock via try_acquire().
