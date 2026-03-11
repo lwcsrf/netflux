@@ -1,3 +1,5 @@
+import io
+import codecs
 import os
 import re
 import queue
@@ -46,10 +48,12 @@ class BashSession:
 
     DEFAULT_TIMEOUT_SEC = 120
     MAX_OUTPUT_CHARS = 40_000
+    READ_CHUNK_BYTES = 4096
+    PENDING_TAIL_CHARS = 8192
 
     def __init__(self, session_id: int) -> None:
         self.session_id = session_id
-        self._proc: Optional[subprocess.Popen[str]] = None
+        self._proc: Optional[subprocess.Popen[bytes]] = None
         self._q: queue.Queue[str] = queue.Queue()
         self._stdout_thread: Optional[threading.Thread] = None
         self._lock = threading.Lock()         # serialize commands per session
@@ -91,10 +95,7 @@ class BashSession:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,  # line-buffered
-            encoding="utf-8",
-            errors="replace",
+            bufsize=-1,
             preexec_fn=preexec,
             creationflags=creationflags,
         )
@@ -163,9 +164,21 @@ class BashSession:
     def _start_readers(self) -> None:
         assert self._proc and self._proc.stdout
         def pump(pipe, label: str):
+            decoder = io.IncrementalNewlineDecoder(
+                codecs.getincrementaldecoder("utf-8")("replace"),
+                translate=True,
+            )
             try:
-                for line in iter(pipe.readline, ""):
-                    self._q.put(line)
+                while True:
+                    chunk = pipe.read1(self.READ_CHUNK_BYTES)
+                    if not chunk:
+                        tail = decoder.decode(b"", final=True)
+                        if tail:
+                            self._q.put(tail)
+                        return
+                    text = decoder.decode(chunk)
+                    if text:
+                        self._q.put(text)
             except Exception:
                 # Mark session unhealthy if the reader crashes (broken pipe, decode error, etc.).
                 self.requires_restart = True
@@ -179,7 +192,7 @@ class BashSession:
     def _write(self, s: str) -> None:
         if not (self._proc and self._proc.stdin):
             raise BashSessionCrashedException("Bash process is not available.")
-        self._proc.stdin.write(s)
+        self._proc.stdin.write(s.encode("utf-8", errors="replace"))
         self._proc.stdin.flush()
 
     def _drain_queue_nowait(self) -> None:
@@ -191,11 +204,15 @@ class BashSession:
 
     def _drain_until(self, token: str, timeout: float) -> bool:
         end = time.time() + timeout
+        pending = ""
+        keep = max(len(token) * 2, 256)
         while time.time() < end:
             try:
-                line = self._q.get(timeout=0.05)
-                if token in line:
+                pending += self._q.get(timeout=0.05)
+                if token in pending:
                     return True
+                if len(pending) > keep:
+                    pending = pending[-keep:]
             except queue.Empty:
                 pass
         return False
@@ -270,14 +287,25 @@ class BashSession:
         collected = 0
         exit_code: Optional[int] = None
         found = False
+        pending = ""
+
+        def append_output(text: str) -> None:
+            nonlocal collected
+            if not text or collected >= self.MAX_OUTPUT_CHARS:
+                return
+            space = self.MAX_OUTPUT_CHARS - collected
+            slice_text = text if len(text) <= space else text[:space]
+            chunks.append(slice_text)
+            collected += len(slice_text)
 
         while time.time() < deadline:
             try:
-                line = self._q.get(timeout=0.05)
+                pending += self._q.get(timeout=0.05)
             except queue.Empty:
                 # Also detect process death while waiting
                 if self._proc and self._proc.poll() is not None:
                     self.requires_restart = True
+                    append_output(pending)
                     partial = "".join(chunks)
                     if collected >= self.MAX_OUTPUT_CHARS:
                         partial += (
@@ -291,26 +319,34 @@ class BashSession:
                     )
                 continue
 
-            line = line or ""
-            # Only treat an exact sentinel line as command completion. This avoids
-            # confusing xtrace/debug output that may contain the sentinel text.
-            m = re.fullmatch(rf"{re.escape(sentinel)}\s+(-?\d+)", line.rstrip("\r\n"))
-            if m:
-                exit_code = int(m.group(1))
-                found = True
-                # Do NOT append the sentinel line to output.
+            while True:
+                nl = pending.find("\n")
+                if nl < 0:
+                    break
+                line = pending[:nl + 1]
+                pending = pending[nl + 1:]
+                # Only treat an exact sentinel line as command completion. This avoids
+                # confusing xtrace/debug output that may contain the sentinel text.
+                m = re.fullmatch(rf"{re.escape(sentinel)}\s+(-?\d+)", line.rstrip("\r\n"))
+                if m:
+                    exit_code = int(m.group(1))
+                    found = True
+                    # Do NOT append the sentinel line to output.
+                    break
+                append_output(line)
+
+            if found:
                 break
 
-            if collected < self.MAX_OUTPUT_CHARS:
-                space = self.MAX_OUTPUT_CHARS - collected
-                slice_text = line if len(line) <= space else line[:space]
-                chunks.append(slice_text)
-                collected += len(slice_text)
+            if len(pending) > self.PENDING_TAIL_CHARS:
+                append_output(pending[:-self.PENDING_TAIL_CHARS])
+                pending = pending[-self.PENDING_TAIL_CHARS:]
 
         if not found:
             # Timed out; mark session as requiring restart and stop activity.
             self.requires_restart = True
             self._terminate_group_if_alive()
+            append_output(pending)
             partial = "".join(chunks)
             if collected >= self.MAX_OUTPUT_CHARS:
                 partial += (

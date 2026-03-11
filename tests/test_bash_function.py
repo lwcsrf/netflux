@@ -591,5 +591,86 @@ class TestBashDiscovery(unittest.TestCase):
             self.assertEqual(BashSession._find_bash(), real)
 
 
+class TestBashChunkedReader(unittest.TestCase):
+    def setUp(self) -> None:
+        self.top_bag = SessionBag()
+        self.parent_node = _DummyNode()
+        self.child_node = _DummyNode(parent=self.parent_node)
+        self.ctx = RunContext(runtime=None, node=self.child_node)  # type: ignore[arg-type]
+        self.ctx.object_bags = {
+            SessionScope.TopLevel: self.top_bag,
+            SessionScope.Parent: self.parent_node.session_bag,
+            SessionScope.Self: self.child_node.session_bag,
+        }
+        self.bash = Bash()
+
+    def tearDown(self) -> None:
+        bag_values: Dict[str, Dict[str, object]] = getattr(self.parent_node.session_bag, "_values", {})
+        for namespace in bag_values.values():
+            for obj in namespace.values():
+                if isinstance(obj, BashSession):
+                    proc = obj._proc
+                    obj._terminate_group_if_alive()
+                    if proc is not None:
+                        if proc.stdin:
+                            try:
+                                proc.stdin.close()
+                            except Exception:
+                                pass
+                        if proc.stdout:
+                            try:
+                                proc.stdout.close()
+                            except Exception:
+                                pass
+                        if proc.stderr:
+                            try:
+                                proc.stderr.close()
+                            except Exception:
+                                pass
+                    thread = obj._stdout_thread
+                    if thread is not None and thread.is_alive():
+                        thread.join(timeout=0.5)
+
+    def test_large_no_newline_output_does_not_deadlock(self) -> None:
+        output = self.bash._call(
+            self.ctx,
+            command="head -c 20000 /dev/zero | tr '\\0' x; echo done",
+            session_id=60,
+            timeout_sec=3,
+        )
+        self.assertIn("done", output)
+
+    def test_binary_pipe_path_preserves_plain_output(self) -> None:
+        output = self.bash._call(self.ctx, command="printf 'hello\\n'", session_id=62)
+        self.assertEqual(output, "hello\n\n")
+
+    def test_binary_pipe_path_normalizes_crlf_output(self) -> None:
+        output = self.bash._call(
+            self.ctx,
+            command="printf 'hello\\r\\nbye\\r'; echo done",
+            session_id=64,
+        )
+        self.assertEqual(output, "hello\nbye\ndone\n\n")
+
+    def test_binary_pipe_path_decodes_utf8_output(self) -> None:
+        output = self.bash._call(
+            self.ctx,
+            command="printf '\\303\\251\\303\\251'; echo done",
+            session_id=63,
+        )
+        self.assertEqual(output, "\u00e9\u00e9done\n\n")
+
+    def test_small_chunk_reader_handles_split_utf8_and_sentinel(self) -> None:
+        from unittest import mock
+
+        with mock.patch.object(BashSession, "READ_CHUNK_BYTES", 1):
+            output = self.bash._call(
+                self.ctx,
+                command="printf '\\303\\251\\303\\251\\303\\251'; echo done",
+                session_id=61,
+            )
+        self.assertIn("\u00e9\u00e9\u00e9done", output)
+
+
 if __name__ == "__main__":
     unittest.main()
