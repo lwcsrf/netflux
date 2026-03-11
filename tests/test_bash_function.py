@@ -355,6 +355,16 @@ class TestBashFunctionCommands(unittest.TestCase):
         follow_up = self.bash._call(self.ctx, command="echo after", session_id=0)
         self.assertIn("after", follow_up.splitlines())
 
+    def test_alias_set_does_not_pollute_wrapper(self) -> None:
+        self.bash._call(self.ctx, command="alias set='echo aliasset'", session_id=0)
+        output = self.bash._call(self.ctx, command="echo hi", session_id=0)
+        self.assertEqual(output.strip(), "hi")
+
+    def test_function_named_printf_does_not_break_sentinel_parsing(self) -> None:
+        self.bash._call(self.ctx, command="printf() { echo hijacked; }", session_id=0)
+        output = self.bash._call(self.ctx, command="echo hi", session_id=0)
+        self.assertEqual(output.strip(), "hi")
+
 
 class TestBashEdgeCases(unittest.TestCase):
     """Edge-case tests for unusual but plausible Bash session scenarios."""
@@ -449,6 +459,54 @@ class TestBashEdgeCases(unittest.TestCase):
         result = self.bash._call(self.ctx, command=None, restart=True, session_id=0)
         self.assertIn("restarted", result)
 
+    def test_new_session_does_not_source_inherited_bash_env(self) -> None:
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            marker = Path(tmpdir) / "bash_env_marker.txt"
+            bash_env = Path(tmpdir) / "bash_env.sh"
+            bash_env.write_text(
+                "\n".join(
+                    [
+                        "export FROM_BASH_ENV=1",
+                        f"echo sourced > {_bash_path(marker)}",
+                    ]
+                )
+                + "\n"
+            )
+
+            with mock.patch.dict(os.environ, {"BASH_ENV": str(bash_env)}):
+                output = self.bash._call(
+                    self.ctx,
+                    command='echo "${FROM_BASH_ENV:-unset}"',
+                    session_id=0,
+                )
+
+            self.assertEqual(output.strip(), "unset")
+            self.assertFalse(marker.exists())
+
+    def test_new_session_does_not_import_inherited_shellopts(self) -> None:
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"SHELLOPTS": "xtrace"}):
+            output = self.bash._call(self.ctx, command="echo hi", session_id=0)
+
+        self.assertEqual(output.strip(), "hi")
+        self.assertNotIn("__nf_was_e", output)
+        self.assertNotIn("__NETFLUX_BASH_DONE__", output)
+
+    def test_new_session_does_not_import_inherited_bash_functions(self) -> None:
+        from unittest import mock
+
+        with mock.patch.dict(os.environ, {"BASH_FUNC_nffn%%": "() { echo imported_fn; }"}):
+            output = self.bash._call(
+                self.ctx,
+                command='type nffn >/dev/null 2>&1; echo "$?"',
+                session_id=0,
+            )
+
+        self.assertEqual(output.strip(), "1")
+
     # ── fd 254 resilience ──
 
     def test_exec_stdout_to_dev_null_sentinel_survives(self) -> None:
@@ -533,6 +591,32 @@ class TestBashEdgeCases(unittest.TestCase):
 
     # ── set -e wrapper semantics ──
 
+    def test_output_exactly_at_limit_not_marked_truncated(self) -> None:
+        output = self.bash._call(
+            self.ctx,
+            command=r"head -c 40000 /dev/zero | tr '\0' x",
+            session_id=0,
+        )
+        self.assertEqual(len(output), BashSession.MAX_OUTPUT_CHARS)
+        self.assertNotIn("Output truncated", output)
+
+    def test_crash_after_exact_limit_not_marked_truncated(self) -> None:
+        with self.assertRaises(BashSessionCrashedException) as cm:
+            self.bash._call(
+                self.ctx,
+                command="head -c 40000 /dev/zero | tr '\\0' x\nexit 0",
+                session_id=0,
+            )
+        self.assertNotIn("Output truncated", str(cm.exception))
+
+    def test_user_newline_past_limit_is_marked_truncated(self) -> None:
+        output = self.bash._call(
+            self.ctx,
+            command=r"head -c 40000 /dev/zero | tr '\0' x; printf '\n'",
+            session_id=0,
+        )
+        self.assertIn("Output truncated", output)
+
     def test_set_e_restored_between_calls(self) -> None:
         """The wrapper suppresses -e during execution for safety (prevents the
         shell from dying on failed commands) but preserves it at the shell level
@@ -592,6 +676,77 @@ class TestBashEdgeCases(unittest.TestCase):
         self.assertTrue(proc.stdin is None or proc.stdin.closed)
         self.assertTrue(proc.stdout is None or proc.stdout.closed)
         self.assertTrue(proc.stderr is None or proc.stderr.closed)
+
+    def test_legacy_internal_var_names_do_not_collide_with_wrapper(self) -> None:
+        self.bash._call(
+            self.ctx,
+            command="readonly __nf_ec=7; readonly __nf_was_e=1",
+            session_id=42,
+        )
+        output = self.bash._call(self.ctx, command="echo hi", session_id=42)
+        self.assertEqual(output.strip(), "hi")
+
+    def test_set_u_and_legacy_internal_var_names_do_not_crash_wrapper(self) -> None:
+        output = self.bash._call(
+            self.ctx,
+            command="set -u; unset __nf_was_e; echo body",
+            session_id=43,
+        )
+        self.assertEqual(output.strip(), "body")
+        follow_up = self.bash._call(self.ctx, command="echo alive", session_id=43)
+        self.assertEqual(follow_up.strip(), "alive")
+
+    @unittest.skipUnless(os.name == "nt", "Windows-specific process tree termination")
+    def test_windows_terminate_uses_ctrl_break_before_taskkill(self) -> None:
+        from unittest import mock
+        from ..func_lib import bash as bash_mod
+
+        session = BashSession(44)
+        proc = mock.Mock()
+        proc.pid = 1234
+        proc.poll.return_value = None
+        proc.wait.return_value = None
+        proc.stdin = None
+        proc.stdout = None
+        proc.stderr = None
+        session._proc = proc
+
+        with mock.patch.object(bash_mod.subprocess, "run") as run_mock:
+            session._terminate_group_if_alive()
+
+        proc.send_signal.assert_called_once_with(bash_mod.signal.CTRL_BREAK_EVENT)
+        run_mock.assert_not_called()
+        proc.wait.assert_called_once_with(timeout=2)
+        self.assertIsNone(session._proc)
+
+    @unittest.skipUnless(os.name == "nt", "Windows-specific process tree termination")
+    def test_windows_terminate_falls_back_to_taskkill_tree(self) -> None:
+        from unittest import mock
+        from ..func_lib import bash as bash_mod
+
+        session = BashSession(45)
+        proc = mock.Mock()
+        proc.pid = 1234
+        proc.poll.return_value = None
+        proc.wait.return_value = None
+        proc.send_signal.side_effect = OSError("no console")
+        proc.stdin = None
+        proc.stdout = None
+        proc.stderr = None
+        session._proc = proc
+
+        with mock.patch.object(bash_mod.subprocess, "run") as run_mock:
+            session._terminate_group_if_alive()
+
+        run_mock.assert_called_once_with(
+            ["taskkill", "/PID", "1234", "/T", "/F"],
+            stdout=bash_mod.subprocess.DEVNULL,
+            stderr=bash_mod.subprocess.DEVNULL,
+            check=False,
+            timeout=5,
+        )
+        proc.wait.assert_called_once_with(timeout=2)
+        self.assertIsNone(session._proc)
 
 
 class TestBashDiscovery(unittest.TestCase):

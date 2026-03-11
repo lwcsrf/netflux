@@ -98,6 +98,7 @@ class BashSession:
             bufsize=-1,
             preexec_fn=preexec,
             creationflags=creationflags,
+            env=_sanitized_bash_env(),
         )
         self._alive_once_started = True
         self.requires_restart = False
@@ -148,7 +149,23 @@ class BashSession:
                         # Fall back to process terminate if group kill fails
                         proc.terminate()
                 else:
-                    proc.terminate()
+                    ctrl_break = getattr(signal, "CTRL_BREAK_EVENT", None)
+                    if ctrl_break is not None:
+                        try:
+                            proc.send_signal(ctrl_break)
+                        except Exception:
+                            ctrl_break = None
+                    if ctrl_break is None:
+                        try:
+                            subprocess.run(
+                                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                                timeout=5,
+                            )
+                        except Exception:
+                            proc.terminate()
                 try:
                     proc.wait(timeout=2)
                 except Exception:
@@ -158,7 +175,16 @@ class BashSession:
                         except Exception:
                             pass
                     else:
-                        proc.kill()
+                        try:
+                            subprocess.run(
+                                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                                stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL,
+                                check=False,
+                                timeout=5,
+                            )
+                        except Exception:
+                            proc.kill()
         finally:
             for stream in (proc.stdin, proc.stdout, proc.stderr):
                 if stream is None:
@@ -260,7 +286,10 @@ class BashSession:
         self._drain_queue_nowait()
 
         # Single sentinel line that also carries the exit code (Y's format).
-        sentinel = f"__NETFLUX_BASH_DONE__{uuid.uuid4().hex}"
+        token = uuid.uuid4().hex
+        sentinel = f"__NETFLUX_BASH_DONE__{token}"
+        was_e_var = f"__nf_was_e_{token}"
+        ec_var = f"__nf_ec_{token}"
         # Ensure the user command ends with a newline so here-doc delimiters stand alone.
         cmd = command if command.endswith("\n") else command + "\n"
         # Make sentinel resilient to `set -e` and common fd redirections.
@@ -268,17 +297,17 @@ class BashSession:
         # original stdout pipe, created during session start). Using a dedicated fd means we
         # emit exactly one sentinel line and ensure our pump thread will reliably play it back to us.
         block = (
-            "__nf_was_e=false; case $- in *e*) __nf_was_e=true;; esac\n"
+            f"{was_e_var}=false; case $- in *e*) {was_e_var}=true;; esac\n"
             # The curly braces are intentionally placed on their own lines to ensure heredoc delimiters
             # are recognized correctly by bash. Do not merge them with other lines.
             # The `:` no-op ensures the group always contains at least one command,
             # preventing a syntax error when the user command is only comments or blank lines.
-            "set +e; { :\n"
+            "builtin set +e; { :\n"
             f"{cmd}"
             "}\n"
-            "__nf_ec=$?\n"
-            "$__nf_was_e && set -e\n"
-            f"printf '\\n{sentinel} %d\\n' \"$__nf_ec\" >&254\n"
+            f"{ec_var}=$?\n"
+            "if [[ \"${" + was_e_var + ":-}\" == true ]]; then builtin set -e; fi\n"
+            "builtin printf '\\n" + sentinel + " %d\\n' \"${" + ec_var + "}\" >&254\n"
         )
         try:
             self._write(block)
@@ -293,15 +322,29 @@ class BashSession:
         deadline = time.time() + effective_timeout
         chunks: List[str] = []
         collected = 0
+        truncated = False
+        overflow_newlines = 0
         exit_code: Optional[int] = None
         found = False
         pending = ""
 
         def append_output(text: str) -> None:
-            nonlocal collected
-            if not text or collected >= self.MAX_OUTPUT_CHARS:
+            nonlocal collected, truncated, overflow_newlines
+            if not text:
+                return
+            if collected >= self.MAX_OUTPUT_CHARS:
+                if text.strip("\n"):
+                    truncated = True
+                else:
+                    overflow_newlines += len(text)
                 return
             space = self.MAX_OUTPUT_CHARS - collected
+            overflow = text[space:]
+            if overflow:
+                if overflow.strip("\n"):
+                    truncated = True
+                else:
+                    overflow_newlines += len(overflow)
             slice_text = text if len(text) <= space else text[:space]
             chunks.append(slice_text)
             collected += len(slice_text)
@@ -315,7 +358,7 @@ class BashSession:
                     self.requires_restart = True
                     append_output(pending)
                     partial = "".join(chunks)
-                    if collected >= self.MAX_OUTPUT_CHARS:
+                    if truncated or overflow_newlines > 0:
                         partial += (
                             f"\n\n... Output truncated (showing {self.MAX_OUTPUT_CHARS} characters; "
                             f"limit {self.MAX_OUTPUT_CHARS}) ..."
@@ -356,7 +399,7 @@ class BashSession:
             self._terminate_group_if_alive()
             append_output(pending)
             partial = "".join(chunks)
-            if collected >= self.MAX_OUTPUT_CHARS:
+            if truncated or overflow_newlines > 0:
                 partial += (
                     f"\n\n... Output truncated (showing {self.MAX_OUTPUT_CHARS} characters; "
                     f"limit {self.MAX_OUTPUT_CHARS}) ..."
@@ -370,7 +413,7 @@ class BashSession:
             )
 
         combined = "".join(chunks)
-        if collected >= self.MAX_OUTPUT_CHARS:
+        if truncated or overflow_newlines > 1:
             combined += (
                 f"\n\n... Output truncated (showing {self.MAX_OUTPUT_CHARS} characters; "
                 f"limit {self.MAX_OUTPUT_CHARS}) ..."
@@ -490,6 +533,19 @@ class Bash(CodeFunction):
 bash = Bash()
 
 
+def _sanitized_bash_env() -> dict[str, str]:
+    """Preserve a normal shell environment while blocking bash startup injection via envvars."""
+    env = dict(os.environ)
+    blocked_exact = {"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
+
+    for key in list(env):
+        probe = key.upper() if os.name == "nt" else key
+        if probe in blocked_exact or probe.startswith("BASH_FUNC_"):
+            env.pop(key, None)
+
+    return env
+
+
 def _bash_works(path: Optional[str]) -> bool:
     if not path or not os.path.isfile(path):
         return False
@@ -505,6 +561,7 @@ def _bash_works(path: Optional[str]) -> bool:
             encoding="utf-8",
             errors="replace",
             timeout=2,
+            env=_sanitized_bash_env(),
         )
     except Exception:
         return False
