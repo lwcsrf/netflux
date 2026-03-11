@@ -239,14 +239,14 @@ class BashSession:
         # original stdout pipe, created during session start). Using a dedicated fd means we
         # emit exactly one sentinel line and ensure our pump thread will reliably play it back to us.
         block = (
-            "was_e=false; case $- in *e*) was_e=true;; esac\n"
+            "__nf_was_e=false; case $- in *e*) __nf_was_e=true;; esac\n"
             # The curly braces are intentionally placed on their own lines to ensure heredoc delimiters
             # are recognized correctly by bash. Do not merge them with other lines.
             "set +e; {\n"
             f"{cmd}"
             "}\n"
             "__nf_ec=$?\n"
-            "$was_e && set -e\n"
+            "$__nf_was_e && set -e\n"
             f"printf '\\n{sentinel} %d\\n' \"$__nf_ec\" >&254\n"
         )
         try:
@@ -285,22 +285,21 @@ class BashSession:
                     )
                 continue
 
-        
             line = line or ""
-            if sentinel in line:
-                # Parse exit code from the sentinel line (format: "<sentinel> <code>")
-                m = re.search(rf"{re.escape(sentinel)}\s+(-?\d+)\s*$", line)
-                exit_code = int(m.group(1)) if m else None
+            # Only treat an exact sentinel line as command completion. This avoids
+            # confusing xtrace/debug output that may contain the sentinel text.
+            m = re.fullmatch(rf"{re.escape(sentinel)}\s+(-?\d+)", line.rstrip("\r\n"))
+            if m:
+                exit_code = int(m.group(1))
                 found = True
                 # Do NOT append the sentinel line to output.
                 break
 
             if collected < self.MAX_OUTPUT_CHARS:
                 space = self.MAX_OUTPUT_CHARS - collected
-                if space > 0:
-                    slice_text = line if len(line) <= space else line[:space]
-                    chunks.append(slice_text)
-                    collected += len(slice_text)
+                slice_text = line if len(line) <= space else line[:space]
+                chunks.append(slice_text)
+                collected += len(slice_text)
 
         if not found:
             # Timed out; mark session as requiring restart and stop activity.

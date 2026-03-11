@@ -340,5 +340,12 @@ class TestBashFunctionCommands(unittest.TestCase):
                 self.assertIn("---", lines)
                 self.assertTrue(lines[-1].strip() == "51", f"Expected 51 lines, got: {lines[-1]}")
 
+    def test_set_x_does_not_break_sentinel_parsing(self) -> None:
+        output = self.bash._call(self.ctx, command="set -x\necho hi", session_id=0)
+        self.assertIn("hi", output.splitlines())
+
+        follow_up = self.bash._call(self.ctx, command="echo after", session_id=0)
+        self.assertIn("after", follow_up.splitlines())
+
 if __name__ == "__main__":
     unittest.main()
