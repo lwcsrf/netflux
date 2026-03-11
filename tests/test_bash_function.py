@@ -696,12 +696,26 @@ class TestBashEdgeCases(unittest.TestCase):
         follow_up = self.bash._call(self.ctx, command="echo alive", session_id=43)
         self.assertEqual(follow_up.strip(), "alive")
 
+    def test_per_call_internal_vars_do_not_accumulate_in_session(self) -> None:
+        sid = 44
+        count_cmd = r"compgen -A variable | grep -Ec '^__nf_.*_[0-9a-f]{32}$' || true"
+
+        baseline = self.bash._call(self.ctx, command=count_cmd, session_id=sid)
+        self.assertEqual(baseline.strip(), "1")
+
+        for i in range(10):
+            output = self.bash._call(self.ctx, command=f"echo run-{i}", session_id=sid)
+            self.assertEqual(output.strip(), f"run-{i}")
+
+        after = self.bash._call(self.ctx, command=count_cmd, session_id=sid)
+        self.assertEqual(after.strip(), "1")
+
     @unittest.skipUnless(os.name == "nt", "Windows-specific process tree termination")
     def test_windows_terminate_uses_ctrl_break_before_taskkill(self) -> None:
         from unittest import mock
         from ..func_lib import bash as bash_mod
 
-        session = BashSession(44)
+        session = BashSession(45)
         proc = mock.Mock()
         proc.pid = 1234
         proc.poll.return_value = None
@@ -724,7 +738,7 @@ class TestBashEdgeCases(unittest.TestCase):
         from unittest import mock
         from ..func_lib import bash as bash_mod
 
-        session = BashSession(45)
+        session = BashSession(46)
         proc = mock.Mock()
         proc.pid = 1234
         proc.poll.return_value = None

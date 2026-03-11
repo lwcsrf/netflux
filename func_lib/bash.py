@@ -308,6 +308,7 @@ class BashSession:
             f"{ec_var}=$?\n"
             "if [[ \"${" + was_e_var + ":-}\" == true ]]; then builtin set -e; fi\n"
             "builtin printf '\\n" + sentinel + " %d\\n' \"${" + ec_var + "}\" >&254\n"
+            "builtin unset -v " + was_e_var + " " + ec_var + " 2>/dev/null || builtin true\n"
         )
         try:
             self._write(block)
