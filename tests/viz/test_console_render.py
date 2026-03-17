@@ -1,8 +1,8 @@
 import unittest
 
-from ..core import TokenBill
-from ..providers import Provider
-from ..viz import ConsoleRender
+from ...core import TokenBill
+from ...providers import Provider
+from ...viz import ConsoleRender
 
 
 class TestConsoleRender(unittest.TestCase):

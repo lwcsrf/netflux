@@ -15,6 +15,23 @@ The interactive demos use `ConsoleRender.run(node)` directly. The renderer owns 
 terminal session, streams live `NodeView` updates, handles keyboard navigation, and leaves
 the completed tree open for browsing until you quit.
 
+### TUI (`tui.py`)
+
+Launches the new multi-pane `TUI` against four existing demo roots at once:
+
+- `puzzle_solver`
+- `bash_stress_agent`
+- `perf_optimizer`
+- `apply_diff_patch`
+
+Use number keys or click the Functions pane to open the launch form for one of those
+roots, then fill in the raw function args and submit. This demo applies one global
+provider choice to every agent reachable from those roots.
+
+Run:
+
+`python3 -m netflux.demos.tui --provider={gemini,anthropic}`
+
 ### Gauntlet (`puzzle.py`)
 
 The LLM needs to solve a series of puzzles and can't advance to the next stage until it has solved this stage's puzzle.

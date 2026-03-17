@@ -291,16 +291,42 @@ while True:
 
 This ensures your UI only sees **consistent** views of the task tree.
 
-If you just want a pretty good interactive terminal viewer, use `ConsoleRender` included in the `viz` subpackage directly instead of writing your own watch loop:
+### Terminal UIs
+
+`viz` is an auxiliary convenience package rather than one of the project's golden packages. It mainly serves as a reference implementation demonstrating how the framework can be used to build an interactive agentic harness used from a terminal.
+
+> **Note:** Unlike `core`, `func_lib`, and `providers` (treated as "golden" packages and carefully architected), `viz` was mostly auto-generated on top of those cleaner abstractions and is not held to the same quality or maintainability bar. See `viz/SPEC.md` for the current UI contract.
+
+* **`TUI(runtime).run():`** a multi-pane terminal app that wraps a `Runtime`, lets you invoke `Function`s from that runtime as top-level invocations, and switch between launched root trees that they produce.
+* **`ConsoleRender.run(node):`** an interactive standalone single-tree viewer for a top-level `Node` you already invoked.
 
 ```python
+from netflux.runtime import Runtime
+from netflux.viz import TUI
+
+runtime = Runtime(
+    specs=[top_level_fn],
+    client_factories={...},
+)
+TUI(runtime).run()
+```
+
+If you already have a top-level `Node` and just want to inspect that one tree, use `ConsoleRender` directly instead of writing your own watch loop:
+
+```python
+import multiprocessing as mp
+
 from netflux.viz import ConsoleRender
 
-render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+cancel_evt = mp.Event()
+node = ctx.invoke(top_level_fn, {...}, cancel_event=cancel_evt)
+render = ConsoleRender(spinner_hz=10.0)
 render.run(node)
 ```
 
 `ConsoleRender` gives you a collapsible execution tree, keyboard navigation, agent-to-agent jumping, expand/collapse-all actions, and a post-completion browser. It redraws when either: (1) a newer `NodeView` snapshot arrives, (2) the animation (e.g. spinner / timer) advances while work is still running, (3) when the user presses a bound key to navigate the tree, and (4) when the terminal size changes.
+
+For the standalone `ConsoleRender.run(node)` entrypoint, the top-level `Node` must have been invoked with a cooperative cancellation event. Pass `cancel_event=...` when invoking the top-level function.
 
 ---
 

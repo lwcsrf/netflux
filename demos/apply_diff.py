@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing as mp
 import os
 import sys
 import tempfile
@@ -256,11 +257,13 @@ def _run_applydiff(
             client_factories=CLIENT_FACTORIES,
         )
         ctx = runtime.get_ctx()
+        cancel_evt = mp.Event()
 
         node = ctx.invoke(
             apply_diff_patch,
             {"diff_content": patch_doc},
             provider=provider,
+            cancel_event=cancel_evt,
         )
 
         render = ConsoleRender(spinner_hz=10.0)
@@ -272,9 +275,6 @@ def _run_applydiff(
             result_text = str(node.result())
         except Exception as e:
             exc = e
-
-        # Final static frame
-        print(str(render.render(runtime.watch(node))))
 
         return node.state, result_text, exc
     finally:

@@ -58,6 +58,7 @@ packages = [
     "netflux",
     "netflux.providers",
     "netflux.tests",
+    "netflux.tests.viz",
     "netflux.viz",
     "netflux.func_lib",
     "netflux.demos",
