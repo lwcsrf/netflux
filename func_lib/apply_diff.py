@@ -1,5 +1,5 @@
 from ..core import AgentFunction, FunctionArg, Provider
-from .bash import bash
+from .bash_func import bash
 from .raise_exception import raise_exception
 from .text_editor import text_editor
 

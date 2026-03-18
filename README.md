@@ -275,7 +275,7 @@ External consumers (e.g., your UI) do **not** read `Node` objects directly—tho
 A minimal **watch loop** facility is provided for event-driven UI and looks like this:
 
 ```python
-from netflux.core import NodeState
+from netflux import NodeState, TerminalNodeStates
 
 prev = 0
 while True:
@@ -301,7 +301,7 @@ This ensures your UI only sees **consistent** views of the task tree.
 * **`ConsoleRender.run(node):`** an interactive standalone single-tree viewer for a top-level `Node` you already invoked.
 
 ```python
-from netflux.runtime import Runtime
+from netflux import Runtime
 from netflux.tui import TUI
 
 runtime = Runtime(
@@ -403,9 +403,7 @@ Below we **reuse** the earlier definitions:
 
 ```python
 # --- Imports from netflux ---
-from netflux.core import NodeState
-from netflux.providers import Provider
-from netflux.runtime import Runtime
+from netflux import NodeState, Provider, Runtime, TerminalNodeStates
 
 # Built-ins
 from netflux.func_lib.text_editor import text_editor           # CodeFunction (leaf tool)

@@ -10,7 +10,7 @@ from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider
 from ..runtime import Runtime
 from ..tui import ConsoleRender
 from .client_factory import CLIENT_FACTORIES
-from ..func_lib.apply_diff import apply_diff_patch
+from ..func_lib import apply_diff_patch
 
 
 def _write(path: Path, text: str) -> None:

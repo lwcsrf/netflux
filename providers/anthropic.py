@@ -100,7 +100,7 @@ from anthropic.types.tool_param import InputSchemaTyped
     * bash tool
         * Ref: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/bash-tool
         * Specified without reference implementation.   
-        * We implemented in `func_lib/bash.py`.
+        * We implemented in `func_lib/bash_func.py`.
 
 * Strict structured outputs
     * should be achieved via tools (their arg schema is the output schema)
