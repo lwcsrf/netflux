@@ -8,7 +8,7 @@ import threading
 import textwrap
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event as MpEvent
-from typing import Callable, Mapping, TypeAlias
+from typing import Callable, Mapping
 
 from ..core import Function, FunctionArg, Node, NodeState, NodeView, TerminalNodeStates, TokenBill
 from ..providers import Provider
@@ -59,8 +59,8 @@ _PANE_SEPARATOR = f"{FG['white']}║{RESET}"
 _PANE_SEPARATOR_COLS = 1
 _RIGHT_PANE_MARGIN_COLS = 2
 
-TokenBills: TypeAlias = Mapping[Provider, TokenBill]
-TerminalCallback: TypeAlias = Callable[[TokenBills], None]
+TokenBills = Mapping[Provider, TokenBill]
+TerminalCallback = Callable[[TokenBills], None]
 
 
 @dataclass

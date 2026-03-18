@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Interactive tree view for agent execution trees.
 
 An interactive renderer supporting:
@@ -19,9 +21,6 @@ Keyboard controls during live execution:
 Additional controls in post-completion browser:
     q / Esc     Exit browser
 """
-
-from __future__ import annotations
-
 import re
 import threading
 import time
