@@ -293,16 +293,16 @@ This ensures your UI only sees **consistent** views of the task tree.
 
 ### Terminal UIs
 
-`viz` is an auxiliary convenience package rather than one of the project's golden packages. It mainly serves as a reference implementation demonstrating how the framework can be used to build an interactive agentic harness used from a terminal.
+`tui` is an auxiliary convenience package rather than one of the project's golden packages. It mainly serves as a reference implementation demonstrating how the framework can be used to build an interactive agentic harness used from a terminal.
 
-> **Note:** Unlike `core`, `func_lib`, and `providers` (treated as "golden" packages and carefully architected), `viz` was mostly auto-generated on top of those cleaner abstractions and is not held to the same quality or maintainability bar. See `viz/SPEC.md` for the current UI contract.
+> **Note:** Unlike `core`, `func_lib`, and `providers` (treated as "golden" packages and carefully architected), `tui` was mostly auto-generated on top of those cleaner abstractions and is not held to the same quality or maintainability bar. See `tui/SPEC.md` for the current UI contract.
 
 * **`TUI(runtime).run():`** a multi-pane terminal app that wraps a `Runtime`, lets you invoke `Function`s from that runtime as top-level invocations, and switch between launched root trees that they produce.
 * **`ConsoleRender.run(node):`** an interactive standalone single-tree viewer for a top-level `Node` you already invoked.
 
 ```python
 from netflux.runtime import Runtime
-from netflux.viz import TUI
+from netflux.tui import TUI
 
 runtime = Runtime(
     specs=[top_level_fn],
@@ -316,7 +316,7 @@ If you already have a top-level `Node` and just want to inspect that one tree, u
 ```python
 import multiprocessing as mp
 
-from netflux.viz import ConsoleRender
+from netflux.tui import ConsoleRender
 
 cancel_evt = mp.Event()
 node = ctx.invoke(top_level_fn, {...}, cancel_event=cancel_evt)

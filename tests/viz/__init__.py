@@ -1,1 +1,0 @@
-"""Viz-specific tests."""

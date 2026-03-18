@@ -2,7 +2,7 @@ import unittest
 
 from ...core import TokenBill
 from ...providers import Provider
-from ...viz import ConsoleRender
+from ...tui import ConsoleRender
 
 
 class TestConsoleRender(unittest.TestCase):

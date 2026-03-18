@@ -14,7 +14,7 @@ from ..core import (
 )
 from ..runtime import Runtime
 from .client_factory import CLIENT_FACTORIES
-from ..viz import ConsoleRender
+from ..tui import ConsoleRender
 
 
 PUZZLE_SOLVER_SYSTEM_PROMPT = (

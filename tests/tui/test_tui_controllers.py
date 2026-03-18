@@ -22,17 +22,17 @@ from ...core import (
 )
 from ...providers import Provider
 from ...runtime import Runtime
-from ...viz import ConsoleRender
-from ...viz._controller_helpers import (
+from ...tui import ConsoleRender
+from ...tui._controller_helpers import (
     compose_bottom_bar,
     multi_pane_shortcut_variants,
     preferred_left_pane_width,
     render_too_small_frame,
 )
-from ...viz._controllers import SingleTreeConsoleController
-from ...viz._contracts import SelectedTreeStatus, SessionController, TerminalSize
-from ...viz._driver import ConsoleSessionDriver
-from ...viz._terminal_io import (
+from ...tui._controllers import SingleTreeConsoleController
+from ...tui._contracts import SelectedTreeStatus, SessionController, TerminalSize
+from ...tui._driver import ConsoleSessionDriver
+from ...tui._terminal_io import (
     _WIN_ENABLE_MOUSE_INPUT,
     _WIN_ENABLE_WINDOW_INPUT,
     _WIN_KEY_EVENT,
@@ -40,8 +40,8 @@ from ...viz._terminal_io import (
     _configure_windows_console_input,
     read_key_windows,
 )
-from ...viz.console import FG
-from ...viz.tui import TUI, TokenBills, _RunRecord, _RunUpdateEvent
+from ...tui.console import FG
+from ...tui.tui import TUI, TokenBills, _RunRecord, _RunUpdateEvent
 
 
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -207,7 +207,7 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         node = runtime.invoke(None, fn, {})
         renderer = ConsoleRender()
 
-        with patch("netflux.viz._driver.ConsoleSessionDriver.run") as driver_run:
+        with patch("netflux.tui._driver.ConsoleSessionDriver.run") as driver_run:
             with self.assertRaisesRegex(ValueError, "requires the node to have a cancel_event"):
                 renderer.run(node)
 
@@ -220,7 +220,7 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         node = runtime.invoke(None, fn, {}, cancel_event=cancel_event)
         renderer = ConsoleRender()
 
-        with patch("netflux.viz._driver.ConsoleSessionDriver.run") as driver_run:
+        with patch("netflux.tui._driver.ConsoleSessionDriver.run") as driver_run:
             renderer.run(node)
 
         driver_run.assert_called_once()
@@ -1173,7 +1173,7 @@ class TestTUIState(unittest.TestCase):
             _RunUpdateEvent(run_index=0, view=_make_view(fn, state=NodeState.Success, update_seqnum=2))
         )
 
-        with patch("netflux.viz.tui.logging.exception") as log_exception:
+        with patch("netflux.tui.tui.logging.exception") as log_exception:
             self.assertTrue(tui.pump_events())
 
         log_exception.assert_called_once()
@@ -1888,8 +1888,8 @@ class TestTUIState(unittest.TestCase):
             return original_start(thread_self, *args, **kwargs)
 
         with patch.object(threading.Thread, "start", autospec=True, side_effect=fail_watcher_start):
-            with patch("netflux.viz.tui.restore_console"), patch(
-                "netflux.viz.tui.os._exit",
+            with patch("netflux.tui.tui.restore_console"), patch(
+                "netflux.tui.tui.os._exit",
                 side_effect=SystemExit(1),
             ):
                 with self.assertRaises(SystemExit):
@@ -1926,8 +1926,8 @@ class TestTUIState(unittest.TestCase):
             return original_start(thread_self, *args, **kwargs)
 
         with patch.object(threading.Thread, "start", autospec=True, side_effect=fail_watcher_start):
-            with patch("netflux.viz.tui.restore_console"), patch(
-                "netflux.viz.tui.os._exit",
+            with patch("netflux.tui.tui.restore_console"), patch(
+                "netflux.tui.tui.os._exit",
                 side_effect=SystemExit(1),
             ):
                 with self.assertRaises(SystemExit):
@@ -1965,9 +1965,9 @@ class TestTUIState(unittest.TestCase):
                 del args, kwargs
                 raise RuntimeError("renderer boom")
 
-        with patch("netflux.viz.tui.ConsoleRender", _BoomRender):
-            with patch("netflux.viz.tui.restore_console"), patch(
-                "netflux.viz.tui.os._exit",
+        with patch("netflux.tui.tui.ConsoleRender", _BoomRender):
+            with patch("netflux.tui.tui.restore_console"), patch(
+                "netflux.tui.tui.os._exit",
                 side_effect=SystemExit(1),
             ):
                 with self.assertRaises(SystemExit):
@@ -2232,7 +2232,7 @@ class TestTerminalIO(unittest.TestCase):
         ])
 
         with patch(
-            "netflux.viz._terminal_io.ctypes.windll",
+            "netflux.tui._terminal_io.ctypes.windll",
             SimpleNamespace(kernel32=kernel32),
             create=True,
         ):
@@ -2241,11 +2241,11 @@ class TestTerminalIO(unittest.TestCase):
     def test_configure_windows_console_input_enables_resize_notifications(self) -> None:
         kernel32 = _FakeWindowsModeKernel32(mode=0)
 
-        with patch("netflux.viz._terminal_io.os.name", "nt"), patch(
-            "netflux.viz._terminal_io.ctypes.windll",
+        with patch("netflux.tui._terminal_io.os.name", "nt"), patch(
+            "netflux.tui._terminal_io.ctypes.windll",
             SimpleNamespace(kernel32=kernel32),
             create=True,
-        ), patch("netflux.viz._terminal_io._WINDOWS_INPUT_MODE_SAVED", None):
+        ), patch("netflux.tui._terminal_io._WINDOWS_INPUT_MODE_SAVED", None):
             _configure_windows_console_input(enable_mouse=True)
 
         self.assertEqual(len(kernel32.set_modes), 1)
@@ -2269,10 +2269,10 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.viz._driver.os.name", "posix"), patch(
-            "netflux.viz._driver.threading.current_thread", return_value=fake_current
+        ), patch("netflux.tui._driver.os.name", "posix"), patch(
+            "netflux.tui._driver.threading.current_thread", return_value=fake_current
         ), patch(
-            "netflux.viz._driver.threading.main_thread", return_value=fake_main
+            "netflux.tui._driver.threading.main_thread", return_value=fake_main
         ):
             with self.assertRaisesRegex(RuntimeError, "main thread on POSIX"):
                 driver.run(controller)
@@ -2288,11 +2288,11 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.viz._driver.os.name", "posix"), patch(
-            "netflux.viz._driver.threading.current_thread", return_value=fake_current
+        ), patch("netflux.tui._driver.os.name", "posix"), patch(
+            "netflux.tui._driver.threading.current_thread", return_value=fake_current
         ), patch(
-            "netflux.viz._driver.threading.main_thread", return_value=fake_main
-        ), patch("netflux.viz._driver.pre_console") as pre_console:
+            "netflux.tui._driver.threading.main_thread", return_value=fake_main
+        ), patch("netflux.tui._driver.pre_console") as pre_console:
             with self.assertRaisesRegex(RuntimeError, "main thread on POSIX"):
                 driver.run(controller)
 
@@ -2308,13 +2308,13 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.viz._driver.os.name", "posix"), patch(
-            "netflux.viz._driver.threading.current_thread", return_value=fake_main
+        ), patch("netflux.tui._driver.os.name", "posix"), patch(
+            "netflux.tui._driver.threading.current_thread", return_value=fake_main
         ), patch(
-            "netflux.viz._driver.threading.main_thread", return_value=fake_main
+            "netflux.tui._driver.threading.main_thread", return_value=fake_main
         ), patch(
-            "netflux.viz._driver.signal.getsignal", return_value=custom_handler
-        ), patch("netflux.viz._driver.pre_console") as pre_console:
+            "netflux.tui._driver.signal.getsignal", return_value=custom_handler
+        ), patch("netflux.tui._driver.pre_console") as pre_console:
             with self.assertRaisesRegex(RuntimeError, "default Python SIGINT handler"):
                 driver.run(controller)
 
@@ -2328,8 +2328,8 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=False
-        ), patch("netflux.viz._driver.pre_console"), patch(
-            "netflux.viz._driver.restore_console"
+        ), patch("netflux.tui._driver.pre_console"), patch(
+            "netflux.tui._driver.restore_console"
         ):
             driver.run(controller)
 
@@ -2343,10 +2343,10 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=False), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.viz._driver.pre_console") as pre_console, patch(
-            "netflux.viz._driver.restore_console"
+        ), patch("netflux.tui._driver.pre_console") as pre_console, patch(
+            "netflux.tui._driver.restore_console"
         ) as restore_console, patch(
-            "netflux.viz._driver.ui_driver",
+            "netflux.tui._driver.ui_driver",
             side_effect=lambda frame: pre_console(),
         ):
             driver.run(controller)
@@ -2362,9 +2362,9 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=False), patch(
             "sys.stdout.isatty", return_value=False
-        ), patch("netflux.viz._driver.pre_console"), patch(
-            "netflux.viz._driver.restore_console"
-        ), patch("netflux.viz._driver.ui_driver"):
+        ), patch("netflux.tui._driver.pre_console"), patch(
+            "netflux.tui._driver.restore_console"
+        ), patch("netflux.tui._driver.ui_driver"):
             driver.run(controller)
 
         self.assertEqual(controller.interrupts, 1)
@@ -2381,7 +2381,7 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=False), patch(
             "sys.stdout.isatty", return_value=False
-        ), patch("netflux.viz._driver.ui_driver") as ui_driver:
+        ), patch("netflux.tui._driver.ui_driver") as ui_driver:
             driver.run(controller)
 
         self.assertEqual(ui_driver.call_count, 1)
@@ -2404,9 +2404,9 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.viz._driver.pre_console"), patch(
-            "netflux.viz._driver.restore_console"
-        ) as restore_console, patch("netflux.viz._driver.ui_driver"), patch.object(
+        ), patch("netflux.tui._driver.pre_console"), patch(
+            "netflux.tui._driver.restore_console"
+        ) as restore_console, patch("netflux.tui._driver.ui_driver"), patch.object(
             ConsoleSessionDriver, loop_name, **loop_args
         ):
             with self.assertRaisesRegex(RuntimeError, "stop boom"):
@@ -2420,8 +2420,8 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.viz._driver.pre_console") as pre_console, patch(
-            "netflux.viz._driver.restore_console"
+        ), patch("netflux.tui._driver.pre_console") as pre_console, patch(
+            "netflux.tui._driver.restore_console"
         ):
             driver.run(controller)
 

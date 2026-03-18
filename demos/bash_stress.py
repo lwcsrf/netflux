@@ -9,7 +9,7 @@ from ..core import AgentFunction, FunctionArg, NodeState, Provider
 from ..func_lib.bash import bash
 from ..func_lib.raise_exception import raise_exception
 from ..runtime import Runtime
-from ..viz import ConsoleRender
+from ..tui import ConsoleRender
 
 
 BASH_STRESS_SYSTEM_PROMPT = (

@@ -1,14 +1,14 @@
-# `viz` UI Specification
+# `tui` UI Specification
 
-Status: current implementation contract for the `viz` package in this branch.
+Status: current implementation contract for the `tui` package in this branch.
 
 Note:
-- `viz` is an auxiliary convenience package rather than one of the project's golden packages.
+- `tui` is an auxiliary convenience package rather than one of the project's golden packages.
 - Unlike `core`, `func_lib`, and `providers`, it is not held to the same quality or maintainability bar. It was mostly auto-generated on top of the framework's clean abstractions. It has undergone the least review compared to the other packages. It is most like a "throwaway frontend" concept. That said, considerable iteration went into the current implementation.
-- This spec is therefore primarily a practical contract for automatic code generation by agents and for keeping future `viz` changes aligned with the current implemented behavior.
+- This spec is therefore primarily a practical contract for automatic code generation by agents and for keeping future `tui` changes aligned with the current implemented behavior.
 
 Scope:
-- This document describes the behavior implemented by `viz/console.py`, `viz/tui.py`, and the internal driver/controller helpers under `viz/`.
+- This document describes the behavior implemented by `tui/console.py`, `tui/tui.py`, and the internal driver/controller helpers under `tui/`.
 - It covers the two supported UI entrypoints: `ConsoleRender.run(node)` and `TUI(runtime).run()`.
 - It describes current behavior and explicit v1 limitations. It is intended to replace the earlier branch-design draft now that the implemented behavior is captured here.
 
@@ -464,8 +464,8 @@ Current v1 limitations include:
 
 ## 9. Verification Surface
 
-The behavior described here is exercised by the `tests/viz/` suite and is intended to stay aligned with:
-- `tests/viz/test_console_render.py`
-- `tests/viz/test_viz_controllers.py`
+The behavior described here is exercised by the `tests/tui/` suite and is intended to stay aligned with:
+- `tests/tui/test_console_render.py`
+- `tests/tui/test_tui_controllers.py`
 
 When implementation changes alter the behavior above, this file should be updated in the same change.

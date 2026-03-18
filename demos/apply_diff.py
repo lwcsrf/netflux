@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 
 from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider
 from ..runtime import Runtime
-from ..viz import ConsoleRender
+from ..tui import ConsoleRender
 from .client_factory import CLIENT_FACTORIES
 from ..func_lib.apply_diff import apply_diff_patch
 

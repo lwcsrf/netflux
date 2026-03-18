@@ -4,7 +4,7 @@ from typing import Iterable, List, Optional, Sequence
 
 from ..core import AgentFunction, Function, Provider
 from ..runtime import Runtime
-from ..viz import TUI
+from ..tui import TUI
 from .apply_diff import apply_diff_patch
 from .bash_stress import bash_stress_agent
 from .client_factory import CLIENT_FACTORIES
