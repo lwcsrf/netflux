@@ -1440,6 +1440,7 @@ class TestTUIState(unittest.TestCase):
         tui._submit_form()
 
         self.assertEqual(len(tui._runs), 1)
+        self.assertEqual(tui._runs[0].node.inputs, {"value": None})
         self.assertIsNone(tui._runs[0].node.result())
 
     def test_launch_form_accepts_literal_j_and_k(self) -> None:

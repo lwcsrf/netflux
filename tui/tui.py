@@ -461,6 +461,8 @@ class TUI(SessionController):
                 assert field.arg is not None
                 raw = field.value
                 if raw.strip() == "":
+                    if field.optional:
+                        parsed_args[field.arg.name] = None
                     continue
                 parsed_args[field.arg.name] = self._parse_arg(field.arg, raw)
             cancel_event = mp.Event()

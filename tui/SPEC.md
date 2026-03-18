@@ -363,7 +363,8 @@ Current form editing behavior:
 
 Submission/parsing rules:
 - whitespace-only arg fields are treated as omitted,
-- omitted fields are passed as missing args, so only optional args may be left blank,
+- blank optional arg fields are submitted as explicit `None`,
+- blank required arg fields remain missing and therefore fail top-level validation,
 - `str` args preserve the raw entered string when non-blank,
 - `int` args are parsed with `int(...)`,
 - `float` args are parsed with `float(...)`,
