@@ -40,8 +40,10 @@ from ...tui._terminal_io import (
     _WIN_KEY_EVENT,
     _WinInputRecord,
     _configure_windows_console_input,
+    read_key,
     read_key_windows,
 )
+from ...tui import _terminal_io as terminal_io
 from ...tui.console import FG
 from ...tui.tui import TUI, TokenBills, _RunRecord, _RunUpdateEvent
 
@@ -77,11 +79,17 @@ def _make_agent_function(name: str) -> AgentFunction:
     )
 
 
-def _make_view(fn: CodeFunction, *, state: NodeState, update_seqnum: int) -> NodeView:
+def _make_view(
+    fn: CodeFunction,
+    *,
+    state: NodeState,
+    update_seqnum: int,
+    inputs: dict[str, object] | None = None,
+) -> NodeView:
     return NodeView(
         id=update_seqnum,
         fn=fn,
-        inputs={},
+        inputs=inputs or {},
         state=state,
         outputs=None,
         exception=None,
@@ -1809,9 +1817,14 @@ class TestTUIState(unittest.TestCase):
         plain_lines = [_strip_ansi(line).rstrip() for line in rendered.splitlines()]
         _, _, header_rows = tui._form_item_window(TerminalSize(columns=80, lines=15))
 
-        self.assertEqual(header_rows, 4)
+        self.assertEqual(
+            header_rows,
+            len(tui._launch_form_desc_lines(fn, 80)) + len(tui._launch_form_arg_lines(fn, 80)) + 2,
+        )
         self.assertIn("first line", plain_lines[1])
         self.assertIn("second line", plain_lines[2])
+        self.assertIn("Arguments", plain_lines[3])
+        self.assertIn("value (str)", plain_lines[4])
 
     def test_launch_form_wraps_long_single_line_descriptions(self) -> None:
         fn = CodeFunction(
@@ -1832,9 +1845,240 @@ class TestTUIState(unittest.TestCase):
         _, _, header_rows = tui._form_item_window(size)
 
         self.assertGreater(len(wrapped_desc), 1)
-        self.assertEqual(header_rows, len(wrapped_desc) + 2)
+        self.assertEqual(
+            header_rows,
+            len(wrapped_desc) + len(tui._launch_form_arg_lines(fn, size.columns)) + 2,
+        )
         for idx, desc_line in enumerate(wrapped_desc, start=1):
             self.assertEqual(plain_lines[idx].strip(), desc_line)
+
+    def test_launch_form_shows_arg_descriptions_and_optional_marker(self) -> None:
+        fn = CodeFunction(
+            name="metadata",
+            desc="launch metadata target",
+            args=[
+                FunctionArg("count", int, "How many items to process."),
+                FunctionArg("ratio", float, "Blend ratio for the run.", optional=True),
+            ],
+            callable=lambda ctx, *, count, ratio=None: f"{count}:{ratio}",
+            uses=[],
+        )
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+
+        rendered = tui.render_frame(TerminalSize(columns=80, lines=18), tick=0)
+        plain_lines = [_strip_ansi(line).rstrip() for line in rendered.splitlines()]
+
+        self.assertTrue(any("Arguments" == line.strip() for line in plain_lines))
+        self.assertTrue(any("count (int): How many items to process." in line for line in plain_lines))
+        self.assertTrue(any("ratio (float) [optional]: Blend ratio for the run." in line for line in plain_lines))
+
+    def test_launch_form_history_uses_most_recent_20_runs_for_same_function(self) -> None:
+        fn = CodeFunction(
+            name="history_target",
+            desc="history target",
+            args=[FunctionArg("value", int)],
+            callable=lambda ctx, *, value: value,
+            uses=[],
+        )
+        other = _make_code_function("other")
+        runtime = Runtime([fn, other], client_factories={})
+        tui = TUI(runtime)
+
+        for idx in range(22):
+            tui._runs.append(
+                _RunRecord(
+                    name=f"run{idx}",
+                    fn=fn,
+                    node=object(),  # type: ignore[arg-type]
+                    renderer=ConsoleRender(cancel_event=mp.Event()),
+                    cancel_event=mp.Event(),
+                    latest_view=_make_view(
+                        fn,
+                        state=NodeState.Success,
+                        update_seqnum=idx + 1,
+                        inputs={"value": idx},
+                    ),
+                )
+            )
+        tui._runs.append(
+            _RunRecord(
+                name="other-run",
+                fn=other,
+                node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=mp.Event()),
+                cancel_event=mp.Event(),
+                latest_view=_make_view(other, state=NodeState.Success, update_seqnum=99),
+            )
+        )
+        tui._open_launch_form(0)
+
+        history = tui._launch_form_history()
+
+        self.assertEqual(len(history), 20)
+        self.assertEqual(history[0].name, "run21")
+        self.assertEqual(history[0].inputs["value"], 21)
+        self.assertEqual(history[-1].name, "run2")
+
+    def test_launch_form_recent_history_enter_repopulates_args(self) -> None:
+        fn = CodeFunction(
+            name="reuse_args",
+            desc="reuse args target",
+            args=[
+                FunctionArg("count", int),
+                FunctionArg("flag", bool),
+                FunctionArg("label", str, optional=True),
+            ],
+            callable=lambda ctx, *, count, flag, label=None: f"{count}:{flag}:{label}",
+            uses=[],
+        )
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="recent run",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=mp.Event()),
+                cancel_event=mp.Event(),
+                latest_view=_make_view(
+                    fn,
+                    state=NodeState.Success,
+                    update_seqnum=1,
+                    inputs={"count": 7, "flag": False, "label": None},
+                ),
+            )
+        ]
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.fields[0].value = "keep name"
+        tui._form_state.fields[1].value = "999"
+        tui._form_state.error = "bad input"
+        tui._form_state.cursor = tui._launch_form_history_start_index()
+
+        tui.handle_key("\n")
+
+        self.assertEqual(tui._form_state.fields[0].value, "recent run (1)")
+        self.assertEqual(tui._form_state.fields[1].value, "7")
+        self.assertEqual(tui._form_state.fields[2].value, "false")
+        self.assertEqual(tui._form_state.fields[3].value, "")
+        self.assertEqual(tui._form_state.cursor, 1)
+        self.assertEqual(tui._form_state.error, "")
+
+    def test_launch_form_last_arg_enter_still_reaches_submit_before_history(self) -> None:
+        fn = CodeFunction(
+            name="submit_before_history",
+            desc="submit ordering target",
+            args=[FunctionArg("value", str)],
+            callable=lambda ctx, *, value: value,
+            uses=[],
+        )
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="recent run",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=mp.Event()),
+                cancel_event=mp.Event(),
+                latest_view=_make_view(
+                    fn,
+                    state=NodeState.Success,
+                    update_seqnum=1,
+                    inputs={"value": "history"},
+                ),
+            )
+        ]
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.fields[1].value = "typed"
+        tui._form_state.cursor = 1
+
+        tui.handle_key("\n")
+
+        assert tui._form_state is not None
+        self.assertEqual(tui._form_state.cursor, len(tui._form_state.fields))
+        self.assertEqual(tui._form_state.fields[1].value, "typed")
+
+        tui.handle_key("\n")
+
+        self.assertIsNone(tui._form_state)
+        self.assertEqual(len(tui._runs), 2)
+        self.assertEqual(tui._runs[-1].node.result(), "typed")
+
+    def test_launch_form_recent_history_mouse_click_repopulates_args(self) -> None:
+        fn = CodeFunction(
+            name="reuse_mouse",
+            desc="reuse args target",
+            args=[FunctionArg("value", str)],
+            callable=lambda ctx, *, value: value,
+            uses=[],
+        )
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="recent click",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=mp.Event()),
+                cancel_event=mp.Event(),
+                latest_view=_make_view(
+                    fn,
+                    state=NodeState.Success,
+                    update_seqnum=1,
+                    inputs={"value": "from history"},
+                ),
+            )
+        ]
+        tui._open_launch_form(0)
+
+        rendered = tui.render_frame(TerminalSize(columns=90, lines=18), tick=0)
+        plain_lines = [_strip_ansi(line).rstrip() for line in rendered.splitlines()]
+        history_row = next(i for i, line in enumerate(plain_lines) if "recent click" in line)
+
+        tui.handle_mouse(SimpleNamespace(x=2, y=history_row, button="left"))
+
+        assert tui._form_state is not None
+        self.assertEqual(tui._form_state.fields[0].value, "recent click (1)")
+        self.assertEqual(tui._form_state.fields[1].value, "from history")
+        self.assertEqual(tui._form_state.cursor, 1)
+
+    def test_launch_form_recent_history_increments_existing_suffix_in_name(self) -> None:
+        fn = CodeFunction(
+            name="reuse_suffix",
+            desc="reuse suffix target",
+            args=[FunctionArg("value", str)],
+            callable=lambda ctx, *, value: value,
+            uses=[],
+        )
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="recent click (7)",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=mp.Event()),
+                cancel_event=mp.Event(),
+                latest_view=_make_view(
+                    fn,
+                    state=NodeState.Success,
+                    update_seqnum=1,
+                    inputs={"value": "from history"},
+                ),
+            )
+        ]
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.cursor = tui._launch_form_history_start_index()
+
+        tui.handle_key("\n")
+
+        self.assertEqual(tui._form_state.fields[0].value, "recent click (8)")
+        self.assertEqual(tui._form_state.fields[1].value, "from history")
 
     def test_launch_form_keeps_fields_visible_when_description_exceeds_viewport(self) -> None:
         fn = CodeFunction(
@@ -2230,6 +2474,51 @@ class _SingleRenderController(_RecordingController):
 
 
 class TestTerminalIO(unittest.TestCase):
+    def test_read_key_buffers_split_posix_mouse_sequence_until_complete(self) -> None:
+        select_results = iter([
+            ([7], [], []),  # initial byte available
+            ([7], [], []),  # [
+            ([7], [], []),  # <
+            ([7], [], []),  # 0
+            ([7], [], []),  # ;
+            ([7], [], []),  # 5
+            ([7], [], []),  # 0
+            ([], [], []),   # partial sequence timeout
+            ([7], [], []),  # ;
+            ([7], [], []),  # 1
+            ([7], [], []),  # 0
+            ([7], [], []),  # M
+        ])
+        read_results = iter([
+            b"\x1b",
+            b"[",
+            b"<",
+            b"0",
+            b";",
+            b"5",
+            b"0",
+            b";",
+            b"1",
+            b"0",
+            b"M",
+        ])
+
+        def _fake_select(_readers, _writers, _errors, _timeout):
+            return next(select_results)
+
+        def _fake_read(_fd: int, _count: int) -> bytes:
+            return next(read_results)
+
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
+        with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
+            terminal_io,
+            "select",
+            SimpleNamespace(select=_fake_select),
+        ), patch.object(terminal_io.os, "read", side_effect=_fake_read):
+            self.assertIsNone(read_key(7, timeout=0))
+            self.assertEqual(read_key(7, timeout=0), terminal_io.MouseEvent(x=49, y=9, button="left"))
+            self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_SEQ)
+
     def test_read_key_windows_returns_none_after_ignored_record_drains_queue(self) -> None:
         kernel32 = _FakeWindowsKernel32([
             _make_windows_key_record(key_down=False),

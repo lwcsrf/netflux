@@ -349,17 +349,27 @@ While the launch form is open:
 Form content:
 - first field is a UI-only run name,
 - remaining fields correspond to the selected function's declared `FunctionArg`s,
-- each arg row shows the arg name, declared type, and `[optional]` marker when applicable,
+- below the function description, the header also shows each arg's declared type, description, and `[optional]` marker when applicable,
+- `[Submit]` and `[Cancel]` appear immediately after the editable arg fields,
+- below `[Submit]` / `[Cancel]`, the form may show up to 20 recent top-level runs of that same function from this `TUI` session, ordered newest first,
+- each recent-run row shows the run name and a truncated inline args preview,
 - function descriptions may span multiple wrapped lines,
 - form layout, scrolling, and mouse hit-testing derive from the rendered header height rather than from a fixed header-row constant.
 
 Current form editing behavior:
 - Tab / Shift+Tab and Up / Down move the form cursor,
-- Enter advances or submits depending on the current row,
+- Enter advances, applies a selected recent-run template, or submits depending on the current row,
 - Escape cancels,
 - Backspace deletes one character,
 - printable characters are appended literally,
 - there is no cursor-within-field editing model in v1.
+
+Recent-run template behavior:
+- selecting a recent-run row by keyboard or left-click does not launch immediately,
+- instead it copies that run's args back into the editable arg fields,
+- it also prepopulates the run-name field from that history entry, appending ` (1)` or incrementing an existing trailing ` (N)` suffix,
+- optional args that were omitted or submitted as `None` repopulate as blank fields,
+- after applying a recent-run template, the cursor returns to the first real arg field (or the run-name field when there are no args).
 
 Submission/parsing rules:
 - whitespace-only arg fields are treated as omitted,

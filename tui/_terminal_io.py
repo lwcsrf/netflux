@@ -32,6 +32,7 @@ class InterruptEvent:
 
 _console_lock = threading.Lock()
 _console_ready = False
+_POSIX_PENDING_ESCAPE_SEQ: str | None = None
 
 _WIN_STD_OUTPUT_HANDLE = -11
 _WIN_STD_INPUT_HANDLE = -10
@@ -95,10 +96,11 @@ class _WinInputRecord(ctypes.Structure):
 def pre_console() -> None:
     if not sys.stdout.isatty():
         return
-    global _console_ready
+    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ
     with _console_lock:
         if _console_ready:
             return
+        _POSIX_PENDING_ESCAPE_SEQ = None
         _enable_vt_if_windows()
         _configure_windows_console_input(enable_mouse=True)
         sys.stdout.write(
@@ -112,10 +114,11 @@ def pre_console() -> None:
 def restore_console() -> None:
     if not sys.stdout.isatty():
         return
-    global _console_ready
+    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ
     with _console_lock:
         if not _console_ready:
             return
+        _POSIX_PENDING_ESCAPE_SEQ = None
         _configure_windows_console_input(enable_mouse=False)
         sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?7h\x1b[?1049l")
         sys.stdout.flush()
@@ -184,9 +187,88 @@ def _configure_windows_console_input(*, enable_mouse: bool) -> None:
         _WINDOWS_INPUT_MODE_SAVED = None
 
 
+def _decode_posix_escape_sequence(seq: str) -> str | MouseEvent | None:
+    if seq == "[A":
+        return "up"
+    if seq == "[B":
+        return "down"
+    if seq == "[Z":
+        return "shift_tab"
+    if seq == "[5~":
+        return "page_up"
+    if seq == "[6~":
+        return "page_down"
+    if seq.startswith("[<") and seq[-1] in ("M", "m"):
+        try:
+            cb_s, cx_s, cy_s = seq[2:-1].split(";")
+            cb = int(cb_s)
+            cx = int(cx_s)
+            cy = int(cy_s)
+        except (TypeError, ValueError):
+            return None
+        x = max(0, cx - 1)
+        y = max(0, cy - 1)
+        if cb & 64:
+            if cb & 1:
+                return MouseEvent(x=x, y=y, button="wheel_down")
+            return MouseEvent(x=x, y=y, button="wheel_up")
+        if seq[-1] == "m" or (cb & 32):
+            return None
+        button_code = cb & 3
+        if button_code == 0:
+            return MouseEvent(x=x, y=y, button="left")
+        if button_code == 1:
+            return MouseEvent(x=x, y=y, button="middle")
+        if button_code == 2:
+            return MouseEvent(x=x, y=y, button="right")
+    return None
+
+
+def _read_posix_escape(fd: int, *, initial_seq: str = "") -> str | MouseEvent | None:
+    global _POSIX_PENDING_ESCAPE_SEQ
+
+    seq = initial_seq
+    while True:
+        try:
+            ready, _, _ = select.select([fd], [], [], 0.05)  # type: ignore[union-attr]
+        except (InterruptedError, OSError):
+            if not seq:
+                return "escape"
+            _POSIX_PENDING_ESCAPE_SEQ = seq
+            return None
+        if not ready:
+            if not seq:
+                return "escape"
+            _POSIX_PENDING_ESCAPE_SEQ = seq
+            return None
+
+        piece = os.read(fd, 1).decode("utf-8", errors="ignore")
+        if not piece:
+            if not seq:
+                return "escape"
+            _POSIX_PENDING_ESCAPE_SEQ = seq
+            return None
+
+        seq += piece
+        if len(seq) > 64:
+            _POSIX_PENDING_ESCAPE_SEQ = None
+            return None
+        if piece.isalpha() or piece in ("~", "m"):
+            _POSIX_PENDING_ESCAPE_SEQ = None
+            return _decode_posix_escape_sequence(seq)
+
+
 def read_key(fd: int, timeout: float | None = 0.1) -> str | MouseEvent | None:
+    global _POSIX_PENDING_ESCAPE_SEQ
+
     if select is None:
         return None
+
+    if _POSIX_PENDING_ESCAPE_SEQ is not None:
+        seq = _POSIX_PENDING_ESCAPE_SEQ
+        _POSIX_PENDING_ESCAPE_SEQ = None
+        return _read_posix_escape(fd, initial_seq=seq)
+
     try:
         ready, _, _ = select.select([fd], [], [], timeout)
     except (InterruptedError, OSError):
@@ -201,55 +283,7 @@ def read_key(fd: int, timeout: float | None = 0.1) -> str | MouseEvent | None:
     ch = raw.decode("utf-8", errors="ignore")
 
     if ch == "\x1b":
-        seq = ""
-        while True:
-            try:
-                ready, _, _ = select.select([fd], [], [], 0.05)
-            except (InterruptedError, OSError):
-                return "escape" if not seq else None
-            if not ready:
-                return "escape" if not seq else None
-            piece = os.read(fd, 1).decode("utf-8", errors="ignore")
-            if not piece:
-                return "escape" if not seq else None
-            seq += piece
-            if piece.isalpha() or piece in ("~", "m"):
-                break
-
-        if seq == "[A":
-            return "up"
-        if seq == "[B":
-            return "down"
-        if seq == "[Z":
-            return "shift_tab"
-        if seq == "[5~":
-            return "page_up"
-        if seq == "[6~":
-            return "page_down"
-        if seq.startswith("[<") and seq[-1] in ("M", "m"):
-            try:
-                cb_s, cx_s, cy_s = seq[2:-1].split(";")
-                cb = int(cb_s)
-                cx = int(cx_s)
-                cy = int(cy_s)
-            except (TypeError, ValueError):
-                return None
-            x = max(0, cx - 1)
-            y = max(0, cy - 1)
-            if cb & 64:
-                if cb & 1:
-                    return MouseEvent(x=x, y=y, button="wheel_down")
-                return MouseEvent(x=x, y=y, button="wheel_up")
-            if seq[-1] == "m" or (cb & 32):
-                return None
-            button_code = cb & 3
-            if button_code == 0:
-                return MouseEvent(x=x, y=y, button="left")
-            if button_code == 1:
-                return MouseEvent(x=x, y=y, button="middle")
-            if button_code == 2:
-                return MouseEvent(x=x, y=y, button="right")
-        return None
+        return _read_posix_escape(fd)
 
     return ch
 

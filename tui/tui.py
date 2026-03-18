@@ -4,6 +4,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import re
 import threading
 import textwrap
 from dataclasses import dataclass, field
@@ -27,6 +28,7 @@ from .console import (
     ConsoleRender,
     _color,
     _crop_line,
+    _format_args,
     _highlight_line,
     _state_glyph,
     _visible_len,
@@ -127,6 +129,12 @@ class _LaunchFormState:
 
 
 @dataclass(frozen=True)
+class _LaunchHistoryEntry:
+    name: str
+    inputs: Mapping[str, object]
+
+
+@dataclass(frozen=True)
 class _LaunchFormLayout:
     header_lines: tuple[str, ...]
     item_start: int
@@ -136,6 +144,8 @@ class _LaunchFormLayout:
 
 
 class TUI(SessionController):
+    _HISTORY_NAME_SUFFIX_RE = re.compile(r"^(.*)\s\((\d+)\)$")
+
     def __init__(
         self,
         runtime: Runtime,
@@ -399,15 +409,101 @@ class TUI(SessionController):
         self._form_state = _LaunchFormState(fn_index=fn_index, fields=fields)
         self._sync_visible_run()
 
+    def _launch_form_history(self) -> list[_LaunchHistoryEntry]:
+        assert self._form_state is not None
+        fn = self.invocable_functions[self._form_state.fn_index]
+        history: list[_LaunchHistoryEntry] = []
+        for run in reversed(self._runs):
+            if run.fn is not fn:
+                continue
+            inputs: Mapping[str, object] = {}
+            if run.latest_view is not None:
+                inputs = run.latest_view.inputs
+            else:
+                raw_inputs = getattr(run.node, "inputs", {})
+                if isinstance(raw_inputs, Mapping):
+                    inputs = raw_inputs
+            history.append(_LaunchHistoryEntry(name=run.name, inputs=dict(inputs)))
+            if len(history) >= 20:
+                break
+        return history
+
+    def _launch_form_item_count(self) -> int:
+        assert self._form_state is not None
+        return len(self._form_state.fields) + 2 + len(self._launch_form_history())
+
+    def _launch_form_submit_index(self) -> int:
+        assert self._form_state is not None
+        return len(self._form_state.fields)
+
+    def _launch_form_cancel_index(self) -> int:
+        return self._launch_form_submit_index() + 1
+
+    def _launch_form_history_start_index(self) -> int:
+        return self._launch_form_cancel_index() + 1
+
+    def _clamp_form_cursor(self) -> None:
+        assert self._form_state is not None
+        max_cursor = max(0, self._launch_form_item_count() - 1)
+        self._form_state.cursor = max(0, min(self._form_state.cursor, max_cursor))
+
+    def _first_arg_field_cursor(self) -> int:
+        assert self._form_state is not None
+        if len(self._form_state.fields) > 1:
+            return 1
+        return 0
+
+    @staticmethod
+    def _launch_form_field_value(arg: FunctionArg, value: object) -> str:
+        if value is None:
+            return ""
+        if arg.argtype is bool:
+            return "true" if bool(value) else "false"
+        if arg.argtype is str:
+            return str(value)
+        return str(value)
+
+    @classmethod
+    def _history_restore_name(cls, name: str) -> str:
+        match = cls._HISTORY_NAME_SUFFIX_RE.fullmatch(name)
+        if match is not None:
+            base, suffix = match.groups()
+            return f"{base} ({int(suffix) + 1})"
+        if name:
+            return f"{name} (1)"
+        return "(1)"
+
+    def _apply_launch_history(self, history_index: int) -> None:
+        assert self._form_state is not None
+        history = self._launch_form_history()
+        if not (0 <= history_index < len(history)):
+            return
+
+        entry = history[history_index]
+        self._form_state.fields[0].value = self._history_restore_name(entry.name)
+        input_fields = self._form_state.fields[1:]
+        for field in input_fields:
+            field.value = ""
+            assert field.arg is not None
+            if field.arg.name in entry.inputs:
+                field.value = self._launch_form_field_value(
+                    field.arg,
+                    entry.inputs[field.arg.name],
+                )
+
+        self._form_state.error = ""
+        self._form_state.cursor = self._first_arg_field_cursor()
+
     def _handle_form_key(self, key: str) -> bool:
         assert self._form_state is not None
+        self._clamp_form_cursor()
 
         if key in ("escape",):
             self._form_state = None
             self._sync_visible_run()
             return False
         if key == "\t":
-            self._form_state.cursor = min(len(self._form_state.fields) + 1, self._form_state.cursor + 1)
+            self._form_state.cursor = min(self._launch_form_item_count() - 1, self._form_state.cursor + 1)
             return False
         if key == "shift_tab":
             self._form_state.cursor = max(0, self._form_state.cursor - 1)
@@ -416,7 +512,7 @@ class TUI(SessionController):
             self._form_state.cursor = max(0, self._form_state.cursor - 1)
             return False
         if key == "down":
-            self._form_state.cursor = min(len(self._form_state.fields) + 1, self._form_state.cursor + 1)
+            self._form_state.cursor = min(self._launch_form_item_count() - 1, self._form_state.cursor + 1)
             return False
         if key in ("\r", "\n"):
             return self._submit_or_move_form()
@@ -430,14 +526,19 @@ class TUI(SessionController):
 
     def _submit_or_move_form(self) -> bool:
         assert self._form_state is not None
-        submit_index = len(self._form_state.fields)
-        cancel_index = submit_index + 1
+        self._clamp_form_cursor()
+        submit_index = self._launch_form_submit_index()
+        cancel_index = self._launch_form_cancel_index()
+        history_start = self._launch_form_history_start_index()
         if self._form_state.cursor == cancel_index:
             self._form_state = None
             self._sync_visible_run()
             return False
         if self._form_state.cursor == submit_index:
             self._submit_form()
+            return False
+        if self._form_state.cursor >= history_start:
+            self._apply_launch_history(self._form_state.cursor - history_start)
             return False
         self._form_state.cursor = min(cancel_index, self._form_state.cursor + 1)
         return False
@@ -717,6 +818,7 @@ class TUI(SessionController):
 
     def _render_launch_form(self, size: TerminalSize, tick: int) -> str:
         assert self._form_state is not None
+        self._clamp_form_cursor()
         if self._too_small:
             interrupt_hint = self._global_interrupt_hint()
             bottom_bar = compose_bottom_bar(
@@ -739,9 +841,12 @@ class TUI(SessionController):
 
         rows = max(1, size.lines - 1)
         layout = self._launch_form_layout(size)
+        history = self._launch_form_history()
         lines = list(layout.header_lines)
-        submit_index = len(self._form_state.fields)
-        item_count = submit_index + 2
+        submit_index = self._launch_form_submit_index()
+        cancel_index = self._launch_form_cancel_index()
+        history_start = self._launch_form_history_start_index()
+        item_count = self._launch_form_item_count()
         start = layout.item_start
         end = layout.item_end
         hint_parts: list[str] = []
@@ -757,16 +862,32 @@ class TUI(SessionController):
         for item_index in range(layout.item_start, layout.item_end):
             if item_index < len(self._form_state.fields):
                 field = self._form_state.fields[item_index]
-                label = field.label
+                label_color = "orange" if field.is_name else "cyan"
+                label = _color(field.label, fg=label_color, bold=True)
+                meta_parts: list[str] = []
                 if field.arg is not None:
-                    label += f" ({field.type_label})"
+                    meta_parts.append(_color(f"({field.type_label})", fg="gray"))
                     if field.optional:
-                        label += " [optional]"
-                rendered = self._pad_visible(f"{label}: {field.value}", size.columns)
+                        meta_parts.append(_color("[optional]", fg="yellow", bold=True))
+                meta = f" {' '.join(meta_parts)}" if meta_parts else ""
+                rendered = self._pad_visible(f"{label}{meta}: {field.value}", size.columns)
             elif item_index == submit_index:
-                rendered = self._pad_visible("[Submit]", size.columns)
+                rendered = self._pad_visible(_color("[Submit]", fg="green", bold=True), size.columns)
+            elif item_index == cancel_index:
+                rendered = self._pad_visible(_color("[Cancel]", fg="red", bold=True), size.columns)
             else:
-                rendered = self._pad_visible("[Cancel]", size.columns)
+                history_entry = history[item_index - history_start]
+                args_preview = _format_args(
+                    dict(history_entry.inputs),
+                    max_len=max(12, size.columns - max(18, len(history_entry.name) + 4)),
+                    per_val_len=32,
+                ) or "(no args)"
+                rendered = self._pad_visible(
+                    f"{_color('↺', fg='yellow', bold=True)} "
+                    f"{_color(history_entry.name, fg='white', bold=True)} "
+                    f"{_color(args_preview, fg='gray', dim=True)}",
+                    size.columns,
+                )
             if item_index == self._form_state.cursor:
                 rendered = _highlight_line(rendered, size.columns)
             lines.append(rendered)
@@ -781,14 +902,14 @@ class TUI(SessionController):
             size.columns,
             shortcut_variants=[
                 [
-                    "Tab/Shift+Tab:field",
-                    "Enter:next/submit",
+                    "Tab/Shift+Tab:item",
+                    "Enter:next/use/submit",
                     "Esc:cancel",
                     "Backspace:delete",
                 ],
                 [
-                    "Tab/S-Tab:field",
-                    "Enter:next/submit",
+                    "Tab/S-Tab:item",
+                    "Enter:next/use/submit",
                     "Esc:cancel",
                     "Backspace",
                 ],
@@ -815,12 +936,16 @@ class TUI(SessionController):
 
     def _handle_form_mouse(self, event: object) -> bool:
         assert self._form_state is not None
+        self._clamp_form_cursor()
         x = int(getattr(event, "x", 0))
         y = int(getattr(event, "y", 0))
         button = getattr(event, "button", "")
         if button != "left":
             return False
         layout = self._launch_form_layout(self._last_size)
+        submit_index = self._launch_form_submit_index()
+        cancel_index = self._launch_form_cancel_index()
+        history_start = self._launch_form_history_start_index()
         if y < layout.header_rows:
             return False
         item_index = layout.item_start + (y - layout.header_rows)
@@ -829,13 +954,17 @@ class TUI(SessionController):
         if item_index < len(self._form_state.fields):
             self._form_state.cursor = item_index
             return False
-        if item_index == len(self._form_state.fields):
+        if item_index == submit_index:
             self._form_state.cursor = item_index
             self._submit_form()
             return False
-        if item_index == len(self._form_state.fields) + 1:
+        if item_index == cancel_index:
             self._form_state = None
             self._sync_visible_run()
+            return False
+        if item_index >= history_start:
+            self._form_state.cursor = item_index
+            self._apply_launch_history(item_index - history_start)
             return False
         if x < 0:
             return False
@@ -847,6 +976,7 @@ class TUI(SessionController):
 
     def _launch_form_layout(self, size: TerminalSize) -> _LaunchFormLayout:
         assert self._form_state is not None
+        self._clamp_form_cursor()
         fn = self.invocable_functions[self._form_state.fn_index]
         rows = max(1, size.lines - 1)
         error_rows = 1 if self._form_state.error else 0
@@ -855,9 +985,18 @@ class TUI(SessionController):
             self._pad_visible(_color(f"Launch {fn.name}", fg="cyan", bold=True), size.columns)
         ]
         full_header_lines.extend(
-            self._pad_visible(_color(desc_line, dim=True), size.columns)
+            self._pad_visible(_color(desc_line, fg="gray", dim=True), size.columns)
             for desc_line in self._launch_form_desc_lines(fn, size.columns)
         )
+        arg_lines = self._launch_form_arg_lines(fn, size.columns)
+        for idx, arg_line in enumerate(arg_lines):
+            is_header = idx == 0
+            full_header_lines.append(
+                self._pad_visible(
+                    _color(arg_line, fg="white" if is_header else "gray", bold=is_header, dim=not is_header),
+                    size.columns,
+                )
+            )
 
         # Reserve one row for the scroll hint line and one row for a visible item.
         min_item_rows = 1
@@ -873,7 +1012,7 @@ class TUI(SessionController):
 
         header_rows = len(header_lines) + hint_rows
         available_rows = max(1, rows - header_rows - error_rows)
-        item_count = len(self._form_state.fields) + 2
+        item_count = self._launch_form_item_count()
         max_start = max(0, item_count - available_rows)
         cursor = min(self._form_state.cursor, item_count - 1)
         start = min(max(0, cursor - available_rows + 1), max_start)
@@ -904,6 +1043,30 @@ class TUI(SessionController):
             wrapped_lines.extend(wrapper.wrap(desc_line) or [""])
 
         return wrapped_lines or [""]
+
+    def _launch_form_arg_lines(self, fn: Function, width: int) -> list[str]:
+        if not fn.args:
+            return []
+
+        wrap_width = max(1, width)
+        wrapper = textwrap.TextWrapper(
+            width=wrap_width,
+            replace_whitespace=False,
+            drop_whitespace=True,
+            break_long_words=True,
+            break_on_hyphens=False,
+        )
+
+        lines = ["Arguments"]
+        for arg in fn.args:
+            optional = " [optional]" if arg.optional else ""
+            prefix = f"{arg.name} ({arg.argtype.__name__}){optional}"
+            body = arg.desc if arg.desc else ""
+            text = f"{prefix}: {body}" if body else prefix
+            wrapped = wrapper.wrap(text) or [text]
+            lines.extend(wrapped)
+
+        return lines
 
     def _select_next_run(self) -> None:
         ordered = self._grouped_run_indices()
