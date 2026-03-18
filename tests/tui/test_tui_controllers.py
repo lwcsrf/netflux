@@ -703,6 +703,7 @@ class TestTUIState(unittest.TestCase):
         rendered = tui._render_runs_pane(width=40, rows=8, tick=0)
         plain_rows = [_strip_ansi(line).rstrip() for line in rendered]
 
+        self.assertIn(FG["gray"], rendered[0])
         self.assertEqual(plain_rows[0], "fn0")
         self.assertIn("name0", plain_rows[1])
         self.assertEqual(plain_rows[2], "")

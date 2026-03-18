@@ -1048,7 +1048,7 @@ class TUI(SessionController):
         if entry.kind == "placeholder":
             return self._pad_visible(_color(entry.label, dim=True), width)
         if entry.kind == "group_header":
-            return self._pad_visible(_color(entry.label, fg="magenta", bold=True), width)
+            return self._pad_visible(_color(entry.label, fg="gray", bold=True), width)
         if entry.kind == "spacer":
             return " " * width
 
