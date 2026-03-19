@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import subprocess
 import unittest
 from unittest.mock import patch
 
@@ -123,6 +124,9 @@ class TestConsoleRender(unittest.TestCase):
 
         run_mock.assert_called_once()
         self.assertEqual(run_mock.call_args.args[0], ["wl-copy"])
+        self.assertEqual(run_mock.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(run_mock.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertNotIn("capture_output", run_mock.call_args.kwargs)
 
     def test_copy_text_to_clipboard_falls_back_to_xclip_on_linux(self) -> None:
         def _which(name: str) -> str | None:
@@ -142,6 +146,9 @@ class TestConsoleRender(unittest.TestCase):
 
         run_mock.assert_called_once()
         self.assertEqual(run_mock.call_args.args[0], ["xclip", "-selection", "clipboard"])
+        self.assertEqual(run_mock.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        self.assertEqual(run_mock.call_args.kwargs["stderr"], subprocess.DEVNULL)
+        self.assertNotIn("capture_output", run_mock.call_args.kwargs)
 
     def test_linux_clipboard_failure_message_mentions_install_when_no_backend(self) -> None:
         with patch("netflux.tui.console.sys.platform", "linux"), patch(
