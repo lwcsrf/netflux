@@ -2847,7 +2847,22 @@ class TestTerminalIO(unittest.TestCase):
             return next(read_results)
 
         self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DEADLINE", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DISCARD", False)
+        self.addCleanup(setattr, terminal_io, "_POSIX_ORPHAN_ESCAPE_DEADLINE", None)
         with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DISCARD",
+            False,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_ORPHAN_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
             terminal_io,
             "select",
             SimpleNamespace(select=_fake_select),
@@ -2884,7 +2899,7 @@ class TestTerminalIO(unittest.TestCase):
             b"0",
             b"M",
         ])
-        monotonic_results = iter([10.0, 10.01])
+        monotonic_results = iter([10.0, 10.01] + [10.01] * 20)
 
         def _fake_select(_readers, _writers, _errors, _timeout):
             return next(select_results)
@@ -2897,9 +2912,19 @@ class TestTerminalIO(unittest.TestCase):
 
         self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
         self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DEADLINE", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DISCARD", False)
+        self.addCleanup(setattr, terminal_io, "_POSIX_ORPHAN_ESCAPE_DEADLINE", None)
         with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
             terminal_io,
             "_POSIX_PENDING_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DISCARD",
+            False,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_ORPHAN_ESCAPE_DEADLINE",
             None,
         ), patch.object(
             terminal_io,
@@ -2924,7 +2949,7 @@ class TestTerminalIO(unittest.TestCase):
             ([], [], []),   # grace deadline expired, still no bytes
         ])
         read_results = iter([b"\x1b"])
-        monotonic_results = iter([20.0, 20.2, 20.2])
+        monotonic_results = iter([20.0, 20.2, 20.2, 20.2])
 
         def _fake_select(_readers, _writers, _errors, _timeout):
             return next(select_results)
@@ -2937,9 +2962,19 @@ class TestTerminalIO(unittest.TestCase):
 
         self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
         self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DEADLINE", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DISCARD", False)
+        self.addCleanup(setattr, terminal_io, "_POSIX_ORPHAN_ESCAPE_DEADLINE", None)
         with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
             terminal_io,
             "_POSIX_PENDING_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DISCARD",
+            False,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_ORPHAN_ESCAPE_DEADLINE",
             None,
         ), patch.object(
             terminal_io,
@@ -2954,6 +2989,135 @@ class TestTerminalIO(unittest.TestCase):
             self.assertEqual(read_key(7, timeout=0), "escape")
             self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_SEQ)
             self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_DEADLINE)
+
+    def test_read_key_discards_late_mouse_tail_after_escape_already_emitted(self) -> None:
+        select_results = iter([
+            ([7], [], []),  # initial ESC available
+            ([], [], []),   # no next byte yet
+            ([], [], []),   # grace deadline expired, still no bytes
+            ([7], [], []),  # orphaned [
+            ([7], [], []),  # <
+            ([7], [], []),  # 6
+            ([7], [], []),  # 4
+            ([7], [], []),  # ;
+            ([7], [], []),  # 5
+            ([7], [], []),  # 0
+            ([7], [], []),  # ;
+            ([7], [], []),  # 1
+            ([7], [], []),  # 0
+            ([7], [], []),  # M
+        ])
+        read_results = iter([
+            b"\x1b",
+            b"[",
+            b"<",
+            b"6",
+            b"4",
+            b";",
+            b"5",
+            b"0",
+            b";",
+            b"1",
+            b"0",
+            b"M",
+        ])
+        monotonic_results = iter([20.0, 20.2, 20.2, 20.21] + [20.21] * 40)
+
+        def _fake_select(_readers, _writers, _errors, _timeout):
+            return next(select_results)
+
+        def _fake_read(_fd: int, _count: int) -> bytes:
+            return next(read_results)
+
+        def _fake_monotonic() -> float:
+            return next(monotonic_results)
+
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DEADLINE", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DISCARD", False)
+        self.addCleanup(setattr, terminal_io, "_POSIX_ORPHAN_ESCAPE_DEADLINE", None)
+        with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DISCARD",
+            False,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_ORPHAN_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "select",
+            SimpleNamespace(select=_fake_select),
+        ), patch.object(terminal_io.os, "read", side_effect=_fake_read), patch.object(
+            terminal_io.time,
+            "monotonic",
+            side_effect=_fake_monotonic,
+        ):
+            events = [read_key(7, timeout=0) for _ in range(3)]
+
+        self.assertEqual([event for event in events if event is not None], ["escape"])
+        self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_SEQ)
+        self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_DEADLINE)
+        self.assertFalse(terminal_io._POSIX_PENDING_ESCAPE_DISCARD)
+
+        runtime = Runtime([_make_code_function(f"fn{i}") for i in range(7)], client_factories={})
+        tui = TUI(runtime)
+        for event in events:
+            if isinstance(event, str):
+                tui.handle_key(event)
+
+        self.assertIsNone(tui._form_state)
+
+    def test_read_key_decodes_legacy_csi_m_mouse_sequence(self) -> None:
+        select_results = iter([
+            ([7], [], []),  # initial ESC available
+            ([7], [], []),  # [
+            ([7], [], []),  # M
+            ([7], [], []),  # cb
+            ([7], [], []),  # cx
+            ([7], [], []),  # cy
+        ])
+        read_results = iter([
+            b"\x1b",
+            b"[",
+            b"M",
+            b" ",
+            b"!",
+            b"!",
+        ])
+
+        def _fake_select(_readers, _writers, _errors, _timeout):
+            return next(select_results)
+
+        def _fake_read(_fd: int, _count: int) -> bytes:
+            return next(read_results)
+
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DEADLINE", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DISCARD", False)
+        self.addCleanup(setattr, terminal_io, "_POSIX_ORPHAN_ESCAPE_DEADLINE", None)
+        with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DISCARD",
+            False,
+        ), patch.object(
+            terminal_io,
+            "_POSIX_ORPHAN_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "select",
+            SimpleNamespace(select=_fake_select),
+        ), patch.object(terminal_io.os, "read", side_effect=_fake_read):
+            self.assertEqual(read_key(7, timeout=0), terminal_io.MouseEvent(x=0, y=0, button="left"))
 
     def test_read_key_windows_returns_none_after_ignored_record_drains_queue(self) -> None:
         kernel32 = _FakeWindowsKernel32([
