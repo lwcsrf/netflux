@@ -837,16 +837,25 @@ class TestTUIState(unittest.TestCase):
         tui.handle_mouse(SimpleNamespace(x=right_origin, y=0, button="left"))
         renderer.handle_mouse_event.assert_called_once_with(0, 0, button="left")
 
-    def test_launch_hit_uses_row_order_not_column_position(self) -> None:
+    def test_launch_hit_uses_row_order_within_visible_function_label(self) -> None:
+        functions = [_make_code_function(f"fn{i}") for i in range(6)]
+        runtime = Runtime(functions, client_factories={})
+        tui = TUI(runtime)
+
+        tui._launch_function_hit(local_x=3, row=2, width=40, bottom_rows=4)
+
+        self.assertIsNotNone(tui._form_state)
+        assert tui._form_state is not None
+        self.assertEqual(tui._form_state.fn_index, 1)
+
+    def test_launch_hit_ignores_padding_after_function_label(self) -> None:
         functions = [_make_code_function(f"fn{i}") for i in range(6)]
         runtime = Runtime(functions, client_factories={})
         tui = TUI(runtime)
 
         tui._launch_function_hit(local_x=39, row=2, width=40, bottom_rows=4)
 
-        self.assertIsNotNone(tui._form_state)
-        assert tui._form_state is not None
-        self.assertEqual(tui._form_state.fn_index, 1)
+        self.assertIsNone(tui._form_state)
 
     def test_first_interrupt_requests_global_cancel_and_waits_for_terminal_update_before_exit(self) -> None:
         fn = _make_code_function("cancel_me")
@@ -2778,6 +2787,19 @@ class _SingleRenderController(_RecordingController):
         return self.render_calls > 0
 
 
+class _SingleKeyExitController(_RecordingController):
+    def __init__(self) -> None:
+        super().__init__()
+        self.keys: list[str] = []
+
+    def should_exit(self) -> bool:
+        return False
+
+    def handle_key(self, key: str) -> bool:
+        self.keys.append(key)
+        return True
+
+
 class TestTerminalIO(unittest.TestCase):
     def test_read_key_buffers_split_posix_mouse_sequence_until_complete(self) -> None:
         select_results = iter([
@@ -2823,6 +2845,105 @@ class TestTerminalIO(unittest.TestCase):
             self.assertIsNone(read_key(7, timeout=0))
             self.assertEqual(read_key(7, timeout=0), terminal_io.MouseEvent(x=49, y=9, button="left"))
             self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_SEQ)
+
+    def test_read_key_buffers_bare_escape_until_following_mouse_sequence_starts(self) -> None:
+        select_results = iter([
+            ([7], [], []),  # initial ESC available
+            ([], [], []),   # no next byte yet
+            ([7], [], []),  # [
+            ([7], [], []),  # <
+            ([7], [], []),  # 0
+            ([7], [], []),  # ;
+            ([7], [], []),  # 5
+            ([7], [], []),  # 0
+            ([7], [], []),  # ;
+            ([7], [], []),  # 1
+            ([7], [], []),  # 0
+            ([7], [], []),  # M
+        ])
+        read_results = iter([
+            b"\x1b",
+            b"[",
+            b"<",
+            b"0",
+            b";",
+            b"5",
+            b"0",
+            b";",
+            b"1",
+            b"0",
+            b"M",
+        ])
+        monotonic_results = iter([10.0, 10.01])
+
+        def _fake_select(_readers, _writers, _errors, _timeout):
+            return next(select_results)
+
+        def _fake_read(_fd: int, _count: int) -> bytes:
+            return next(read_results)
+
+        def _fake_monotonic() -> float:
+            return next(monotonic_results)
+
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DEADLINE", None)
+        with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "select",
+            SimpleNamespace(select=_fake_select),
+        ), patch.object(terminal_io.os, "read", side_effect=_fake_read), patch.object(
+            terminal_io.time,
+            "monotonic",
+            side_effect=_fake_monotonic,
+        ):
+            self.assertIsNone(read_key(7, timeout=0))
+            self.assertEqual(terminal_io._POSIX_PENDING_ESCAPE_SEQ, "")
+            self.assertIsNotNone(terminal_io._POSIX_PENDING_ESCAPE_DEADLINE)
+            self.assertEqual(read_key(7, timeout=0), terminal_io.MouseEvent(x=49, y=9, button="left"))
+            self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_SEQ)
+            self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_DEADLINE)
+
+    def test_read_key_emits_escape_after_bare_escape_grace_expires(self) -> None:
+        select_results = iter([
+            ([7], [], []),  # initial ESC available
+            ([], [], []),   # no next byte yet
+            ([], [], []),   # grace deadline expired, still no bytes
+        ])
+        read_results = iter([b"\x1b"])
+        monotonic_results = iter([20.0, 20.2, 20.2])
+
+        def _fake_select(_readers, _writers, _errors, _timeout):
+            return next(select_results)
+
+        def _fake_read(_fd: int, _count: int) -> bytes:
+            return next(read_results)
+
+        def _fake_monotonic() -> float:
+            return next(monotonic_results)
+
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None)
+        self.addCleanup(setattr, terminal_io, "_POSIX_PENDING_ESCAPE_DEADLINE", None)
+        with patch.object(terminal_io, "_POSIX_PENDING_ESCAPE_SEQ", None), patch.object(
+            terminal_io,
+            "_POSIX_PENDING_ESCAPE_DEADLINE",
+            None,
+        ), patch.object(
+            terminal_io,
+            "select",
+            SimpleNamespace(select=_fake_select),
+        ), patch.object(terminal_io.os, "read", side_effect=_fake_read), patch.object(
+            terminal_io.time,
+            "monotonic",
+            side_effect=_fake_monotonic,
+        ):
+            self.assertIsNone(read_key(7, timeout=0))
+            self.assertEqual(read_key(7, timeout=0), "escape")
+            self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_SEQ)
+            self.assertIsNone(terminal_io._POSIX_PENDING_ESCAPE_DEADLINE)
 
     def test_read_key_windows_returns_none_after_ignored_record_drains_queue(self) -> None:
         kernel32 = _FakeWindowsKernel32([
@@ -3024,6 +3145,28 @@ class TestConsoleSessionDriver(unittest.TestCase):
             driver.run(controller)
 
         self.assertFalse(pre_console.called)
+
+    def test_posix_loop_resolves_pending_bare_escape_without_waiting_for_more_fd_bytes(self) -> None:
+        controller = _SingleKeyExitController()
+        driver = ConsoleSessionDriver()
+        driver._wake_pipe_read = 11
+
+        with patch(
+            "netflux.tui._driver.select",
+            SimpleNamespace(select=Mock(return_value=([], [], []))),
+        ), patch(
+            "netflux.tui._driver.posix_pending_input_timeout",
+            return_value=0.0,
+        ), patch(
+            "netflux.tui._driver.read_key",
+            return_value="escape",
+        ) as read_key_mock, patch(
+            "netflux.tui._driver.ui_driver",
+        ):
+            driver._loop_posix(controller, 7)
+
+        read_key_mock.assert_called_once_with(7, timeout=0)
+        self.assertEqual(controller.keys, ["escape"])
 
 
 if __name__ == "__main__":  # pragma: no cover

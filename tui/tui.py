@@ -1251,7 +1251,6 @@ class TUI(SessionController):
             self._set_selected_run(run_index)
 
     def _launch_function_hit(self, local_x: int, row: int, width: int, bottom_rows: int) -> None:
-        del local_x, width
         if row == 0:
             return
 
@@ -1264,8 +1263,15 @@ class TUI(SessionController):
             return
 
         fn_index = entry_row
-        if 0 <= fn_index < len(self.invocable_functions):
-            self._open_launch_form(fn_index)
+        if not (0 <= fn_index < len(self.invocable_functions)):
+            return
+
+        label = f"({fn_index}) {self.invocable_functions[fn_index].name}"
+        clickable_cols = min(width, len(label))
+        if not (0 <= local_x < clickable_cols):
+            return
+
+        self._open_launch_form(fn_index)
 
     @staticmethod
     def _pad_visible(text: str, width: int) -> str:

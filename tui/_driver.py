@@ -11,6 +11,7 @@ from ._contracts import SessionController, TerminalSize
 from ._terminal_io import (
     InterruptEvent,
     ResizeEvent,
+    posix_pending_input_timeout,
     pre_console,
     read_key,
     read_key_windows,
@@ -289,8 +290,21 @@ class ConsoleSessionDriver:
                     break
 
                 timeout = self._seconds_until_next_tick(last_tick) if wants_ticks else None
+                pending_timeout = posix_pending_input_timeout()
+                if pending_timeout is not None:
+                    timeout = pending_timeout if timeout is None else min(timeout, pending_timeout)
                 ready, _, _ = select.select([fd, self._wake_pipe_read], [], [], timeout)
                 if not ready:
+                    pending_timeout = posix_pending_input_timeout()
+                    if pending_timeout is not None and pending_timeout <= 0.0:
+                        event = read_key(fd, timeout=0)
+                        if event is not None:
+                            if hasattr(event, "button"):
+                                should_exit = controller.handle_mouse(event)
+                            else:
+                                should_exit = controller.handle_key(event)
+                            if should_exit:
+                                break
                     force_render = True
                     continue
 

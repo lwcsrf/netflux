@@ -5,6 +5,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 from dataclasses import dataclass
 
 if os.name != "nt":
@@ -33,6 +34,9 @@ class InterruptEvent:
 _console_lock = threading.Lock()
 _console_ready = False
 _POSIX_PENDING_ESCAPE_SEQ: str | None = None
+_POSIX_PENDING_ESCAPE_DEADLINE: float | None = None
+_POSIX_ESCAPE_INTERBYTE_TIMEOUT = 0.05
+_POSIX_BARE_ESCAPE_GRACE = 0.05
 
 _WIN_STD_OUTPUT_HANDLE = -11
 _WIN_STD_INPUT_HANDLE = -10
@@ -96,11 +100,12 @@ class _WinInputRecord(ctypes.Structure):
 def pre_console() -> None:
     if not sys.stdout.isatty():
         return
-    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ
+    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
     with _console_lock:
         if _console_ready:
             return
         _POSIX_PENDING_ESCAPE_SEQ = None
+        _POSIX_PENDING_ESCAPE_DEADLINE = None
         _enable_vt_if_windows()
         _configure_windows_console_input(enable_mouse=True)
         sys.stdout.write(
@@ -114,11 +119,12 @@ def pre_console() -> None:
 def restore_console() -> None:
     if not sys.stdout.isatty():
         return
-    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ
+    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
     with _console_lock:
         if not _console_ready:
             return
         _POSIX_PENDING_ESCAPE_SEQ = None
+        _POSIX_PENDING_ESCAPE_DEADLINE = None
         _configure_windows_console_input(enable_mouse=False)
         sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?7h\x1b[?1049l")
         sys.stdout.flush()
@@ -224,50 +230,95 @@ def _decode_posix_escape_sequence(seq: str) -> str | MouseEvent | None:
     return None
 
 
-def _read_posix_escape(fd: int, *, initial_seq: str = "") -> str | MouseEvent | None:
+def _clear_posix_pending_escape() -> None:
+    global _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
+    _POSIX_PENDING_ESCAPE_SEQ = None
+    _POSIX_PENDING_ESCAPE_DEADLINE = None
+
+
+def posix_pending_input_timeout() -> float | None:
+    if select is None:
+        return None
+    if _POSIX_PENDING_ESCAPE_SEQ != "" or _POSIX_PENDING_ESCAPE_DEADLINE is None:
+        return None
+    return max(0.0, _POSIX_PENDING_ESCAPE_DEADLINE - time.monotonic())
+
+
+def _buffer_posix_escape(
+    seq: str,
+    *,
+    bare_escape_deadline: float | None,
+) -> str | MouseEvent | None:
+    global _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
+
+    if seq:
+        _POSIX_PENDING_ESCAPE_SEQ = seq
+        _POSIX_PENDING_ESCAPE_DEADLINE = None
+        return None
+
+    if bare_escape_deadline is None:
+        _POSIX_PENDING_ESCAPE_SEQ = ""
+        _POSIX_PENDING_ESCAPE_DEADLINE = time.monotonic() + _POSIX_BARE_ESCAPE_GRACE
+        return None
+
+    if time.monotonic() >= bare_escape_deadline:
+        _clear_posix_pending_escape()
+        return "escape"
+
+    _POSIX_PENDING_ESCAPE_SEQ = ""
+    _POSIX_PENDING_ESCAPE_DEADLINE = bare_escape_deadline
+    return None
+
+
+def _read_posix_escape(
+    fd: int,
+    *,
+    initial_seq: str = "",
+    bare_escape_deadline: float | None = None,
+) -> str | MouseEvent | None:
     global _POSIX_PENDING_ESCAPE_SEQ
 
     seq = initial_seq
     while True:
+        timeout = _POSIX_ESCAPE_INTERBYTE_TIMEOUT
+        if not seq and bare_escape_deadline is not None:
+            timeout = max(0.0, bare_escape_deadline - time.monotonic())
         try:
-            ready, _, _ = select.select([fd], [], [], 0.05)  # type: ignore[union-attr]
+            ready, _, _ = select.select([fd], [], [], timeout)  # type: ignore[union-attr]
         except (InterruptedError, OSError):
-            if not seq:
-                return "escape"
-            _POSIX_PENDING_ESCAPE_SEQ = seq
-            return None
+            return _buffer_posix_escape(seq, bare_escape_deadline=bare_escape_deadline)
         if not ready:
-            if not seq:
-                return "escape"
-            _POSIX_PENDING_ESCAPE_SEQ = seq
-            return None
+            return _buffer_posix_escape(seq, bare_escape_deadline=bare_escape_deadline)
 
         piece = os.read(fd, 1).decode("utf-8", errors="ignore")
         if not piece:
-            if not seq:
-                return "escape"
-            _POSIX_PENDING_ESCAPE_SEQ = seq
-            return None
+            return _buffer_posix_escape(seq, bare_escape_deadline=bare_escape_deadline)
 
         seq += piece
+        bare_escape_deadline = None
         if len(seq) > 64:
-            _POSIX_PENDING_ESCAPE_SEQ = None
+            _clear_posix_pending_escape()
             return None
         if piece.isalpha() or piece in ("~", "m"):
-            _POSIX_PENDING_ESCAPE_SEQ = None
+            _clear_posix_pending_escape()
             return _decode_posix_escape_sequence(seq)
 
 
 def read_key(fd: int, timeout: float | None = 0.1) -> str | MouseEvent | None:
-    global _POSIX_PENDING_ESCAPE_SEQ
+    global _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
 
     if select is None:
         return None
 
     if _POSIX_PENDING_ESCAPE_SEQ is not None:
         seq = _POSIX_PENDING_ESCAPE_SEQ
-        _POSIX_PENDING_ESCAPE_SEQ = None
-        return _read_posix_escape(fd, initial_seq=seq)
+        deadline = _POSIX_PENDING_ESCAPE_DEADLINE
+        _clear_posix_pending_escape()
+        return _read_posix_escape(
+            fd,
+            initial_seq=seq,
+            bare_escape_deadline=deadline,
+        )
 
     try:
         ready, _, _ = select.select([fd], [], [], timeout)
