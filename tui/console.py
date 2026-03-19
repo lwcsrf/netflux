@@ -22,6 +22,9 @@ Additional controls in post-completion browser:
     q / Esc     Exit browser
 """
 import re
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -100,6 +103,13 @@ _MOUSE_SCROLL_ROWS = 5
 #   final byte        0x40-0x7E  => [@-~]
 _RE_COMPLETE_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _RE_TRAILING_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*$")
+_RE_MARKDOWN_FENCE = re.compile(r"^\s*```+([^`]*)\s*$")
+_RE_MARKDOWN_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*)$")
+_RE_MARKDOWN_BLOCKQUOTE = re.compile(r"^\s{0,3}>\s?(.*)$")
+_RE_MARKDOWN_UL = re.compile(r"^(\s*)([-*+])\s+(.*)$")
+_RE_MARKDOWN_OL = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
+_RE_MARKDOWN_HR = re.compile(r"^\s{0,3}(?:([-*_])\s*){3,}$")
+_RE_MARKDOWN_TABLE_DIVIDER = re.compile(r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
 
 def _color(
     text: str,
@@ -119,6 +129,122 @@ def _color(
     if not codes:
         return text
     return "".join(codes) + text + RESET
+
+
+def _copy_text_to_clipboard_windows(text: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    GMEM_ZEROINIT = 0x0040
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+
+    size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size)
+    if not handle:
+        return False
+
+    locked = kernel32.GlobalLock(handle)
+    if not locked:
+        kernel32.GlobalFree(handle)
+        return False
+
+    try:
+        buffer = ctypes.create_unicode_buffer(text)
+        ctypes.memmove(locked, ctypes.addressof(buffer), size)
+    finally:
+        kernel32.GlobalUnlock(handle)
+
+    for _ in range(20):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.01)
+    else:
+        kernel32.GlobalFree(handle)
+        return False
+
+    try:
+        if not user32.EmptyClipboard():
+            return False
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            return False
+        handle = None
+        return True
+    finally:
+        user32.CloseClipboard()
+        if handle:
+            kernel32.GlobalFree(handle)
+
+
+def _linux_clipboard_commands() -> list[list[str]]:
+    commands: list[list[str]] = []
+    if shutil.which("wl-copy"):
+        commands.append(["wl-copy"])
+    if shutil.which("xclip"):
+        commands.append(["xclip", "-selection", "clipboard"])
+    if shutil.which("xsel"):
+        commands.append(["xsel", "--clipboard", "--input"])
+    return commands
+
+
+def _clipboard_copy_failure_message() -> str:
+    if sys.platform.startswith("win"):
+        return "Clipboard copy failed."
+    if sys.platform == "darwin":
+        if shutil.which("pbcopy") is None:
+            return "Clipboard unavailable. Ensure pbcopy is installed."
+        return "Clipboard copy failed."
+    if not _linux_clipboard_commands():
+        return "Clipboard unavailable. Install wl-copy, xclip, or xsel."
+    return "Clipboard copy failed."
+
+
+def _copy_text_to_clipboard(text: str) -> bool:
+    if sys.platform.startswith("win"):
+        return _copy_text_to_clipboard_windows(text)
+
+    commands: list[list[str]] = []
+
+    if sys.platform == "darwin":
+        commands.append(["pbcopy"])
+    else:
+        commands.extend(_linux_clipboard_commands())
+
+    for command in commands:
+        try:
+            subprocess.run(
+                command,
+                input=text,
+                text=True,
+                check=True,
+                capture_output=True,
+            )
+            return True
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            continue
+
+    return False
 
 
 def _style_block(text: str, *codes: str) -> str:
@@ -186,6 +312,37 @@ def _preview_text(text: str, max_len: int = 60) -> str:
     return stripped[: max_len - 1] + "…"
 
 
+def _render_inline_markdown(text: str) -> str:
+    text = re.sub(
+        r"!\[([^\]]*)\]\(([^)]+)\)",
+        lambda m: f"[image: {m.group(1)}] ({m.group(2)})" if m.group(2) else f"[image: {m.group(1)}]",
+        text,
+    )
+    text = re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        lambda m: f"{m.group(1)} ({m.group(2)})",
+        text,
+    )
+    for pattern in (
+        r"\*\*\*([^*]+)\*\*\*",
+        r"___([^_]+)___",
+        r"\*\*([^*]+)\*\*",
+        r"__([^_]+)__",
+        r"~~([^~]+)~~",
+        r"`([^`]+)`",
+        r"(?<!\*)\*([^*\n]+)\*(?!\*)",
+        r"(?<!_)_([^_\n]+)_(?!_)",
+    ):
+        text = re.sub(pattern, r"\1", text)
+    return (
+        text.replace("\\*", "*")
+        .replace("\\_", "_")
+        .replace("\\`", "`")
+        .replace("\\[", "[")
+        .replace("\\]", "]")
+    )
+
+
 def _short_repr(value: Any, max_len: int = 40) -> str:
     """Short string representation, truncated if needed."""
     try:
@@ -215,6 +372,94 @@ def _format_args(
     if len(s) > max_len:
         s = s[: max_len - 3] + "..."
     return s
+
+
+def _render_markdown_lines(text: str) -> list[_RenderedBlockLine]:
+    rendered: list[_RenderedBlockLine] = []
+    in_code_block = False
+
+    for raw_line in text.splitlines() or [""]:
+        fence_match = _RE_MARKDOWN_FENCE.match(raw_line)
+        if fence_match is not None:
+            if in_code_block:
+                in_code_block = False
+            else:
+                in_code_block = True
+                language = fence_match.group(1).strip()
+                label = f"[{language} code]" if language else "[code]"
+                rendered.append(_RenderedBlockLine(label, fg="cyan", bold=True))
+            continue
+
+        if in_code_block:
+            rendered.append(_RenderedBlockLine(raw_line, fg="cyan"))
+            continue
+
+        stripped = raw_line.strip()
+        if stripped == "":
+            rendered.append(_RenderedBlockLine(""))
+            continue
+
+        if _RE_MARKDOWN_HR.match(raw_line):
+            rendered.append(_RenderedBlockLine("─" * 16, fg="gray", dim=True))
+            continue
+
+        heading_match = _RE_MARKDOWN_HEADING.match(raw_line)
+        if heading_match is not None:
+            level = len(heading_match.group(1))
+            rendered.append(
+                _RenderedBlockLine(
+                    _render_inline_markdown(heading_match.group(2).strip()),
+                    fg="white" if level <= 2 else "cyan",
+                    bold=True,
+                )
+            )
+            continue
+
+        blockquote_match = _RE_MARKDOWN_BLOCKQUOTE.match(raw_line)
+        if blockquote_match is not None:
+            rendered.append(
+                _RenderedBlockLine(
+                    f"│ {_render_inline_markdown(blockquote_match.group(1).strip())}",
+                    fg="gray",
+                    dim=True,
+                )
+            )
+            continue
+
+        unordered_match = _RE_MARKDOWN_UL.match(raw_line)
+        if unordered_match is not None:
+            indent = "  " * (len(unordered_match.group(1).expandtabs(2)) // 2)
+            rendered.append(
+                _RenderedBlockLine(
+                    f"{indent}• {_render_inline_markdown(unordered_match.group(3).strip())}"
+                )
+            )
+            continue
+
+        ordered_match = _RE_MARKDOWN_OL.match(raw_line)
+        if ordered_match is not None:
+            indent = "  " * (len(ordered_match.group(1).expandtabs(2)) // 2)
+            rendered.append(
+                _RenderedBlockLine(
+                    f"{indent}{ordered_match.group(2)}. {_render_inline_markdown(ordered_match.group(3).strip())}"
+                )
+            )
+            continue
+
+        if _RE_MARKDOWN_TABLE_DIVIDER.match(raw_line):
+            continue
+
+        if stripped.startswith("|") and stripped.endswith("|"):
+            columns = [
+                _render_inline_markdown(part.strip())
+                for part in stripped.strip("|").split("|")
+            ]
+            rendered.append(_RenderedBlockLine(" | ".join(columns), fg="white"))
+            continue
+
+        rendered.append(_RenderedBlockLine(_render_inline_markdown(raw_line.rstrip())))
+
+    return rendered or [_RenderedBlockLine("")]
 
 
 def _format_elapsed(nv: NodeView) -> str | None:
@@ -339,6 +584,21 @@ class NodeRange:
     is_agent: bool
 
 
+@dataclass(frozen=True)
+class _RenderedBlockLine:
+    text: str
+    fg: str | None = None
+    dim: bool = False
+    bold: bool = False
+
+
+@dataclass(frozen=True)
+class _RootResultTarget:
+    key: str
+    display_text: str
+    copy_text: str
+
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Interactive Tree Renderer
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -442,6 +702,86 @@ class ConsoleRender:
 
     def _is_collapsed(self, key: str, default: bool) -> bool:
         return self._collapse_overrides.get(key, default)
+
+    def _terminal_root_result_target_locked(self) -> _RootResultTarget | None:
+        view = self._last_view
+        if view is None or view.state is not NodeState.Success:
+            return None
+
+        if view.fn.is_agent():
+            for idx in range(len(view.transcript) - 1, -1, -1):
+                part = view.transcript[idx]
+                if isinstance(part, ModelTextPart):
+                    copy_text = str(view.outputs) if view.outputs is not None else part.text
+                    return _RootResultTarget(
+                        key=f"tp:{view.id}:{idx}:model",
+                        display_text=part.text,
+                        copy_text=copy_text,
+                    )
+            if view.outputs is None:
+                return None
+            rendered = str(view.outputs)
+            return _RootResultTarget(
+                key=f"ao:{view.id}",
+                display_text=rendered,
+                copy_text=rendered,
+            )
+
+        if view.outputs is None:
+            return None
+
+        rendered = str(view.outputs)
+        return _RootResultTarget(
+            key=f"cr:{view.id}",
+            display_text=rendered,
+            copy_text=rendered,
+        )
+
+    def _rendered_root_result_lines_locked(
+        self,
+        key: str,
+        text: str,
+    ) -> list[_RenderedBlockLine] | None:
+        target = self._terminal_root_result_target_locked()
+        if target is None or target.key != key:
+            return None
+        return _render_markdown_lines(text)
+
+    def copy_terminal_result(self) -> bool:
+        success, _ = self.copy_terminal_result_with_feedback()
+        return success
+
+    def copy_terminal_result_with_feedback(self) -> tuple[bool, str | None]:
+        with self._lock:
+            target = self._terminal_root_result_target_locked()
+        if target is None:
+            return False, None
+        if _copy_text_to_clipboard(target.copy_text):
+            return True, None
+        return False, _clipboard_copy_failure_message()
+
+    def focus_terminal_result(self) -> bool:
+        with self._lock:
+            target = self._terminal_root_result_target_locked()
+            if target is None:
+                return False
+
+            if self._root_id is not None:
+                self._collapse_overrides[f"n:{self._root_id}"] = False
+            self._collapse_overrides[target.key] = False
+            self._follow_mode = False
+            self._selected_key = None
+            self._selected_anchor = target.key
+            self._selected_anchor_occurrence = len(self._lines) + 1024
+
+            matches = [
+                idx
+                for idx, info in enumerate(self._line_infos)
+                if info.key == target.key or target.key in info.anchors
+            ]
+            if matches:
+                self._cursor = matches[-1]
+            return True
 
     # ── Navigation (all acquire lock) ─────────────────────────────────────
 
@@ -714,6 +1054,8 @@ class ConsoleRender:
             "collapse_agent": self.collapse_enclosing_agent,
             "expand_all": self.expand_all_nodes,
             "collapse_all": self.collapse_all_nodes,
+            "copy_result": self.copy_terminal_result,
+            "focus_result": self.focus_terminal_result,
         }
         handler = action_map.get(action)
         if handler is None:
@@ -754,6 +1096,7 @@ class ConsoleRender:
         has_lines = bool(self._lines)
         can_expand = any(info.expandable for info in self._line_infos)
         can_jump = sum(1 for info in self._line_infos if info.is_agent_header) > 1
+        result_target = self._terminal_root_result_target_locked()
         is_terminal = bool(
             self._last_view and self._last_view.state in _TERMINAL_STATES
         )
@@ -763,6 +1106,8 @@ class ConsoleRender:
             can_jump_agents=can_jump,
             follow_mode=self._follow_mode,
             is_terminal=is_terminal,
+            can_copy_root_result=result_target is not None,
+            can_focus_root_result=result_target is not None,
         )
 
     def right_pane_context(self) -> RightPaneInteractionContext:
@@ -1172,6 +1517,27 @@ class ConsoleRender:
             )
             infos.append(LineInfo(anchors=anchors))
 
+    def _emit_rendered_block(
+        self,
+        rendered_lines: list[_RenderedBlockLine],
+        prefix: str,
+        lines: list[str],
+        infos: list[LineInfo],
+        *,
+        anchors: tuple[str, ...] = (),
+    ) -> None:
+        for rendered_line in rendered_lines:
+            self._append_content(
+                rendered_line.text,
+                prefix,
+                lines,
+                infos,
+                fg=rendered_line.fg,
+                dim=rendered_line.dim,
+                bold=rendered_line.bold,
+                anchors=anchors,
+            )
+
     def _emit_kv_pairs(
         self,
         inputs: dict[str, Any],
@@ -1218,6 +1584,22 @@ class ConsoleRender:
         max_len = max(20, self._cols - _visible_len(header_prefix) - len(header_plain) - 4)
         return _preview_text(text, max_len)
 
+    def _preview_for_rendered_lines(
+        self,
+        rendered_lines: list[_RenderedBlockLine],
+        header_prefix: str,
+        header_plain: str,
+    ) -> str:
+        for rendered_line in rendered_lines:
+            preview = self._preview_for_header(
+                rendered_line.text,
+                header_prefix,
+                header_plain,
+            )
+            if preview:
+                return preview
+        return ""
+
     def _emit_text_part(
         self,
         *,
@@ -1231,6 +1613,7 @@ class ConsoleRender:
         infos: list[LineInfo],
         fg: str | None = None,
         dim: bool = False,
+        rendered_lines: list[_RenderedBlockLine] | None = None,
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
@@ -1238,7 +1621,15 @@ class ConsoleRender:
         header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
         label = f"{detail_prefix}{_color(header_plain, fg=fg, dim=dim)}"
         if collapsed:
-            preview = self._preview_for_header(text, detail_prefix, header_plain)
+            preview = (
+                self._preview_for_rendered_lines(
+                    rendered_lines,
+                    detail_prefix,
+                    header_plain,
+                )
+                if rendered_lines is not None
+                else self._preview_for_header(text, detail_prefix, header_plain)
+            )
             if preview:
                 label += f" {_color(preview, dim=True)}"
         lines.append(label)
@@ -1252,16 +1643,25 @@ class ConsoleRender:
             )
         )
         if not collapsed:
-            block = text.splitlines() or [""]
-            self._emit_content_block(
-                block,
-                content_prefix,
-                lines,
-                infos,
-                max_lines=None,
-                dim=True,
-                anchors=(key,),
-            )
+            if rendered_lines is None:
+                block = text.splitlines() or [""]
+                self._emit_content_block(
+                    block,
+                    content_prefix,
+                    lines,
+                    infos,
+                    max_lines=None,
+                    dim=True,
+                    anchors=(key,),
+                )
+            else:
+                self._emit_rendered_block(
+                    rendered_lines,
+                    content_prefix,
+                    lines,
+                    infos,
+                    anchors=(key,),
+                )
 
     def _emit_value_part(
         self,
@@ -1275,6 +1675,7 @@ class ConsoleRender:
         lines: list[str],
         infos: list[LineInfo],
         fg: str | None = None,
+        rendered_lines: list[_RenderedBlockLine] | None = None,
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
@@ -1282,7 +1683,15 @@ class ConsoleRender:
         header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
         line = f"{detail_prefix}{_color(header_plain, fg=fg)}"
         if collapsed:
-            preview = self._preview_for_header(text, detail_prefix, header_plain)
+            preview = (
+                self._preview_for_rendered_lines(
+                    rendered_lines,
+                    detail_prefix,
+                    header_plain,
+                )
+                if rendered_lines is not None
+                else self._preview_for_header(text, detail_prefix, header_plain)
+            )
             if preview:
                 line += f" {_color(preview, dim=True)}"
         lines.append(line)
@@ -1296,15 +1705,24 @@ class ConsoleRender:
             )
         )
         if not collapsed:
-            self._emit_content_block(
-                text.splitlines() or [""],
-                content_prefix,
-                lines,
-                infos,
-                max_lines=None,
-                dim=True,
-                anchors=(key,),
-            )
+            if rendered_lines is None:
+                self._emit_content_block(
+                    text.splitlines() or [""],
+                    content_prefix,
+                    lines,
+                    infos,
+                    max_lines=None,
+                    dim=True,
+                    anchors=(key,),
+                )
+            else:
+                self._emit_rendered_block(
+                    rendered_lines,
+                    content_prefix,
+                    lines,
+                    infos,
+                    anchors=(key,),
+                )
 
     def _emit_synthetic_function_row(
         self,
@@ -1472,8 +1890,9 @@ class ConsoleRender:
             if kind == "model":
                 part = payload
                 assert isinstance(part, ModelTextPart)
+                model_key = f"tp:{nv.id}:{tx_idx}:model"
                 self._emit_text_part(
-                    key=f"tp:{nv.id}:{tx_idx}:model",
+                    key=model_key,
                     title="result",
                     glyph=RESULT_GLYPH,
                     text=part.text,
@@ -1482,6 +1901,10 @@ class ConsoleRender:
                     lines=lines,
                     infos=infos,
                     fg="green",
+                    rendered_lines=self._rendered_root_result_lines_locked(
+                        model_key,
+                        part.text,
+                    ),
                 )
                 continue
 
@@ -1585,8 +2008,9 @@ class ConsoleRender:
             )
 
         if _has_output(nv) and not has_model_text:
+            result_key = f"ao:{nv.id}"
             self._emit_text_part(
-                key=f"ao:{nv.id}",
+                key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
                 text=str(nv.outputs),
@@ -1595,6 +2019,10 @@ class ConsoleRender:
                 lines=lines,
                 infos=infos,
                 fg="green",
+                rendered_lines=self._rendered_root_result_lines_locked(
+                    result_key,
+                    str(nv.outputs),
+                ),
             )
         elif has_error_outcome:
             self._emit_error_block(
@@ -1630,8 +2058,9 @@ class ConsoleRender:
                 )
 
         if _has_output(nv):
+            result_key = f"cr:{nv.id}"
             self._emit_value_part(
-                key=f"cr:{nv.id}",
+                key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
                 text=str(nv.outputs),
@@ -1640,6 +2069,10 @@ class ConsoleRender:
                 lines=lines,
                 infos=infos,
                 fg="green",
+                rendered_lines=self._rendered_root_result_lines_locked(
+                    result_key,
+                    str(nv.outputs),
+                ),
             )
         elif _has_error(nv) or (nv.state is NodeState.Canceled and nv.exception is not None):
             self._emit_error_block(

@@ -104,6 +104,28 @@ def _make_view(
     )
 
 
+def _make_output_view(
+    fn: CodeFunction,
+    *,
+    output: object,
+    update_seqnum: int,
+) -> NodeView:
+    return NodeView(
+        id=update_seqnum,
+        fn=fn,
+        inputs={},
+        state=NodeState.Success,
+        outputs=output,
+        exception=None,
+        children=(),
+        usage=None,
+        transcript=(),
+        started_at=0.0,
+        ended_at=0.0,
+        update_seqnum=update_seqnum,
+    )
+
+
 def _make_agent_view(
     fn: AgentFunction,
     *,
@@ -339,6 +361,51 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         self.assertIn("q:quit", frame)
         self.assertTrue(controller.should_exit())
 
+    def test_copy_result_failure_shows_clipboard_install_hint(self) -> None:
+        fn = _make_code_function("done")
+        runtime = Runtime([fn], client_factories={})
+        cancel_event = mp.Event()
+        node = runtime.invoke(None, fn, {}, cancel_event=cancel_event)
+        self.assertEqual(node.result(), "done")
+
+        renderer = ConsoleRender()
+        controller = SingleTreeConsoleController(renderer, node)
+        self.addCleanup(controller.on_session_stop)
+        controller.on_session_start(interactive=True)
+
+        with patch.object(
+            renderer,
+            "copy_terminal_result_with_feedback",
+            return_value=(False, "Clipboard unavailable. Install wl-copy, xclip, or xsel."),
+        ):
+            self.assertFalse(controller.handle_key("c"))
+
+        frame = _strip_ansi(controller.render_frame(TerminalSize(columns=140, lines=10), tick=0))
+        self.assertIn("Install wl-copy, xclip, or xsel", frame.splitlines()[-1])
+
+    def test_standalone_key_remap_routes_agent_and_all_actions(self) -> None:
+        fn = _make_code_function("done")
+        runtime = Runtime([fn], client_factories={})
+        cancel_event = mp.Event()
+        node = runtime.invoke(None, fn, {}, cancel_event=cancel_event)
+        self.assertEqual(node.result(), "done")
+
+        renderer = ConsoleRender()
+        renderer.apply_action = Mock()  # type: ignore[method-assign]
+        controller = SingleTreeConsoleController(renderer, node)
+        self.addCleanup(controller.on_session_stop)
+        controller.on_session_start(interactive=True)
+
+        controller.handle_key("a")
+        controller.handle_key("e")
+        controller.handle_key("E")
+        controller.handle_key("r")
+
+        self.assertEqual(
+            [call.args[0] for call in renderer.apply_action.call_args_list],
+            ["collapse_agent", "expand_all", "collapse_all", "focus_result"],
+        )
+
     def test_interrupt_uses_node_cancel_event_when_renderer_has_none(self) -> None:
         cancel_event = mp.Event()
         started = threading.Event()
@@ -485,7 +552,7 @@ class TestBottomBarFormatting(unittest.TestCase):
 
         plain = _strip_ansi(bar)
         self.assertIn("^C:cancel all", plain)
-        self.assertNotIn("e/r:all", plain)
+        self.assertNotIn("e/E:all", plain)
 
     def test_render_too_small_frame_respects_single_line_height(self) -> None:
         rendered = render_too_small_frame(
@@ -1384,6 +1451,93 @@ class TestTUIState(unittest.TestCase):
         bottom_bar = _strip_ansi(rendered.splitlines()[-1])
 
         self.assertNotIn("C:cancel tree", bottom_bar)
+
+    def test_terminal_run_shows_result_shortcuts_when_root_result_available(self) -> None:
+        fn = _make_code_function("done")
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="run",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=mp.Event()),
+                cancel_event=mp.Event(),
+                latest_view=_make_output_view(
+                    fn,
+                    output="# Summary\n\n- first item",
+                    update_seqnum=1,
+                ),
+            )
+        ]
+        tui._selected_run = 0
+
+        rendered = tui.render_frame(TerminalSize(columns=100, lines=15), tick=0)
+        bottom_bar = _strip_ansi(rendered.splitlines()[-1])
+
+        self.assertRegex(bottom_bar, r"(^|  )c(?:(:copy result|:copy)|  )")
+        self.assertRegex(bottom_bar, r"(^|  )r(?:(:show result|:result)|  )")
+
+    def test_copy_result_failure_shows_clipboard_install_hint_in_bottom_bar(self) -> None:
+        fn = _make_code_function("done")
+        runtime = Runtime([fn], client_factories={})
+        renderer = ConsoleRender(cancel_event=mp.Event())
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="run",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=renderer,
+                cancel_event=mp.Event(),
+                latest_view=_make_output_view(
+                    fn,
+                    output="# Summary\n\n- first item",
+                    update_seqnum=1,
+                ),
+            )
+        ]
+        tui._selected_run = 0
+
+        with patch.object(
+            renderer,
+            "copy_terminal_result_with_feedback",
+            return_value=(False, "Clipboard unavailable. Install wl-copy, xclip, or xsel."),
+        ):
+            self.assertFalse(tui.handle_key("c"))
+
+        rendered = tui.render_frame(TerminalSize(columns=140, lines=15), tick=0)
+        bottom_bar = _strip_ansi(rendered.splitlines()[-1])
+
+        self.assertIn("Install wl-copy, xclip, or xsel", bottom_bar)
+
+    def test_multi_pane_key_remap_routes_agent_and_all_actions(self) -> None:
+        fn = _make_code_function("done")
+        runtime = Runtime([fn], client_factories={})
+        renderer = ConsoleRender(cancel_event=mp.Event())
+        renderer.apply_action = Mock()  # type: ignore[method-assign]
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="run",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=renderer,
+                cancel_event=mp.Event(),
+                latest_view=_make_view(fn, state=NodeState.Success, update_seqnum=1),
+            )
+        ]
+        tui._selected_run = 0
+
+        tui.handle_key("a")
+        tui.handle_key("e")
+        tui.handle_key("E")
+        tui.handle_key("r")
+
+        self.assertEqual(
+            [call.args[0] for call in renderer.apply_action.call_args_list],
+            ["collapse_agent", "expand_all", "collapse_all", "focus_result"],
+        )
 
     def test_terminal_run_ignores_cancel_tree_key(self) -> None:
         fn = _make_code_function("done")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass
 from typing import Callable
 
@@ -30,9 +31,10 @@ _STANDALONE_ACTION_KEYS = {
     "page_down": "page_down",
     "n": "next_agent",
     "N": "prev_agent",
-    "c": "collapse_agent",
-    "E": "expand_all",
-    "C": "collapse_all",
+    "r": "focus_result",
+    "a": "collapse_agent",
+    "e": "expand_all",
+    "E": "collapse_all",
 }
 
 
@@ -61,6 +63,8 @@ class SingleTreeConsoleController(SessionController):
             daemon=True,
         )
         self._too_small = False
+        self._flash_message: str | None = None
+        self._flash_until: float = 0.0
 
     def set_wakeup(self, wakeup: Callable[[], None]) -> None:
         self._wakeup = wakeup
@@ -123,6 +127,19 @@ class SingleTreeConsoleController(SessionController):
             token_bill=status.token_bill,
         )
 
+    def _set_flash_message(self, message: str, *, duration: float = 5.0) -> None:
+        self._flash_message = message
+        self._flash_until = time.monotonic() + duration
+
+    def _active_flash_message(self) -> str | None:
+        if self._flash_message is None:
+            return None
+        if time.monotonic() > self._flash_until:
+            self._flash_message = None
+            self._flash_until = 0.0
+            return None
+        return self._flash_message
+
     @staticmethod
     def _mandatory_shortcuts(status: SelectedTreeStatus) -> list[str]:
         if status.state in TerminalNodeStates:
@@ -155,6 +172,9 @@ class SingleTreeConsoleController(SessionController):
         if self._too_small:
             status = self._status_without_position()
             mandatory = self._mandatory_shortcuts(status)
+            flash = self._active_flash_message()
+            if flash is not None:
+                mandatory = [flash, *mandatory]
             bottom_bar = compose_bottom_bar(
                 size.columns,
                 shortcut_variants=[
@@ -181,6 +201,9 @@ class SingleTreeConsoleController(SessionController):
         status = self._renderer.selected_tree_status()
         ctx = self._renderer.right_pane_context()
         mandatory = self._mandatory_shortcuts(status)
+        flash = self._active_flash_message()
+        if flash is not None:
+            mandatory = [flash, *mandatory]
         bottom_bar = compose_bottom_bar(
             size.columns,
             shortcut_variants=standalone_shortcut_variants(ctx),
@@ -195,6 +218,12 @@ class SingleTreeConsoleController(SessionController):
             return self._mode == "browse"
 
         if self._too_small:
+            return False
+
+        if key == "c":
+            copied, message = self._renderer.copy_terminal_result_with_feedback()
+            if not copied and message:
+                self._set_flash_message(message)
             return False
 
         action = _STANDALONE_ACTION_KEYS.get(key)

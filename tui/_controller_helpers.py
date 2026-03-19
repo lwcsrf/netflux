@@ -289,19 +289,29 @@ def standalone_shortcut_variants(ctx: RightPaneInteractionContext) -> list[list[
             compact.append("n/N:next/prev")
             terse.append("n/N")
 
-        if ctx.can_expand_collapse:
-            full.append("c:agent")
-            compact.append("c:agent")
+        if getattr(ctx, "can_copy_root_result", False):
+            full.append("c:copy result")
+            compact.append("c:copy")
             terse.append("c")
+
+        if getattr(ctx, "can_focus_root_result", False):
+            full.append("r:show result")
+            compact.append("r:result")
+            terse.append("r")
+
+        if ctx.can_expand_collapse:
+            full.append("a:agent")
+            compact.append("a:agent")
+            terse.append("a")
 
         full.append("g/G:top/btm")
         compact.append("g/G:top/btm")
         terse.append("g/G")
 
         if ctx.can_expand_collapse:
-            full.append("E/C:all")
-            compact.append("E/C:all")
-            terse.append("E/C")
+            full.append("e/E:all")
+            compact.append("e/E:all")
+            terse.append("e/E")
 
     return _dedupe_variants(full, compact, terse, [])
 
@@ -346,18 +356,28 @@ def multi_pane_shortcut_variants(
             compact.append("n/N:agent")
             terse.append("n/N")
 
-        if ctx.can_expand_collapse:
-            full.append("c:agent")
-            compact.append("c:agent")
+        if getattr(ctx, "can_copy_root_result", False):
+            full.append("c:copy result")
+            compact.append("c:copy")
             terse.append("c")
+
+        if getattr(ctx, "can_focus_root_result", False):
+            full.append("r:show result")
+            compact.append("r:result")
+            terse.append("r")
+
+        if ctx.can_expand_collapse:
+            full.append("a:agent")
+            compact.append("a:agent")
+            terse.append("a")
 
         full.append("g/G:top/btm")
         compact.append("g/G:top/btm")
         terse.append("g/G")
 
         if ctx.can_expand_collapse:
-            full.append("e/r:all")
-            compact.append("e/r:all")
-            terse.append("e/r")
+            full.append("e/E:all")
+            compact.append("e/E:all")
+            terse.append("e/E")
 
     return _dedupe_variants(full, compact, terse)

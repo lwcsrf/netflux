@@ -7,6 +7,7 @@ import queue
 import re
 import threading
 import textwrap
+import time
 from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Callable, Mapping
@@ -51,9 +52,10 @@ _MULTI_ACTION_KEYS = {
     "page_down": "page_down",
     "n": "next_agent",
     "N": "prev_agent",
-    "c": "collapse_agent",
+    "r": "focus_result",
+    "a": "collapse_agent",
     "e": "expand_all",
-    "r": "collapse_all",
+    "E": "collapse_all",
 }
 
 
@@ -191,6 +193,8 @@ class TUI(SessionController):
         self._exit_after_render = False
         self._terminal_callback: TerminalCallback | None = None
         self._wakeup: Callable[[], None] = lambda: None
+        self._flash_message: str | None = None
+        self._flash_until: float = 0.0
 
     def run(self) -> None:
         ConsoleSessionDriver(spinner_hz=self.spinner_hz).run(self)
@@ -321,6 +325,7 @@ class TUI(SessionController):
             else SelectedTreeStatus()
         )
         ctx = selected_renderer.right_pane_context() if selected_renderer is not None else RightPaneInteractionContext()
+        flash = self._active_flash_message()
         bottom_bar = compose_bottom_bar(
             size.columns,
             shortcut_variants=multi_pane_shortcut_variants(
@@ -331,6 +336,7 @@ class TUI(SessionController):
             ),
             status=status,
             tick=tick,
+            mandatory_shortcuts=[flash] if flash is not None else (),
         )
         frame_rows.append(f"{bottom_bar}\x1b[K")
         return self._finalize_frame("\n".join(frame_rows))
@@ -360,6 +366,14 @@ class TUI(SessionController):
             idx = int(key)
             if idx < len(self.invocable_functions):
                 self._open_launch_form(idx)
+            return False
+        if key == "c":
+            renderer = self._selected_renderer()
+            if renderer is None:
+                return False
+            copied, message = renderer.copy_terminal_result_with_feedback()
+            if not copied and message:
+                self._set_flash_message(message)
             return False
 
         action = _MULTI_ACTION_KEYS.get(key)
@@ -1073,6 +1087,19 @@ class TUI(SessionController):
         if self._global_cancel_requested:
             return "^C:force quit"
         return "^C:cancel all"
+
+    def _set_flash_message(self, message: str, *, duration: float = 5.0) -> None:
+        self._flash_message = message
+        self._flash_until = time.monotonic() + duration
+
+    def _active_flash_message(self) -> str | None:
+        if self._flash_message is None:
+            return None
+        if time.monotonic() > self._flash_until:
+            self._flash_message = None
+            self._flash_until = 0.0
+            return None
+        return self._flash_message
 
     def _finalize_frame(self, frame: str) -> str:
         if self._exit_after_render:
