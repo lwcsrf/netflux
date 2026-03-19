@@ -1,8 +1,7 @@
 import argparse
-from collections import deque
-from typing import Iterable, List, Optional, Sequence
+from typing import List, Optional, Sequence
 
-from ..core import AgentFunction, Function, Provider
+from ..core import Function
 from ..runtime import Runtime
 from ..tui import TUI
 from .apply_diff import apply_diff_patch
@@ -18,26 +17,6 @@ ROOT_FUNCTIONS: tuple[Function, ...] = (
     perf_optimizer,
     apply_diff_patch,
 )
-
-
-def _walk_functions(roots: Sequence[Function]) -> Iterable[Function]:
-    queue = deque(roots)
-    seen: set[int] = set()
-
-    while queue:
-        fn = queue.popleft()
-        marker = id(fn)
-        if marker in seen:
-            continue
-        seen.add(marker)
-        yield fn
-        queue.extend(fn.uses)
-
-
-def _set_default_provider(roots: Sequence[Function], provider: Provider) -> None:
-    for fn in _walk_functions(roots):
-        if isinstance(fn, AgentFunction):
-            fn.default_model = provider
 
 
 class _DemoRuntime(Runtime):
@@ -58,20 +37,13 @@ class _DemoRuntime(Runtime):
         return self._launch_functions
 
 
-def build_runtime(provider: Provider) -> Runtime:
-    _set_default_provider(ROOT_FUNCTIONS, provider)
+def build_runtime() -> Runtime:
     return _DemoRuntime(ROOT_FUNCTIONS)
 
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run the multi-root TUI demo over the four existing demo functions.",
-    )
-    parser.add_argument(
-        "--provider",
-        choices=[p.value.lower() for p in Provider],
-        required=True,
-        help="Provider to assign as the default model for all agent-based demo roots.",
     )
     parser.add_argument(
         "--spinner-hz",
@@ -84,9 +56,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
-    provider_value = {p.value.lower(): p.value for p in Provider}[args.provider]
-    provider = Provider(provider_value)
-    runtime = build_runtime(provider)
+    runtime = build_runtime()
     TUI(runtime, spinner_hz=args.spinner_hz).run()
 
 

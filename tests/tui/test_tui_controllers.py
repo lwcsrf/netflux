@@ -107,6 +107,7 @@ def _make_agent_view(
     *,
     state: NodeState,
     update_seqnum: int,
+    provider: Provider | None = None,
 ) -> NodeView:
     return NodeView(
         id=update_seqnum,
@@ -121,6 +122,7 @@ def _make_agent_view(
         started_at=0.0,
         ended_at=0.0 if state in {NodeState.Success, NodeState.Error, NodeState.Canceled} else None,
         update_seqnum=update_seqnum,
+        provider=provider,
     )
 
 
@@ -2079,6 +2081,309 @@ class TestTUIState(unittest.TestCase):
 
         self.assertEqual(tui._form_state.fields[0].value, "recent click (8)")
         self.assertEqual(tui._form_state.fields[1].value, "from history")
+
+    def test_launch_form_agent_provider_field_starts_from_default_model(self) -> None:
+        fn = AgentFunction(
+            name="agent_launch",
+            desc="agent launch target",
+            args=[FunctionArg("prompt", str)],
+            system_prompt="system",
+            user_prompt_template="{prompt}",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+
+        tui._open_launch_form(0)
+
+        assert tui._form_state is not None
+        self.assertEqual(tui._form_state.fields[0].label, "run_name")
+        self.assertEqual(tui._form_state.fields[1].label, "provider")
+        self.assertTrue(tui._form_state.fields[2].is_provider_options)
+        self.assertEqual(tui._form_state.fields[1].value, Provider.Anthropic.value)
+        self.assertEqual(tui._form_state.fields[3].label, "prompt")
+
+    def test_launch_form_agent_default_provider_submits_without_override(self) -> None:
+        fn = AgentFunction(
+            name="agent_default_submit",
+            desc="agent default submit target",
+            args=[FunctionArg("prompt", str)],
+            system_prompt="system",
+            user_prompt_template="{prompt}",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.fields[0].value = "agent run"
+        tui._form_state.fields[3].value = "hello"
+        terminal_view = _make_agent_view(
+            fn,
+            state=NodeState.Success,
+            update_seqnum=1,
+            provider=Provider.Anthropic,
+        )
+        node = SimpleNamespace(id=123, watch=Mock(return_value=terminal_view))
+
+        with patch.object(runtime, "invoke", return_value=node) as invoke_mock, patch.object(
+            runtime,
+            "get_view",
+            return_value=terminal_view,
+        ):
+            tui._submit_form()
+
+        invoke_mock.assert_called_once_with(
+            None,
+            fn,
+            {"prompt": "hello"},
+            provider=None,
+            cancel_event=unittest.mock.ANY,
+        )
+
+    def test_launch_form_agent_provider_override_is_forwarded_only_for_root_invoke(self) -> None:
+        fn = AgentFunction(
+            name="agent_override_submit",
+            desc="agent override submit target",
+            args=[FunctionArg("prompt", str)],
+            system_prompt="system",
+            user_prompt_template="{prompt}",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.fields[0].value = "agent run"
+        tui._form_state.fields[1].value = "gemini"
+        tui._form_state.fields[3].value = "hello"
+        terminal_view = _make_agent_view(
+            fn,
+            state=NodeState.Success,
+            update_seqnum=1,
+            provider=Provider.Gemini,
+        )
+        node = SimpleNamespace(id=123, watch=Mock(return_value=terminal_view))
+
+        with patch.object(runtime, "invoke", return_value=node) as invoke_mock, patch.object(
+            runtime,
+            "get_view",
+            return_value=terminal_view,
+        ):
+            tui._submit_form()
+
+        invoke_mock.assert_called_once_with(
+            None,
+            fn,
+            {"prompt": "hello"},
+            provider=Provider.Gemini,
+            cancel_event=unittest.mock.ANY,
+        )
+
+    def test_launch_form_invalid_provider_shows_error_and_does_not_launch(self) -> None:
+        fn = AgentFunction(
+            name="agent_invalid_provider",
+            desc="agent invalid provider target",
+            args=[FunctionArg("prompt", str)],
+            system_prompt="system",
+            user_prompt_template="{prompt}",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.fields[1].value = "not-a-provider"
+        tui._form_state.fields[3].value = "hello"
+
+        tui._submit_form()
+
+        self.assertEqual(len(tui._runs), 0)
+        assert tui._form_state is not None
+        self.assertIn("Provider must be one of", tui._form_state.error)
+
+    def test_launch_form_recent_history_repopulates_provider_for_agent_runs(self) -> None:
+        fn = AgentFunction(
+            name="agent_history",
+            desc="agent history target",
+            args=[FunctionArg("prompt", str)],
+            system_prompt="system",
+            user_prompt_template="{prompt}",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+        tui._runs = [
+            _RunRecord(
+                name="recent agent",
+                fn=fn,
+                node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=mp.Event()),
+                cancel_event=mp.Event(),
+                latest_view=_make_agent_view(
+                    fn,
+                    state=NodeState.Success,
+                    update_seqnum=1,
+                    provider=Provider.Gemini,
+                ),
+            )
+        ]
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.fields[0].value = "keep name"
+        tui._form_state.fields[1].value = Provider.Anthropic.value
+        tui._form_state.fields[3].value = "stale"
+        tui._form_state.cursor = tui._launch_form_history_start_index()
+
+        tui.handle_key("\n")
+
+        assert tui._form_state is not None
+        self.assertEqual(tui._form_state.fields[0].value, "recent agent (1)")
+        self.assertEqual(tui._form_state.fields[1].value, Provider.Gemini.value)
+        self.assertEqual(tui._form_state.fields[3].value, "")
+        self.assertEqual(tui._form_state.cursor, 1)
+
+    def test_launch_form_provider_row_renders_enum_and_highlights_selected_option(self) -> None:
+        fn = AgentFunction(
+            name="agent_provider_enum",
+            desc="agent provider enum target",
+            args=[],
+            system_prompt="system",
+            user_prompt_template="",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+
+        rendered = tui.render_frame(TerminalSize(columns=90, lines=18), tick=0)
+        plain_lines = [_strip_ansi(line).rstrip() for line in rendered.splitlines()]
+        provider_options = next(
+            line for line in plain_lines if "Anthropic" in line and "Gemini" in line and "OpenAI" in line and "xAI" in line
+        )
+
+        self.assertIn("[Anthropic]", provider_options)
+        self.assertIn("Gemini", provider_options)
+        self.assertIn("OpenAI", provider_options)
+        self.assertIn("xAI", provider_options)
+        self.assertIn(FG["green"], rendered)
+
+    def test_launch_form_space_toggles_provider_when_provider_field_selected(self) -> None:
+        fn = AgentFunction(
+            name="agent_provider_toggle",
+            desc="agent provider toggle target",
+            args=[],
+            system_prompt="system",
+            user_prompt_template="",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.cursor = 1
+
+        tui.handle_key(" ")
+
+        self.assertEqual(tui._form_state.fields[1].value, Provider.Gemini.value)
+
+    def test_launch_form_space_still_inserts_literal_space_for_text_fields(self) -> None:
+        fn = CodeFunction(
+            name="space_text",
+            desc="space text target",
+            args=[FunctionArg("value", str)],
+            callable=lambda ctx, *, value: value,
+            uses=[],
+        )
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+        assert tui._form_state is not None
+        tui._form_state.cursor = 1
+
+        tui.handle_key(" ")
+
+        self.assertEqual(tui._form_state.fields[1].value, " ")
+
+    def test_launch_form_clicking_provider_options_row_selects_provider_field(self) -> None:
+        fn = AgentFunction(
+            name="agent_provider_click",
+            desc="agent provider click target",
+            args=[],
+            system_prompt="system",
+            user_prompt_template="",
+            uses=[],
+            default_model=Provider.Anthropic,
+        )
+        runtime = Runtime(
+            [fn],
+            client_factories={
+                Provider.Anthropic: lambda: None,
+                Provider.Gemini: lambda: None,
+            },
+        )
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+
+        rendered = tui.render_frame(TerminalSize(columns=90, lines=18), tick=0)
+        plain_lines = [_strip_ansi(line).rstrip() for line in rendered.splitlines()]
+        provider_options_row = next(
+            i for i, line in enumerate(plain_lines) if "Anthropic" in line and "Gemini" in line and "OpenAI" in line and "xAI" in line
+        )
+
+        tui.handle_mouse(SimpleNamespace(x=2, y=provider_options_row, button="left"))
+
+        assert tui._form_state is not None
+        self.assertEqual(tui._form_state.cursor, 1)
 
     def test_launch_form_keeps_fields_visible_when_description_exceeds_viewport(self) -> None:
         fn = CodeFunction(

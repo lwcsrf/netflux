@@ -348,8 +348,11 @@ While the launch form is open:
 
 Form content:
 - first field is a UI-only run name,
+- `AgentFunction` launch forms include a provider field immediately after the run name; it is initialized from that function's `default_model`,
+- directly under that provider field, the form renders the `Provider` enum choices and visually highlights the currently selected provider,
 - remaining fields correspond to the selected function's declared `FunctionArg`s,
 - below the function description, the header also shows each arg's declared type, description, and `[optional]` marker when applicable,
+- the launch form uses its own color/bold treatment for the title, field labels, submit/cancel actions, and recent-run rows; this styling change is intentionally scoped to the launch form only,
 - `[Submit]` and `[Cancel]` appear immediately after the editable arg fields,
 - below `[Submit]` / `[Cancel]`, the form may show up to 20 recent top-level runs of that same function from this `TUI` session, ordered newest first,
 - each recent-run row shows the run name and a truncated inline args preview,
@@ -359,19 +362,23 @@ Form content:
 Current form editing behavior:
 - Tab / Shift+Tab and Up / Down move the form cursor,
 - Enter advances, applies a selected recent-run template, or submits depending on the current row,
+- when the provider field is selected, Space cycles to the next `Provider` enum value,
 - Escape cancels,
 - Backspace deletes one character,
-- printable characters are appended literally,
+- printable characters are appended literally on text fields; the provider field is not free-form text in v1,
 - there is no cursor-within-field editing model in v1.
 
 Recent-run template behavior:
 - selecting a recent-run row by keyboard or left-click does not launch immediately,
-- instead it copies that run's args back into the editable arg fields,
+- instead it copies that run's provider selection and args back into the editable fields,
 - it also prepopulates the run-name field from that history entry, appending ` (1)` or incrementing an existing trailing ` (N)` suffix,
 - optional args that were omitted or submitted as `None` repopulate as blank fields,
-- after applying a recent-run template, the cursor returns to the first real arg field (or the run-name field when there are no args).
+- after applying a recent-run template, the cursor returns to the first editable non-name field (or the run-name field when there are no other fields).
 
 Submission/parsing rules:
+- provider text is parsed case-insensitively against `Provider` names/values before `Runtime.invoke(...)`,
+- a blank provider field, or one matching the function's `default_model`, means no top-level provider override is passed,
+- a selected provider override applies only to the launched root; descendant invokes still use whatever provider/default each caller chooses normally,
 - whitespace-only arg fields are treated as omitted,
 - blank optional arg fields are submitted as explicit `None`,
 - blank required arg fields remain missing and therefore fail top-level validation,

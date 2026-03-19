@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from multiprocessing.synchronize import Event as MpEvent
 from typing import Callable, Mapping
 
-from ..core import Function, FunctionArg, Node, NodeState, NodeView, TerminalNodeStates, TokenBill
+from ..core import AgentFunction, Function, FunctionArg, Node, NodeState, NodeView, TerminalNodeStates, TokenBill
 from ..providers import Provider
 from ..runtime import Runtime
 from ._contracts import RightPaneInteractionContext, SelectedTreeStatus, SessionController, TerminalSize
@@ -104,19 +104,37 @@ class _LaunchField:
     label: str
     value: str = ""
     arg: FunctionArg | None = None
+    kind: str = "arg"
 
     @property
     def is_name(self) -> bool:
-        return self.arg is None
+        return self.kind == "name"
+
+    @property
+    def is_provider(self) -> bool:
+        return self.kind == "provider"
+
+    @property
+    def is_provider_options(self) -> bool:
+        return self.kind == "provider_options"
 
     @property
     def type_label(self) -> str:
-        if self.arg is None:
+        if self.is_name:
             return "str"
+        if self.is_provider:
+            return "Provider"
+        if self.is_provider_options:
+            return ""
+        assert self.arg is not None
         return self.arg.argtype.__name__
 
     @property
     def optional(self) -> bool:
+        if self.is_provider:
+            return False
+        if self.is_provider_options:
+            return False
         return bool(self.arg and self.arg.optional)
 
 
@@ -132,6 +150,7 @@ class _LaunchFormState:
 class _LaunchHistoryEntry:
     name: str
     inputs: Mapping[str, object]
+    provider: Provider | None = None
 
 
 @dataclass(frozen=True)
@@ -404,7 +423,10 @@ class TUI(SessionController):
 
     def _open_launch_form(self, fn_index: int) -> None:
         fn = self.invocable_functions[fn_index]
-        fields = [_LaunchField(label="run_name")]
+        fields = [_LaunchField(label="run_name", kind="name")]
+        if isinstance(fn, AgentFunction):
+            fields.append(_LaunchField(label="provider", value=fn.default_model.value, kind="provider"))
+            fields.append(_LaunchField(label="provider_options", kind="provider_options"))
         fields.extend(_LaunchField(label=arg.name, arg=arg) for arg in fn.args)
         self._form_state = _LaunchFormState(fn_index=fn_index, fields=fields)
         self._sync_visible_run()
@@ -423,7 +445,15 @@ class TUI(SessionController):
                 raw_inputs = getattr(run.node, "inputs", {})
                 if isinstance(raw_inputs, Mapping):
                     inputs = raw_inputs
-            history.append(_LaunchHistoryEntry(name=run.name, inputs=dict(inputs)))
+            provider: Provider | None = None
+            if isinstance(fn, AgentFunction):
+                if run.latest_view is not None:
+                    provider = run.latest_view.provider
+                if provider is None:
+                    raw_provider = getattr(run.node, "provider", None)
+                    if isinstance(raw_provider, Provider):
+                        provider = raw_provider
+            history.append(_LaunchHistoryEntry(name=run.name, inputs=dict(inputs), provider=provider))
             if len(history) >= 20:
                 break
         return history
@@ -444,14 +474,45 @@ class TUI(SessionController):
 
     def _clamp_form_cursor(self) -> None:
         assert self._form_state is not None
-        max_cursor = max(0, self._launch_form_item_count() - 1)
+        focusable = self._focusable_form_indices()
+        if not focusable:
+            self._form_state.cursor = 0
+            return
+        max_cursor = focusable[-1]
         self._form_state.cursor = max(0, min(self._form_state.cursor, max_cursor))
+        if self._form_state.cursor not in focusable:
+            eligible = [index for index in focusable if index <= self._form_state.cursor]
+            self._form_state.cursor = eligible[-1] if eligible else focusable[0]
 
-    def _first_arg_field_cursor(self) -> int:
+    def _first_editable_field_cursor(self) -> int:
         assert self._form_state is not None
         if len(self._form_state.fields) > 1:
             return 1
         return 0
+
+    def _focusable_form_indices(self) -> list[int]:
+        assert self._form_state is not None
+        indices = [
+            idx for idx, field in enumerate(self._form_state.fields) if not field.is_provider_options
+        ]
+        indices.append(self._launch_form_submit_index())
+        indices.append(self._launch_form_cancel_index())
+        indices.extend(range(self._launch_form_history_start_index(), self._launch_form_item_count()))
+        return indices
+
+    def _move_form_cursor(self, step: int) -> None:
+        assert self._form_state is not None
+        focusable = self._focusable_form_indices()
+        if not focusable:
+            self._form_state.cursor = 0
+            return
+        current = self._form_state.cursor
+        if current not in focusable:
+            self._form_state.cursor = focusable[0]
+            return
+        position = focusable.index(current)
+        position = max(0, min(position + step, len(focusable) - 1))
+        self._form_state.cursor = focusable[position]
 
     @staticmethod
     def _launch_form_field_value(arg: FunctionArg, value: object) -> str:
@@ -475,15 +536,22 @@ class TUI(SessionController):
 
     def _apply_launch_history(self, history_index: int) -> None:
         assert self._form_state is not None
+        fn = self.invocable_functions[self._form_state.fn_index]
         history = self._launch_form_history()
         if not (0 <= history_index < len(history)):
             return
 
         entry = history[history_index]
         self._form_state.fields[0].value = self._history_restore_name(entry.name)
-        input_fields = self._form_state.fields[1:]
-        for field in input_fields:
+        for field in self._form_state.fields[1:]:
             field.value = ""
+            if field.is_provider:
+                assert isinstance(fn, AgentFunction)
+                provider = entry.provider or fn.default_model
+                field.value = provider.value
+                continue
+            if field.is_provider_options:
+                continue
             assert field.arg is not None
             if field.arg.name in entry.inputs:
                 field.value = self._launch_form_field_value(
@@ -492,34 +560,42 @@ class TUI(SessionController):
                 )
 
         self._form_state.error = ""
-        self._form_state.cursor = self._first_arg_field_cursor()
+        self._form_state.cursor = self._first_editable_field_cursor()
 
     def _handle_form_key(self, key: str) -> bool:
         assert self._form_state is not None
         self._clamp_form_cursor()
+        field = self._current_form_field()
 
         if key in ("escape",):
             self._form_state = None
             self._sync_visible_run()
             return False
         if key == "\t":
-            self._form_state.cursor = min(self._launch_form_item_count() - 1, self._form_state.cursor + 1)
+            self._move_form_cursor(1)
             return False
         if key == "shift_tab":
-            self._form_state.cursor = max(0, self._form_state.cursor - 1)
+            self._move_form_cursor(-1)
             return False
         if key == "up":
-            self._form_state.cursor = max(0, self._form_state.cursor - 1)
+            self._move_form_cursor(-1)
             return False
         if key == "down":
-            self._form_state.cursor = min(self._launch_form_item_count() - 1, self._form_state.cursor + 1)
+            self._move_form_cursor(1)
+            return False
+        if key == " " and field is not None and field.is_provider:
+            self._cycle_provider_field()
             return False
         if key in ("\r", "\n"):
             return self._submit_or_move_form()
         if key in ("\x08", "\x7f"):
+            if field is not None and (field.is_provider or field.is_provider_options):
+                return False
             self._edit_form_text(backspace=True, ch="")
             return False
         if len(key) == 1:
+            if field is not None and (field.is_provider or field.is_provider_options):
+                return False
             self._edit_form_text(backspace=False, ch=key)
             return False
         return False
@@ -540,7 +616,7 @@ class TUI(SessionController):
         if self._form_state.cursor >= history_start:
             self._apply_launch_history(self._form_state.cursor - history_start)
             return False
-        self._form_state.cursor = min(cancel_index, self._form_state.cursor + 1)
+        self._move_form_cursor(1)
         return False
 
     def _edit_form_text(self, *, backspace: bool, ch: str) -> None:
@@ -553,12 +629,51 @@ class TUI(SessionController):
         else:
             field.value += ch
 
+    def _current_form_field(self) -> _LaunchField | None:
+        assert self._form_state is not None
+        if self._form_state.cursor >= len(self._form_state.fields):
+            return None
+        return self._form_state.fields[self._form_state.cursor]
+
+    def _selected_provider_for_field(self, fn: AgentFunction, field: _LaunchField) -> Provider:
+        raw_value = field.value.strip()
+        if raw_value:
+            try:
+                return self._parse_provider(raw_value)
+            except ValueError:
+                pass
+        return fn.default_model
+
+    def _cycle_provider_field(self) -> None:
+        assert self._form_state is not None
+        field = self._current_form_field()
+        if field is None or not field.is_provider:
+            return
+        fn = self.invocable_functions[self._form_state.fn_index]
+        assert isinstance(fn, AgentFunction)
+        providers = list(Provider)
+        current = self._selected_provider_for_field(fn, field)
+        current_index = providers.index(current)
+        field.value = providers[(current_index + 1) % len(providers)].value
+        self._form_state.error = ""
+
     def _submit_form(self) -> None:
         assert self._form_state is not None
         fn = self.invocable_functions[self._form_state.fn_index]
         parsed_args: dict[str, object] = {}
+        provider_override: Provider | None = None
         try:
             for field in self._form_state.fields[1:]:
+                if field.is_provider:
+                    assert isinstance(fn, AgentFunction)
+                    raw_provider = field.value.strip()
+                    if raw_provider:
+                        selected_provider = self._parse_provider(raw_provider)
+                        if selected_provider != fn.default_model:
+                            provider_override = selected_provider
+                    continue
+                if field.is_provider_options:
+                    continue
                 assert field.arg is not None
                 raw = field.value
                 if raw.strip() == "":
@@ -567,7 +682,13 @@ class TUI(SessionController):
                     continue
                 parsed_args[field.arg.name] = self._parse_arg(field.arg, raw)
             cancel_event = mp.Event()
-            node = self.runtime.invoke(None, fn, parsed_args, cancel_event=cancel_event)
+            node = self.runtime.invoke(
+                None,
+                fn,
+                parsed_args,
+                provider=provider_override,
+                cancel_event=cancel_event,
+            )
         except Exception as exc:
             self._form_state.error = str(exc)
             return
@@ -633,6 +754,15 @@ class TUI(SessionController):
             allowed = ", ".join(sorted(arg.enum))
             raise ValueError(f"Arg '{arg.name}' must be one of: {allowed}")
         return value
+
+    @staticmethod
+    def _parse_provider(raw: str) -> Provider:
+        normalized = raw.strip().lower()
+        for provider in Provider:
+            if normalized == provider.value.lower() or normalized == provider.name.lower():
+                return provider
+        allowed = ", ".join(provider.value for provider in Provider)
+        raise ValueError(f"Provider must be one of: {allowed}")
 
     def _watch_run(self, run_index: int, node: Node, stop_event: threading.Event) -> None:
         prev_seq = 0
@@ -842,19 +972,17 @@ class TUI(SessionController):
         rows = max(1, size.lines - 1)
         layout = self._launch_form_layout(size)
         history = self._launch_form_history()
-        lines = list(layout.header_lines)
         submit_index = self._launch_form_submit_index()
         cancel_index = self._launch_form_cancel_index()
         history_start = self._launch_form_history_start_index()
         item_count = self._launch_form_item_count()
-        start = layout.item_start
-        end = layout.item_end
+        lines = list(layout.header_lines)
         hint_parts: list[str] = []
         if layout.header_clipped:
             hint_parts.append("desc clipped")
-        if start > 0:
+        if layout.item_start > 0:
             hint_parts.append("↑ more")
-        if end < item_count:
+        if layout.item_end < item_count:
             hint_parts.append("↓ more")
         hint = _color("  ".join(hint_parts), dim=True) if hint_parts else ""
         lines.append(self._pad_visible(hint, size.columns))
@@ -862,15 +990,28 @@ class TUI(SessionController):
         for item_index in range(layout.item_start, layout.item_end):
             if item_index < len(self._form_state.fields):
                 field = self._form_state.fields[item_index]
-                label_color = "orange" if field.is_name else "cyan"
-                label = _color(field.label, fg=label_color, bold=True)
-                meta_parts: list[str] = []
-                if field.arg is not None:
-                    meta_parts.append(_color(f"({field.type_label})", fg="gray"))
-                    if field.optional:
-                        meta_parts.append(_color("[optional]", fg="yellow", bold=True))
-                meta = f" {' '.join(meta_parts)}" if meta_parts else ""
-                rendered = self._pad_visible(f"{label}{meta}: {field.value}", size.columns)
+                if field.is_provider_options:
+                    provider_field = self._form_state.fields[item_index - 1]
+                    fn = self.invocable_functions[self._form_state.fn_index]
+                    assert isinstance(fn, AgentFunction)
+                    selected_provider = self._selected_provider_for_field(fn, provider_field)
+                    option_tokens: list[str] = []
+                    for provider in Provider:
+                        if provider == selected_provider:
+                            option_tokens.append(_color(f"[{provider.value}]", fg="green", bold=True))
+                        else:
+                            option_tokens.append(_color(provider.value, fg="gray", dim=True))
+                    rendered = self._pad_visible(f"  {'  '.join(option_tokens)}", size.columns)
+                else:
+                    label_color = "orange" if field.is_name else "cyan"
+                    label = _color(field.label, fg=label_color, bold=True)
+                    meta_parts: list[str] = []
+                    if not field.is_name:
+                        meta_parts.append(_color(f"({field.type_label})", fg="gray"))
+                        if field.optional:
+                            meta_parts.append(_color("[optional]", fg="yellow", bold=True))
+                    meta = f" {' '.join(meta_parts)}" if meta_parts else ""
+                    rendered = self._pad_visible(f"{label}{meta}: {field.value}", size.columns)
             elif item_index == submit_index:
                 rendered = self._pad_visible(_color("[Submit]", fg="green", bold=True), size.columns)
             elif item_index == cancel_index:
@@ -888,7 +1029,10 @@ class TUI(SessionController):
                     f"{_color(args_preview, fg='gray', dim=True)}",
                     size.columns,
                 )
-            if item_index == self._form_state.cursor:
+            highlight_index = item_index
+            if item_index < len(self._form_state.fields) and self._form_state.fields[item_index].is_provider_options:
+                highlight_index = item_index - 1
+            if highlight_index == self._form_state.cursor:
                 rendered = _highlight_line(rendered, size.columns)
             lines.append(rendered)
 
@@ -898,22 +1042,24 @@ class TUI(SessionController):
         while len(lines) < rows:
             lines.append(" " * size.columns)
 
+        current_field = self._current_form_field()
+        provider_selected = current_field is not None and current_field.is_provider
         bottom_bar = compose_bottom_bar(
             size.columns,
             shortcut_variants=[
                 [
                     "Tab/Shift+Tab:item",
                     "Enter:next/use/submit",
-                    "Esc:cancel",
-                    "Backspace:delete",
+                    "Space:toggle provider" if provider_selected else "Esc:cancel",
+                    "Esc:cancel" if provider_selected else "Backspace:delete",
                 ],
                 [
                     "Tab/S-Tab:item",
                     "Enter:next/use/submit",
-                    "Esc:cancel",
-                    "Backspace",
+                    "Space:toggle" if provider_selected else "Esc:cancel",
+                    "Esc" if provider_selected else "Backspace",
                 ],
-                ["Tab", "Enter", "Esc", "Backspace"],
+                ["Tab", "Enter", "Space" if provider_selected else "Esc", "Esc" if provider_selected else "Backspace"],
             ],
             status=self._selected_status(include_position=False),
             tick=tick,
@@ -937,7 +1083,6 @@ class TUI(SessionController):
     def _handle_form_mouse(self, event: object) -> bool:
         assert self._form_state is not None
         self._clamp_form_cursor()
-        x = int(getattr(event, "x", 0))
         y = int(getattr(event, "y", 0))
         button = getattr(event, "button", "")
         if button != "left":
@@ -952,7 +1097,10 @@ class TUI(SessionController):
         if item_index >= layout.item_end:
             return False
         if item_index < len(self._form_state.fields):
-            self._form_state.cursor = item_index
+            if self._form_state.fields[item_index].is_provider_options:
+                self._form_state.cursor = max(0, item_index - 1)
+            else:
+                self._form_state.cursor = item_index
             return False
         if item_index == submit_index:
             self._form_state.cursor = item_index
@@ -965,8 +1113,6 @@ class TUI(SessionController):
         if item_index >= history_start:
             self._form_state.cursor = item_index
             self._apply_launch_history(item_index - history_start)
-            return False
-        if x < 0:
             return False
         return False
 
