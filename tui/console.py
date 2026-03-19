@@ -235,7 +235,10 @@ def _copy_text_to_clipboard(text: str) -> bool:
                 input=text,
                 text=True,
                 check=True,
-                capture_output=True,
+                # Clipboard helpers often fork a background owner process.
+                # Captured pipes can keep subprocess.run() waiting for that child.
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
             return True
         except (FileNotFoundError, OSError, subprocess.SubprocessError):
