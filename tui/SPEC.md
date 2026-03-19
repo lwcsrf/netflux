@@ -156,7 +156,7 @@ Successful terminal root results behave as follows:
 - for agent roots, this is the last `ModelTextPart` when present, otherwise the terminal `outputs` block,
 - for code roots, this is the terminal `outputs` block,
 - clipboard copy uses the raw terminal result text verbatim rather than the markdown-rendered display form,
-- when that result target is expanded, it is rendered through the current built-in lightweight markdown formatter instead of being shown as raw markdown text.
+- when that result target is expanded, it is rendered through the current Rich-based terminal markdown renderer instead of being shown as raw markdown text.
 
 ### 3.5 Status and Interaction Context
 

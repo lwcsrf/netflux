@@ -23,6 +23,7 @@ Additional controls in post-completion browser:
 """
 import re
 import shutil
+from io import StringIO
 import subprocess
 import sys
 import threading
@@ -30,6 +31,9 @@ import time
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
 from typing import Any, Iterator, Mapping
+
+from rich.console import Console
+from rich.markdown import Markdown
 
 from ._contracts import RightPaneInteractionContext, SelectedTreeStatus
 from ..core import (
@@ -103,13 +107,6 @@ _MOUSE_SCROLL_ROWS = 5
 #   final byte        0x40-0x7E  => [@-~]
 _RE_COMPLETE_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _RE_TRAILING_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*$")
-_RE_MARKDOWN_FENCE = re.compile(r"^\s*```+([^`]*)\s*$")
-_RE_MARKDOWN_HEADING = re.compile(r"^\s{0,3}(#{1,6})\s+(.*)$")
-_RE_MARKDOWN_BLOCKQUOTE = re.compile(r"^\s{0,3}>\s?(.*)$")
-_RE_MARKDOWN_UL = re.compile(r"^(\s*)([-*+])\s+(.*)$")
-_RE_MARKDOWN_OL = re.compile(r"^(\s*)(\d+)\.\s+(.*)$")
-_RE_MARKDOWN_HR = re.compile(r"^\s{0,3}(?:([-*_])\s*){3,}$")
-_RE_MARKDOWN_TABLE_DIVIDER = re.compile(r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*:?-+:?\s*\|?\s*$")
 
 def _color(
     text: str,
@@ -312,35 +309,8 @@ def _preview_text(text: str, max_len: int = 60) -> str:
     return stripped[: max_len - 1] + "…"
 
 
-def _render_inline_markdown(text: str) -> str:
-    text = re.sub(
-        r"!\[([^\]]*)\]\(([^)]+)\)",
-        lambda m: f"[image: {m.group(1)}] ({m.group(2)})" if m.group(2) else f"[image: {m.group(1)}]",
-        text,
-    )
-    text = re.sub(
-        r"\[([^\]]+)\]\(([^)]+)\)",
-        lambda m: f"{m.group(1)} ({m.group(2)})",
-        text,
-    )
-    for pattern in (
-        r"\*\*\*([^*]+)\*\*\*",
-        r"___([^_]+)___",
-        r"\*\*([^*]+)\*\*",
-        r"__([^_]+)__",
-        r"~~([^~]+)~~",
-        r"`([^`]+)`",
-        r"(?<!\*)\*([^*\n]+)\*(?!\*)",
-        r"(?<!_)_([^_\n]+)_(?!_)",
-    ):
-        text = re.sub(pattern, r"\1", text)
-    return (
-        text.replace("\\*", "*")
-        .replace("\\_", "_")
-        .replace("\\`", "`")
-        .replace("\\[", "[")
-        .replace("\\]", "]")
-    )
+def _strip_ansi(text: str) -> str:
+    return _RE_COMPLETE_CSI.sub("", text)
 
 
 def _short_repr(value: Any, max_len: int = 40) -> str:
@@ -374,92 +344,25 @@ def _format_args(
     return s
 
 
-def _render_markdown_lines(text: str) -> list[_RenderedBlockLine]:
-    rendered: list[_RenderedBlockLine] = []
-    in_code_block = False
-
-    for raw_line in text.splitlines() or [""]:
-        fence_match = _RE_MARKDOWN_FENCE.match(raw_line)
-        if fence_match is not None:
-            if in_code_block:
-                in_code_block = False
-            else:
-                in_code_block = True
-                language = fence_match.group(1).strip()
-                label = f"[{language} code]" if language else "[code]"
-                rendered.append(_RenderedBlockLine(label, fg="cyan", bold=True))
-            continue
-
-        if in_code_block:
-            rendered.append(_RenderedBlockLine(raw_line, fg="cyan"))
-            continue
-
-        stripped = raw_line.strip()
-        if stripped == "":
-            rendered.append(_RenderedBlockLine(""))
-            continue
-
-        if _RE_MARKDOWN_HR.match(raw_line):
-            rendered.append(_RenderedBlockLine("─" * 16, fg="gray", dim=True))
-            continue
-
-        heading_match = _RE_MARKDOWN_HEADING.match(raw_line)
-        if heading_match is not None:
-            level = len(heading_match.group(1))
-            rendered.append(
-                _RenderedBlockLine(
-                    _render_inline_markdown(heading_match.group(2).strip()),
-                    fg="white" if level <= 2 else "cyan",
-                    bold=True,
-                )
-            )
-            continue
-
-        blockquote_match = _RE_MARKDOWN_BLOCKQUOTE.match(raw_line)
-        if blockquote_match is not None:
-            rendered.append(
-                _RenderedBlockLine(
-                    f"│ {_render_inline_markdown(blockquote_match.group(1).strip())}",
-                    fg="gray",
-                    dim=True,
-                )
-            )
-            continue
-
-        unordered_match = _RE_MARKDOWN_UL.match(raw_line)
-        if unordered_match is not None:
-            indent = "  " * (len(unordered_match.group(1).expandtabs(2)) // 2)
-            rendered.append(
-                _RenderedBlockLine(
-                    f"{indent}• {_render_inline_markdown(unordered_match.group(3).strip())}"
-                )
-            )
-            continue
-
-        ordered_match = _RE_MARKDOWN_OL.match(raw_line)
-        if ordered_match is not None:
-            indent = "  " * (len(ordered_match.group(1).expandtabs(2)) // 2)
-            rendered.append(
-                _RenderedBlockLine(
-                    f"{indent}{ordered_match.group(2)}. {_render_inline_markdown(ordered_match.group(3).strip())}"
-                )
-            )
-            continue
-
-        if _RE_MARKDOWN_TABLE_DIVIDER.match(raw_line):
-            continue
-
-        if stripped.startswith("|") and stripped.endswith("|"):
-            columns = [
-                _render_inline_markdown(part.strip())
-                for part in stripped.strip("|").split("|")
-            ]
-            rendered.append(_RenderedBlockLine(" | ".join(columns), fg="white"))
-            continue
-
-        rendered.append(_RenderedBlockLine(_render_inline_markdown(raw_line.rstrip())))
-
-    return rendered or [_RenderedBlockLine("")]
+def _render_markdown_lines(text: str, *, width: int) -> list[_RenderedBlockLine]:
+    buffer = StringIO()
+    console = Console(
+        file=buffer,
+        force_terminal=True,
+        color_system="standard",
+        width=max(1, width),
+        legacy_windows=False,
+    )
+    console.print(Markdown(text, hyperlinks=False), end="")
+    rendered = buffer.getvalue()
+    lines = rendered.splitlines() or [""]
+    return [
+        _RenderedBlockLine(
+            text=_strip_ansi(line).rstrip(),
+            styled_text=line,
+        )
+        for line in lines
+    ] or [_RenderedBlockLine("")]
 
 
 def _format_elapsed(nv: NodeView) -> str | None:
@@ -590,6 +493,7 @@ class _RenderedBlockLine:
     fg: str | None = None
     dim: bool = False
     bold: bool = False
+    styled_text: str | None = None
 
 
 @dataclass(frozen=True)
@@ -741,11 +645,13 @@ class ConsoleRender:
         self,
         key: str,
         text: str,
+        content_prefix: str,
     ) -> list[_RenderedBlockLine] | None:
         target = self._terminal_root_result_target_locked()
         if target is None or target.key != key:
             return None
-        return _render_markdown_lines(text)
+        width = max(1, self._cols - _visible_len(content_prefix))
+        return _render_markdown_lines(text, width=width)
 
     def copy_terminal_result(self) -> bool:
         success, _ = self.copy_terminal_result_with_feedback()
@@ -1527,6 +1433,14 @@ class ConsoleRender:
         anchors: tuple[str, ...] = (),
     ) -> None:
         for rendered_line in rendered_lines:
+            if rendered_line.styled_text is not None:
+                avail = max(20, self._cols - _visible_len(prefix))
+                styled_text = rendered_line.styled_text
+                if _visible_len(styled_text) > avail:
+                    styled_text = _crop_line(styled_text, avail)
+                lines.append(f"{prefix}{styled_text}")
+                infos.append(LineInfo(anchors=anchors))
+                continue
             self._append_content(
                 rendered_line.text,
                 prefix,
@@ -1904,6 +1818,7 @@ class ConsoleRender:
                     rendered_lines=self._rendered_root_result_lines_locked(
                         model_key,
                         part.text,
+                        content_prefix,
                     ),
                 )
                 continue
@@ -2022,6 +1937,7 @@ class ConsoleRender:
                 rendered_lines=self._rendered_root_result_lines_locked(
                     result_key,
                     str(nv.outputs),
+                    content_prefix,
                 ),
             )
         elif has_error_outcome:
@@ -2072,6 +1988,7 @@ class ConsoleRender:
                 rendered_lines=self._rendered_root_result_lines_locked(
                     result_key,
                     str(nv.outputs),
+                    content_prefix,
                 ),
             )
         elif _has_error(nv) or (nv.state is NodeState.Canceled and nv.exception is not None):
