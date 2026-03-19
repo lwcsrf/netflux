@@ -330,8 +330,8 @@ class BashSession:
         return path, BashSession._command_file_path(path)
 
     @staticmethod
-    def _timeout_hint_for_command(command: str) -> str:
-        # Keep this as a post-timeout heuristic only: a raw text scan is too imprecise
+    def _noexec_timeout_hint_for_command(command: str) -> str:
+        # Keep this as a failure-time heuristic only: a raw text scan is too imprecise
         # to block execution because these strings may legitimately appear inside heredocs,
         # generated script content, comments, or commands run in a child bash process. If found,
         # these may be the cause of the timeout, so we give the agent a fighting chance to try again.
@@ -339,8 +339,36 @@ class BashSession:
             return ""
         return (
             "\nEnsure you avoid 'set -n' / 'set -o noexec' in commands run in the session "
-            "(okay in scripts run via a separate bash process)."
+            "(okay in scripts run via a child bash process as the command)."
         )
+
+    @staticmethod
+    def _errexit_failure_hint_for_command(command: str) -> str:
+        # Keep this heuristic failure-only for the same reason as _noexec_timeout_hint_for_command():
+        # a raw text scan is not precise enough to reject commands up front.
+        if not re.search(
+            r"(^|[;\n(])\s*set\s+(?:-[A-Za-z]*e[A-Za-z]*|-o\s+errexit)\b",
+            command,
+            re.MULTILINE,
+        ):
+            return ""
+        return (
+            "\nThis command appears to use 'set -e' / 'set -o errexit', which is unsupported "
+            "in the persistent session and may have contributed to this failure. "
+            "Invoke a child 'bash' process on your script when you need errexit semantics."
+        )
+
+    @staticmethod
+    def _failure_hints_for_exception(command: str, exc: BashException) -> str:
+        hints: List[str] = []
+        if isinstance(exc, BashCommandTimeoutException):
+            noexec_hint = BashSession._noexec_timeout_hint_for_command(command)
+            if noexec_hint:
+                hints.append(noexec_hint)
+        errexit_hint = BashSession._errexit_failure_hint_for_command(command)
+        if errexit_hint:
+            hints.append(errexit_hint)
+        return "".join(hints)
 
     def _drain_until(self, token: str, timeout: float) -> bool:
         end = time.time() + timeout
@@ -363,7 +391,6 @@ class BashSession:
         timeout_sec: Optional[int],
         *,
         normalize_paths: Tuple[str, ...] = (),
-        timeout_hint: str = "",
     ) -> Tuple[str, int]:
         # Read until we see the sentinel; preserve arrival order (stdout+stderr interleaving).
         effective_timeout = self.DEFAULT_TIMEOUT_SEC if (timeout_sec is None) else float(timeout_sec)
@@ -456,7 +483,7 @@ class BashSession:
                 f"Command timed out after {int(effective_timeout)} seconds. "
                 f"The session has been marked as requiring restart. "
                 f"Invoke the tool again with restart=true to continue."
-                f"{timeout_hint}\n\n"
+                "\n\n"
                 f"--- partial output ---\n"
                 f"{partial}"
             )
@@ -510,22 +537,18 @@ class BashSession:
 
         token = uuid.uuid4().hex
         sentinel = f"__NETFLUX_BASH_DONE__{token}"
-        was_e_var = f"__nf_was_e_{token}"
         ec_var = f"__nf_ec_{token}"
-        timeout_hint = self._timeout_hint_for_command(command)
         try:
             script_path, bash_script_path = self._write_command_file(command)
         except Exception as e:
             raise BashException(f"Failed to stage bash command in a temp file: {e}") from e
 
         block = (
-            f"{was_e_var}=false; case $- in *e*) {was_e_var}=true;; esac\n"
             "builtin set +e\n"
             f"builtin source {shlex.quote(bash_script_path)} </dev/null\n"
             f"{ec_var}=$?\n"
-            "if [[ \"${" + was_e_var + ":-}\" == true ]]; then builtin set -e; fi\n"
             "builtin printf '\\n" + sentinel + " %d\\n' \"${" + ec_var + "}\" >&254\n"
-            "builtin unset -v " + was_e_var + " " + ec_var + " 2>/dev/null || builtin true\n"
+            "builtin unset -v " + ec_var + " 2>/dev/null || builtin true\n"
         )
         try:
             self._write(block)
@@ -533,9 +556,13 @@ class BashSession:
                 sentinel,
                 timeout_sec,
                 normalize_paths=(script_path, bash_script_path),
-                timeout_hint=timeout_hint,
             )
             return combined, exit_code, sentinel
+        except (BashCommandTimeoutException, BashSessionCrashedException) as e:
+            failure_hint = self._failure_hints_for_exception(command, e)
+            if failure_hint:
+                raise type(e)(f"{e}{failure_hint}") from e
+            raise
         except Exception as e:
             if isinstance(e, BashException):
                 raise
