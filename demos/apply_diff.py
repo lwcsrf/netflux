@@ -1,4 +1,5 @@
 import argparse
+import multiprocessing as mp
 import os
 import sys
 import tempfile
@@ -7,9 +8,9 @@ from typing import List, Optional, Tuple
 
 from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider
 from ..runtime import Runtime
-from ..viz import ConsoleRender
+from ..tui import ConsoleRender
 from .client_factory import CLIENT_FACTORIES
-from ..func_lib.apply_diff import apply_diff_patch
+from ..func_lib import apply_diff_patch
 
 
 def _write(path: Path, text: str) -> None:
@@ -256,11 +257,13 @@ def _run_applydiff(
             client_factories=CLIENT_FACTORIES,
         )
         ctx = runtime.get_ctx()
+        cancel_evt = mp.Event()
 
         node = ctx.invoke(
             apply_diff_patch,
             {"diff_content": patch_doc},
             provider=provider,
+            cancel_event=cancel_evt,
         )
 
         render = ConsoleRender(spinner_hz=10.0)
@@ -272,9 +275,6 @@ def _run_applydiff(
             result_text = str(node.result())
         except Exception as e:
             exc = e
-
-        # Final static frame
-        print(str(render.render(runtime.watch(node))))
 
         return node.state, result_text, exc
     finally:

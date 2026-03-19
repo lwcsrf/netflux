@@ -139,6 +139,14 @@ class TestRuntimeRegistration(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, f"Duplicate Function name '{shared_name}'"):
             Runtime([parent, conflicting], client_factories={Provider.Anthropic: lambda: None})
 
+    def test_invocable_functions_exposes_registered_functions(self) -> None:
+        child = _make_code_function("child")
+        parent = _make_code_function("parent", uses=[child])
+        sibling = _make_code_function("sibling")
+        runtime = Runtime([parent, sibling], client_factories={})
+
+        self.assertEqual(runtime.invocable_functions, (parent, sibling, child))
+
 
 class TestRuntimeInvocation(unittest.TestCase):
     def test_invoke_rejects_unregistered_function(self) -> None:

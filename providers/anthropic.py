@@ -96,11 +96,11 @@ from anthropic.types.tool_param import InputSchemaTyped
     * text editor
         * Ref: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/text-editor-tool
         * Specified without reference implementation.
-        * We implemented very robustly in `func_lib/text_editor.py`.
+        * We implemented very robustly in `func_lib/text_editor_func.py`.
     * bash tool
         * Ref: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/bash-tool
         * Specified without reference implementation.   
-        * We implemented in `func_lib/bash.py`.
+        * We implemented in `func_lib/bash_func.py`.
 
 * Strict structured outputs
     * should be achieved via tools (their arg schema is the output schema)

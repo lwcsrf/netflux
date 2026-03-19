@@ -15,10 +15,9 @@ from typing import Dict, List, Optional
 
 from ..core import AgentFunction, CodeFunction, FunctionArg, NodeState, Provider, RunContext, CancellationException
 from ..runtime import Runtime
-from ..viz import ConsoleRender
+from ..tui import ConsoleRender
 from .client_factory import CLIENT_FACTORIES
-from ..func_lib.text_editor import text_editor
-from ..func_lib.raise_exception import raise_exception
+from ..func_lib import raise_exception, text_editor
  
 
 ULTRATHINK_PROMPT = (
@@ -442,7 +441,7 @@ def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> Optional[str
         cancel_event=cancel_evt,
     )
 
-    render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+    render = ConsoleRender(spinner_hz=10.0)
 
     final_path: Optional[str] = None
     try:
@@ -457,8 +456,6 @@ def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> Optional[str
         final_path = str(node.result())
     except Exception:
         pass
-
-    print(str(render.render(runtime.watch(node))))
 
     if node.state == NodeState.Error:
         print(f"\nError: {node.exception}")

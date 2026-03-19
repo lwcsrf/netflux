@@ -14,7 +14,7 @@ from ..core import (
 )
 from ..runtime import Runtime
 from .client_factory import CLIENT_FACTORIES
-from ..viz import ConsoleRender
+from ..tui import ConsoleRender
 
 
 PUZZLE_SOLVER_SYSTEM_PROMPT = (
@@ -195,7 +195,7 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
     # Ensure the root node participates in cooperative cancellation chaining.
     node = ctx.invoke(INTERLEAVE_AGENT, {}, provider=provider, cancel_event=cancel_evt)
 
-    render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+    render = ConsoleRender(spinner_hz=10.0)
 
     final_result: Optional[Any] = None
     run_exception: Optional[Exception] = None
@@ -208,9 +208,6 @@ def run_interleave_experiment_tree(provider: Optional[Provider] = None):
         run_exception = e
     finally:
         cancel_evt.set()
-
-    # Final render to show final state.
-    print(str(render.render(runtime.watch(node))))
 
     if run_exception:
         print("\n--- Execution Exception ---\n")

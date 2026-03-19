@@ -43,7 +43,7 @@ class Runtime:
         *,
         client_factories: Mapping[Provider, Callable[[], Any]],
     ):
-        self._functions: List[Function] = list(specs)  # shallow copy
+        self._functions: List[Function] = []
         # Index functions by name; uniqueness enforced.
         self._fn_by_name: Dict[str, Function] = {}
         self._client_factories: Dict[Provider, Callable[[], Any]] = \
@@ -99,6 +99,11 @@ class Runtime:
         """Return a RunContext not tied to any specific Node
         (suitable for top-level Function invokes by users)."""
         return RunContext(runtime=self, node=None)
+
+    @property
+    def invocable_functions(self) -> tuple[Function, ...]:
+        """Return all registered Functions that may be invoked top-level."""
+        return tuple(self._functions)
 
     def list_toplevel_views(self) -> List[NodeView]:
         """Return a snapshot of the latest NodeViews for all top-level tasks."""

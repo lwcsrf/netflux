@@ -45,7 +45,7 @@ Everything in netflux is a `Function`. There are two concrete kinds:
 
 * **`CodeFunction`** — Deterministic Python code (your callable) with a declared signature. Think basic utilities, orchestrators, and agent decorators.
 
-  *Example utility:* `TextEditor` (`func_lib/text_editor.py`) provides file viewing and editing commands.
+  *Example utility:* `TextEditor` (`func_lib/text_editor_func.py`) provides file viewing and editing commands.
 
 * **`AgentFunction`** — An LLM‑backed function with a schema (arguments), a system prompt, and an initial user prompt template. Under the hood it runs an **agent loop** and can call other Functions in-between thinking. We casually say *“Agent”* to mean an instance of `AgentFunction`.
 
@@ -222,8 +222,8 @@ def _fix_bug_workflow(ctx: RunContext, *, root: str, error_message: str) -> str:
 
     return f"{summary}\nReport: {report_path}"
 
-# `CodeFunction`s are often just defined as instances, but sometimes it is convenient to define
-# them as subclasses of `CodeFunction` (see `func_lib/text_editor.py` example).
+# `CodeFunction`s are often just defined as instances of `CodeFunction`, but sometimes it is convenient to define
+# one as a subclass of `CodeFunction` and then instantiate the subclass (see `func_lib/text_editor_func.py` -> `text_editor` example).
 
 fix_bug_workflow = CodeFunction(
     name="fix_bug_workflow",
@@ -275,7 +275,7 @@ External consumers (e.g., your UI) do **not** read `Node` objects directly—tho
 A minimal **watch loop** facility is provided for event-driven UI and looks like this:
 
 ```python
-from netflux.core import NodeState
+from netflux import NodeState, TerminalNodeStates
 
 prev = 0
 while True:
@@ -291,16 +291,42 @@ while True:
 
 This ensures your UI only sees **consistent** views of the task tree.
 
-If you just want a pretty good interactive terminal viewer, use `ConsoleRender` included in the `viz` subpackage directly instead of writing your own watch loop:
+### Terminal UIs
+
+`tui` is an auxiliary convenience package rather than one of the project's golden packages. It mainly serves as a reference implementation demonstrating how the framework can be used to build an interactive agentic harness used from a terminal.
+
+> **Note:** Unlike `core`, `func_lib`, and `providers` (treated as "golden" packages and carefully architected), `tui` was mostly auto-generated on top of those cleaner abstractions and is not held to the same quality or maintainability bar. See `tui/SPEC.md` for the current UI contract.
+
+* **`TUI(runtime).run():`** a multi-pane terminal app that wraps a `Runtime`, lets you invoke `Function`s from that runtime as top-level invocations, and switch between launched root trees that they produce.
+* **`ConsoleRender.run(node):`** an interactive standalone single-tree viewer for a top-level `Node` you already invoked.
 
 ```python
-from netflux.viz import ConsoleRender
+from netflux import Runtime
+from netflux.tui import TUI
 
-render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+runtime = Runtime(
+    specs=[top_level_fn],
+    client_factories={...},
+)
+TUI(runtime).run()
+```
+
+If you already have a top-level `Node` and just want to inspect that one tree, use `ConsoleRender` directly instead of writing your own watch loop:
+
+```python
+import multiprocessing as mp
+
+from netflux.tui import ConsoleRender
+
+cancel_evt = mp.Event()
+node = ctx.invoke(top_level_fn, {...}, cancel_event=cancel_evt)
+render = ConsoleRender(spinner_hz=10.0)
 render.run(node)
 ```
 
 `ConsoleRender` gives you a collapsible execution tree, keyboard navigation, agent-to-agent jumping, expand/collapse-all actions, and a post-completion browser. It redraws when either: (1) a newer `NodeView` snapshot arrives, (2) the animation (e.g. spinner / timer) advances while work is still running, (3) when the user presses a bound key to navigate the tree, and (4) when the terminal size changes.
+
+For the standalone `ConsoleRender.run(node)` entrypoint, the top-level `Node` must have been invoked with a cooperative cancellation event. Pass `cancel_event=...` when invoking the top-level function.
 
 ---
 
@@ -377,12 +403,10 @@ Below we **reuse** the earlier definitions:
 
 ```python
 # --- Imports from netflux ---
-from netflux.core import NodeState
-from netflux.providers import Provider
-from netflux.runtime import Runtime
+from netflux import NodeState, Provider, Runtime, TerminalNodeStates
 
 # Built-ins
-from netflux.func_lib.text_editor import text_editor           # CodeFunction (leaf tool)
+from netflux.func_lib.text_editor_func import text_editor      # CodeFunction (leaf tool)
 from netflux.func_lib.apply_diff import apply_diff_patch       # AgentFunction (built-in)
 from netflux.func_lib.raise_exception import raise_exception   # CodeFunction (to raise AgentException)
 from netflux.func_lib.ensemble import Ensemble                 # CodeFunction decorator
@@ -512,6 +536,7 @@ This refined example shows:
         * `client_factories` are factory functions that return an instance of the client type expected by each provider.
             * Used in `AgentNode` provider-specific subtypes.
             * Support pluggable configuration and authentication mechanisms unique to the consumer's app.
+    * `runtime.invocable_functions -> tuple[Function, ...]`: read-only property exposing all registered `Function`s that may be invoked top-level, in the runtime's registration order (including transitively discovered dependencies).
     * `runtime.get_ctx() -> RunContext`: return a special `RunContext` that is outside the scope of any Task (`Function` invocation).
 * During registration, the runtime automatically performs a **BFS over each Function's `uses` graph** to discover and register all transitively referenced Functions. Consumers may seed with a partial set; transitives are added automatically. Duplicate names that point to different Function instances are rejected.
 * Responsible for creating trees of `Node`s that execute `Function`s.

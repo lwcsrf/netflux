@@ -5,7 +5,8 @@ from pathlib import Path
 from typing import Dict, Optional
 
 from ..core import RunContext, SessionBag, SessionScope
-from ..func_lib.bash import (
+from ..func_lib import bash_func as bash_mod
+from ..func_lib.bash_func import (
     Bash,
     BashSession,
     BashException,
@@ -786,7 +787,6 @@ class TestBashEdgeCases(unittest.TestCase):
 
     def test_start_wraps_popen_failure_with_underlying_exception_details(self) -> None:
         from unittest import mock
-        from ..func_lib import bash as bash_mod
 
         session = BashSession(41)
         with mock.patch.object(BashSession, "_find_bash", return_value="/bin/bash"), \
@@ -801,7 +801,6 @@ class TestBashEdgeCases(unittest.TestCase):
 
     def test_start_wraps_bootstrap_transport_failure_with_underlying_exception_details(self) -> None:
         from unittest import mock
-        from ..func_lib import bash as bash_mod
 
         session = BashSession(42)
         proc = mock.Mock()
@@ -860,7 +859,6 @@ class TestBashEdgeCases(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows-specific process tree termination")
     def test_windows_terminate_uses_ctrl_break_before_taskkill(self) -> None:
         from unittest import mock
-        from ..func_lib import bash as bash_mod
 
         session = BashSession(46)
         proc = mock.Mock()
@@ -883,7 +881,6 @@ class TestBashEdgeCases(unittest.TestCase):
     @unittest.skipUnless(os.name == "nt", "Windows-specific process tree termination")
     def test_windows_terminate_falls_back_to_taskkill_tree(self) -> None:
         from unittest import mock
-        from ..func_lib import bash as bash_mod
 
         session = BashSession(47)
         proc = mock.Mock()
@@ -913,7 +910,6 @@ class TestBashEdgeCases(unittest.TestCase):
 class TestBashDiscovery(unittest.TestCase):
     def test_find_bash_skips_windowsapps_stub(self) -> None:
         from unittest import mock
-        from ..func_lib import bash as bash_mod
 
         stub = r"C:\Users\andre\AppData\Local\Microsoft\WindowsApps\bash.exe"
         real = r"C:\Program Files\Git\bin\bash.exe"

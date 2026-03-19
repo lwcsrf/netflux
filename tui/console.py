@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """Interactive tree view for agent execution trees.
 
 An interactive renderer supporting:
@@ -19,21 +21,21 @@ Keyboard controls during live execution:
 Additional controls in post-completion browser:
     q / Esc     Exit browser
 """
-
-from __future__ import annotations
-
-import os
 import re
-import signal
 import shutil
+from io import StringIO
+import subprocess
 import sys
 import threading
 import time
-import ctypes
 from dataclasses import dataclass
 from multiprocessing.synchronize import Event
 from typing import Any, Iterator, Mapping
 
+from rich.console import Console
+from rich.markdown import Markdown
+
+from ._contracts import RightPaneInteractionContext, SelectedTreeStatus
 from ..core import (
     Function,
     ModelTextPart,
@@ -47,15 +49,6 @@ from ..core import (
     UserTextPart,
 )
 from ..providers import ModelNames, Provider
-
-if os.name != "nt":
-    import select
-    import termios
-    import tty
-else:  # pragma: no cover - runtime guarded use on non-POSIX terminals only
-    select = None
-    termios = None
-    tty = None
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # ANSI Constants
@@ -73,6 +66,7 @@ FG: dict[str, str] = {
     "magenta": "\x1b[35m",
     "cyan": "\x1b[36m",
     "white": "\x1b[37m",
+    "gray": "\x1b[38;5;250m",
     "orange": "\x1b[38;5;208m",
 }
 
@@ -114,57 +108,6 @@ _MOUSE_SCROLL_ROWS = 5
 _RE_COMPLETE_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _RE_TRAILING_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*$")
 
-_WIN_STD_OUTPUT_HANDLE = -11
-_WIN_STD_INPUT_HANDLE = -10
-_WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-_WIN_ENABLE_EXTENDED_FLAGS = 0x0080
-_WIN_ENABLE_QUICK_EDIT_MODE = 0x0040
-_WIN_ENABLE_MOUSE_INPUT = 0x0010
-_WIN_KEY_EVENT = 0x0001
-_WIN_MOUSE_EVENT = 0x0002
-_WIN_DOUBLE_CLICK = 0x0002
-_WIN_MOUSE_WHEELED = 0x0004
-_WIN_FROM_LEFT_1ST_BUTTON_PRESSED = 0x0001
-_WIN_RIGHTMOST_BUTTON_PRESSED = 0x0002
-_WIN_FROM_LEFT_2ND_BUTTON_PRESSED = 0x0004
-
-
-class _WinCoord(ctypes.Structure):
-    _fields_ = [("X", ctypes.c_short), ("Y", ctypes.c_short)]
-
-
-class _WinKeyEventRecord(ctypes.Structure):
-    _fields_ = [
-        ("bKeyDown", ctypes.c_int),
-        ("wRepeatCount", ctypes.c_ushort),
-        ("wVirtualKeyCode", ctypes.c_ushort),
-        ("wVirtualScanCode", ctypes.c_ushort),
-        ("uChar", ctypes.c_wchar),
-        ("dwControlKeyState", ctypes.c_uint),
-    ]
-
-
-class _WinMouseEventRecord(ctypes.Structure):
-    _fields_ = [
-        ("dwMousePosition", _WinCoord),
-        ("dwButtonState", ctypes.c_uint),
-        ("dwControlKeyState", ctypes.c_uint),
-        ("dwEventFlags", ctypes.c_uint),
-    ]
-
-
-class _WinEventUnion(ctypes.Union):
-    _fields_ = [
-        ("KeyEvent", _WinKeyEventRecord),
-        ("MouseEvent", _WinMouseEventRecord),
-        ("_padding", ctypes.c_byte * 16),
-    ]
-
-
-class _WinInputRecord(ctypes.Structure):
-    _fields_ = [("EventType", ctypes.c_ushort), ("Event", _WinEventUnion)]
-
-
 def _color(
     text: str,
     *,
@@ -183,6 +126,122 @@ def _color(
     if not codes:
         return text
     return "".join(codes) + text + RESET
+
+
+def _copy_text_to_clipboard_windows(text: str) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    CF_UNICODETEXT = 13
+    GMEM_MOVEABLE = 0x0002
+    GMEM_ZEROINIT = 0x0040
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+
+    kernel32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalUnlock.restype = wintypes.BOOL
+    kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+    kernel32.GlobalFree.restype = ctypes.c_void_p
+
+    user32.OpenClipboard.argtypes = [wintypes.HWND]
+    user32.OpenClipboard.restype = wintypes.BOOL
+    user32.CloseClipboard.argtypes = []
+    user32.CloseClipboard.restype = wintypes.BOOL
+    user32.EmptyClipboard.argtypes = []
+    user32.EmptyClipboard.restype = wintypes.BOOL
+    user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
+    user32.SetClipboardData.restype = ctypes.c_void_p
+
+    size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+    handle = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size)
+    if not handle:
+        return False
+
+    locked = kernel32.GlobalLock(handle)
+    if not locked:
+        kernel32.GlobalFree(handle)
+        return False
+
+    try:
+        buffer = ctypes.create_unicode_buffer(text)
+        ctypes.memmove(locked, ctypes.addressof(buffer), size)
+    finally:
+        kernel32.GlobalUnlock(handle)
+
+    for _ in range(20):
+        if user32.OpenClipboard(None):
+            break
+        time.sleep(0.01)
+    else:
+        kernel32.GlobalFree(handle)
+        return False
+
+    try:
+        if not user32.EmptyClipboard():
+            return False
+        if not user32.SetClipboardData(CF_UNICODETEXT, handle):
+            return False
+        handle = None
+        return True
+    finally:
+        user32.CloseClipboard()
+        if handle:
+            kernel32.GlobalFree(handle)
+
+
+def _linux_clipboard_commands() -> list[list[str]]:
+    commands: list[list[str]] = []
+    if shutil.which("wl-copy"):
+        commands.append(["wl-copy"])
+    if shutil.which("xclip"):
+        commands.append(["xclip", "-selection", "clipboard"])
+    if shutil.which("xsel"):
+        commands.append(["xsel", "--clipboard", "--input"])
+    return commands
+
+
+def _clipboard_copy_failure_message() -> str:
+    if sys.platform.startswith("win"):
+        return "Clipboard copy failed."
+    if sys.platform == "darwin":
+        if shutil.which("pbcopy") is None:
+            return "Clipboard unavailable. Ensure pbcopy is installed."
+        return "Clipboard copy failed."
+    if not _linux_clipboard_commands():
+        return "Clipboard unavailable. Install wl-copy, xclip, or xsel."
+    return "Clipboard copy failed."
+
+
+def _copy_text_to_clipboard(text: str) -> bool:
+    if sys.platform.startswith("win"):
+        return _copy_text_to_clipboard_windows(text)
+
+    commands: list[list[str]] = []
+
+    if sys.platform == "darwin":
+        commands.append(["pbcopy"])
+    else:
+        commands.extend(_linux_clipboard_commands())
+
+    for command in commands:
+        try:
+            subprocess.run(
+                command,
+                input=text,
+                text=True,
+                check=True,
+                capture_output=True,
+            )
+            return True
+        except (FileNotFoundError, OSError, subprocess.SubprocessError):
+            continue
+
+    return False
 
 
 def _style_block(text: str, *codes: str) -> str:
@@ -250,6 +309,10 @@ def _preview_text(text: str, max_len: int = 60) -> str:
     return stripped[: max_len - 1] + "…"
 
 
+def _strip_ansi(text: str) -> str:
+    return _RE_COMPLETE_CSI.sub("", text)
+
+
 def _short_repr(value: Any, max_len: int = 40) -> str:
     """Short string representation, truncated if needed."""
     try:
@@ -279,6 +342,27 @@ def _format_args(
     if len(s) > max_len:
         s = s[: max_len - 3] + "..."
     return s
+
+
+def _render_markdown_lines(text: str, *, width: int) -> list[_RenderedBlockLine]:
+    buffer = StringIO()
+    console = Console(
+        file=buffer,
+        force_terminal=True,
+        color_system="standard",
+        width=max(1, width),
+        legacy_windows=False,
+    )
+    console.print(Markdown(text, hyperlinks=False), end="")
+    rendered = buffer.getvalue()
+    lines = rendered.splitlines() or [""]
+    return [
+        _RenderedBlockLine(
+            text=_strip_ansi(line).rstrip(),
+            styled_text=line,
+        )
+        for line in lines
+    ] or [_RenderedBlockLine("")]
 
 
 def _format_elapsed(nv: NodeView) -> str | None:
@@ -404,10 +488,19 @@ class NodeRange:
 
 
 @dataclass(frozen=True)
-class MouseEvent:
-    x: int
-    y: int
-    button: str
+class _RenderedBlockLine:
+    text: str
+    fg: str | None = None
+    dim: bool = False
+    bold: bool = False
+    styled_text: str | None = None
+
+
+@dataclass(frozen=True)
+class _RootResultTarget:
+    key: str
+    display_text: str
+    copy_text: str
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -455,8 +548,6 @@ class ConsoleRender:
 
     Thread safety:
     - All mutable state is protected by `_lock`.
-    - `ConsoleRender.run(node)` owns the terminal session and manages both the
-      background watch/render loop and the foreground keyboard loop.
     - Navigation methods (`navigate_up`, `navigate_down`, `toggle_expanded`,
       `go_top`, `go_bottom`, `page_up`, `page_down`, `jump_prev_agent`,
       `jump_next_agent`, `collapse_enclosing_agent`, `expand_all_nodes`,
@@ -470,36 +561,25 @@ class ConsoleRender:
 
     Intended usage for a terminal UI:
     - Create `ConsoleRender(...)` and call `run(node)`.
-    - `run(node)` manages terminal ownership, the live watch/render loop,
-      keyboard handling, and the post-completion browser.
+    - `run(node)` delegates terminal ownership and event-loop orchestration to
+      the shared session driver, while `ConsoleRender` remains the single-tree
+      viewport renderer/controller.
     """
-
-    _console_lock = threading.Lock()
-    _console_ready = False
 
     def __init__(
         self,
         cancel_event: Event | None = None,
         *,
-        width: int | None = None,
         spinner_hz: float = 10.0,
         follow: bool = True,
     ) -> None:
         """Initialise the interactive tree renderer."""
-        self.width = width
         self.spinner_hz = max(1.0, float(spinner_hz))
         self._cancel_event = cancel_event
         self._last_view: NodeView | None = None
         self._root_id: int | None = None
         self._t0 = time.monotonic()
         self._lock = threading.Lock()
-        self._loop_wake = threading.Condition()
-        self._loop_pending_view: NodeView | None = None
-        self._loop_pending_redraw = False
-        self._loop_stop = False
-        self._sigint_handler_installed = False
-        self._exit_after_terminal = False
-        self._console_session_active = False
 
         # Navigation state
         self._cursor: int = 0
@@ -527,72 +607,87 @@ class ConsoleRender:
     def _is_collapsed(self, key: str, default: bool) -> bool:
         return self._collapse_overrides.get(key, default)
 
-    def request_redraw(self) -> None:
-        with self._lock:
-            self._signal_redraw_locked()
-
-    def _signal_redraw_locked(self) -> None:
-        with self._loop_wake:
-            self._loop_pending_redraw = True
-            self._loop_wake.notify()
-
-    def _stop_view_loop(self) -> None:
-        with self._loop_wake:
-            self._loop_stop = True
-            self._loop_wake.notify_all()
-
-    def _ui_driver(self, s: str) -> None:
-        if not self._console_session_active:
-            return
-        ConsoleRender.ui_driver(s)
-
-    def _request_cancel(self) -> bool:
-        if self._cancel_event is None:
-            return False
-        already_set = self._cancel_event.is_set()
-        self._cancel_event.set()
-        self._exit_after_terminal = True
-        with self._lock:
-            self._signal_redraw_locked()
-        return not already_set
-
-    def _install_sigint_handler(
-        self,
-        view_thread: threading.Thread,
-    ) -> signal.Handlers | None:
-        if self._cancel_event is None:
-            return None
-        if threading.current_thread() is not threading.main_thread():
+    def _terminal_root_result_target_locked(self) -> _RootResultTarget | None:
+        view = self._last_view
+        if view is None or view.state is not NodeState.Success:
             return None
 
-        previous_handler = signal.getsignal(signal.SIGINT)
+        if view.fn.is_agent():
+            for idx in range(len(view.transcript) - 1, -1, -1):
+                part = view.transcript[idx]
+                if isinstance(part, ModelTextPart):
+                    copy_text = str(view.outputs) if view.outputs is not None else part.text
+                    return _RootResultTarget(
+                        key=f"tp:{view.id}:{idx}:model",
+                        display_text=part.text,
+                        copy_text=copy_text,
+                    )
+            if view.outputs is None:
+                return None
+            rendered = str(view.outputs)
+            return _RootResultTarget(
+                key=f"ao:{view.id}",
+                display_text=rendered,
+                copy_text=rendered,
+            )
 
-        def _handle_sigint(signum: int, frame: Any) -> None:
-            del signum, frame
-            if view_thread.is_alive() and self._request_cancel():
-                return
-            self._stop_view_loop()
-            self._console_session_active = False
-            ConsoleRender.restore_console()
-            if callable(previous_handler):
-                previous_handler(signal.SIGINT, None)
-                return
-            if previous_handler == signal.SIG_IGN:
-                return
-            raise KeyboardInterrupt
+        if view.outputs is None:
+            return None
 
-        signal.signal(signal.SIGINT, _handle_sigint)
-        self._sigint_handler_installed = True
-        return previous_handler
+        rendered = str(view.outputs)
+        return _RootResultTarget(
+            key=f"cr:{view.id}",
+            display_text=rendered,
+            copy_text=rendered,
+        )
 
-    def _restore_sigint_handler(
+    def _rendered_root_result_lines_locked(
         self,
-        previous_handler: signal.Handlers | None,
-    ) -> None:
-        if not self._sigint_handler_installed:
-            return
-        signal.signal(signal.SIGINT, previous_handler)
-        self._sigint_handler_installed = False
+        key: str,
+        text: str,
+        content_prefix: str,
+    ) -> list[_RenderedBlockLine] | None:
+        target = self._terminal_root_result_target_locked()
+        if target is None or target.key != key:
+            return None
+        width = max(1, self._cols - _visible_len(content_prefix))
+        return _render_markdown_lines(text, width=width)
+
+    def copy_terminal_result(self) -> bool:
+        success, _ = self.copy_terminal_result_with_feedback()
+        return success
+
+    def copy_terminal_result_with_feedback(self) -> tuple[bool, str | None]:
+        with self._lock:
+            target = self._terminal_root_result_target_locked()
+        if target is None:
+            return False, None
+        if _copy_text_to_clipboard(target.copy_text):
+            return True, None
+        return False, _clipboard_copy_failure_message()
+
+    def focus_terminal_result(self) -> bool:
+        with self._lock:
+            target = self._terminal_root_result_target_locked()
+            if target is None:
+                return False
+
+            if self._root_id is not None:
+                self._collapse_overrides[f"n:{self._root_id}"] = False
+            self._collapse_overrides[target.key] = False
+            self._follow_mode = False
+            self._selected_key = None
+            self._selected_anchor = target.key
+            self._selected_anchor_occurrence = len(self._lines) + 1024
+
+            matches = [
+                idx
+                for idx, info in enumerate(self._line_infos)
+                if info.key == target.key or target.key in info.anchors
+            ]
+            if matches:
+                self._cursor = matches[-1]
+            return True
 
     # ── Navigation (all acquire lock) ─────────────────────────────────────
 
@@ -630,7 +725,6 @@ class ConsoleRender:
         max_pos = max(0, len(self._lines) - 1)
         self._cursor = max(0, min(new_cursor, max_pos))
         self._remember_selection()
-        self._signal_redraw_locked()
 
     def _navigate(self, new_cursor: int) -> None:
         self._set_cursor(new_cursor, disable_follow=True)
@@ -644,7 +738,6 @@ class ConsoleRender:
         current = self._is_collapsed(info.key, info.default_collapsed)
         self._collapse_overrides[info.key] = not current
         self._remember_selection()
-        self._signal_redraw_locked()
         return True
 
     def _toggle_expanded_locked(self) -> None:
@@ -794,7 +887,6 @@ class ConsoleRender:
                 return
             for key in self._iter_node_keys(self._last_view):
                 self._collapse_overrides[key] = False
-            self._signal_redraw_locked()
 
     def collapse_all_nodes(self) -> None:
         with self._lock:
@@ -819,32 +911,158 @@ class ConsoleRender:
 
     # ── Render state update and frame building ────────────────────────────
 
-    def render(self, view: NodeView | None) -> str:
-        """Render the current tree view to a string."""
+    def _adopt_root_view_locked(self, view: NodeView) -> None:
+        if self._root_id is not None and view.id != self._root_id:
+            self._collapse_overrides.clear()
+            self._cursor = 0
+            self._scroll_offset = 0
+            self._selected_key = None
+            self._selected_anchor = None
+            self._selected_anchor_occurrence = 0
+            self._follow_mode = True
+            self._lines = []
+            self._line_infos = []
+            self._node_ranges = []
+        self._root_id = view.id
+        self._last_view = view
+
+    def assign_view(self, view: NodeView | None) -> None:
         with self._lock:
-            return self._render_locked(view)
+            if view is None:
+                return
+            if (
+                self._last_view is not None
+                and view.id == self._last_view.id
+                and view.update_seqnum == self._last_view.update_seqnum
+            ):
+                return
+            self._adopt_root_view_locked(view)
 
-    def _render_locked(self, view: NodeView | None) -> str:
+    def set_cancel_event(self, cancel_event: Event | None) -> None:
+        with self._lock:
+            self._cancel_event = cancel_event
+
+    def cancel_event(self) -> Event | None:
+        with self._lock:
+            return self._cancel_event
+
+    def apply_action(self, action: str) -> None:
+        action_map = {
+            "move_up": self.navigate_up,
+            "move_down": self.navigate_down,
+            "page_up": self.page_up,
+            "page_down": self.page_down,
+            "toggle": self.toggle_expanded,
+            "go_top": self.go_top,
+            "go_bottom": self.go_bottom,
+            "next_agent": self.jump_next_agent,
+            "prev_agent": self.jump_prev_agent,
+            "collapse_agent": self.collapse_enclosing_agent,
+            "expand_all": self.expand_all_nodes,
+            "collapse_all": self.collapse_all_nodes,
+            "copy_result": self.copy_terminal_result,
+            "focus_result": self.focus_terminal_result,
+        }
+        handler = action_map.get(action)
+        if handler is None:
+            raise ValueError(f"Unknown ConsoleRender action: {action}")
+        handler()
+
+    def handle_mouse_event(self, x: int, y: int, *, button: str = "left") -> None:
+        self.handle_click(x, y, button=button)
+
+    def _selected_tree_status_locked(self) -> SelectedTreeStatus:
+        token_bill = {}
+        state = None
+        can_cancel = False
+        cancel_pending = False
+        if self._last_view is not None:
+            token_bill = self._last_view.total_tree_token_bill()
+            state = self._last_view.state
+            can_cancel = (
+                self._cancel_event is not None
+                and self._last_view.state not in _TERMINAL_STATES
+            )
+            cancel_pending = bool(self._cancel_event and self._cancel_event.is_set())
+
+        return SelectedTreeStatus(
+            cursor_line=(self._cursor + 1) if self._lines else 0,
+            total_lines=len(self._lines),
+            state=state,
+            cancel_pending=cancel_pending,
+            can_cancel=can_cancel,
+            token_bill=token_bill,
+        )
+
+    def selected_tree_status(self) -> SelectedTreeStatus:
+        with self._lock:
+            return self._selected_tree_status_locked()
+
+    def _right_pane_context_locked(self) -> RightPaneInteractionContext:
+        has_lines = bool(self._lines)
+        can_expand = any(info.expandable for info in self._line_infos)
+        can_jump = sum(1 for info in self._line_infos if info.is_agent_header) > 1
+        result_target = self._terminal_root_result_target_locked()
+        is_terminal = bool(
+            self._last_view and self._last_view.state in _TERMINAL_STATES
+        )
+        return RightPaneInteractionContext(
+            has_lines=has_lines,
+            can_expand_collapse=can_expand,
+            can_jump_agents=can_jump,
+            follow_mode=self._follow_mode,
+            is_terminal=is_terminal,
+            can_copy_root_result=result_target is not None,
+            can_focus_root_result=result_target is not None,
+        )
+
+    def right_pane_context(self) -> RightPaneInteractionContext:
+        with self._lock:
+            return self._right_pane_context_locked()
+
+    def render_body(
+        self,
+        *,
+        width: int,
+        height: int,
+        view: NodeView | None = None,
+        tick: int | None = None,
+    ) -> str:
+        with self._lock:
+            return self._render_locked(
+                view,
+                width=width,
+                height=height,
+                tick=tick,
+            )
+
+    def _render_locked(
+        self,
+        view: NodeView | None,
+        *,
+        width: int,
+        height: int,
+        tick: int | None = None,
+    ) -> str:
         if view is not None:
-            if self._root_id is not None and view.id != self._root_id:
-                self._collapse_overrides.clear()
-                self._cursor = 0
-                self._scroll_offset = 0
-                self._selected_key = None
-                self._selected_anchor = None
-                self._selected_anchor_occurrence = 0
-                self._follow_mode = True
-            self._root_id = view.id
-            self._last_view = view
+            self._adopt_root_view_locked(view)
         if self._last_view is None:
-            return "(waiting for data...)"
+            cols = max(1, width)
+            rows = max(1, height)
+            self._cols = cols
+            self._tree_rows = rows
+            placeholder = _crop_line("(waiting for data...)", cols)
+            if _visible_len(placeholder) < cols:
+                placeholder = placeholder + " " * (cols - _visible_len(placeholder))
+            output = [placeholder]
+            while len(output) < rows:
+                output.append(" " * cols)
+            return "\n".join(output)
 
-        tick = self._tick()
+        tick = self._tick() if tick is None else tick
         cancel_pending = bool(self._cancel_event and self._cancel_event.is_set())
 
-        sz = shutil.get_terminal_size(fallback=(80, 24))
-        self._cols = max(1, self.width if self.width is not None else sz.columns)
-        self._tree_rows = max(1, sz.lines - 1)
+        self._cols = max(1, width)
 
         # Build flat line list from tree
         lines: list[str] = []
@@ -898,7 +1116,10 @@ class ConsoleRender:
         self._cursor = max(0, min(self._cursor, max_pos))
         self._remember_selection()
 
-        return self._render_viewport()
+        return self._render_viewport(
+            rows=height,
+            cols=self._cols,
+        )
 
     # ── Tree building (recursive) ─────────────────────────────────────────
 
@@ -1202,6 +1423,35 @@ class ConsoleRender:
             )
             infos.append(LineInfo(anchors=anchors))
 
+    def _emit_rendered_block(
+        self,
+        rendered_lines: list[_RenderedBlockLine],
+        prefix: str,
+        lines: list[str],
+        infos: list[LineInfo],
+        *,
+        anchors: tuple[str, ...] = (),
+    ) -> None:
+        for rendered_line in rendered_lines:
+            if rendered_line.styled_text is not None:
+                avail = max(20, self._cols - _visible_len(prefix))
+                styled_text = rendered_line.styled_text
+                if _visible_len(styled_text) > avail:
+                    styled_text = _crop_line(styled_text, avail)
+                lines.append(f"{prefix}{styled_text}")
+                infos.append(LineInfo(anchors=anchors))
+                continue
+            self._append_content(
+                rendered_line.text,
+                prefix,
+                lines,
+                infos,
+                fg=rendered_line.fg,
+                dim=rendered_line.dim,
+                bold=rendered_line.bold,
+                anchors=anchors,
+            )
+
     def _emit_kv_pairs(
         self,
         inputs: dict[str, Any],
@@ -1248,6 +1498,22 @@ class ConsoleRender:
         max_len = max(20, self._cols - _visible_len(header_prefix) - len(header_plain) - 4)
         return _preview_text(text, max_len)
 
+    def _preview_for_rendered_lines(
+        self,
+        rendered_lines: list[_RenderedBlockLine],
+        header_prefix: str,
+        header_plain: str,
+    ) -> str:
+        for rendered_line in rendered_lines:
+            preview = self._preview_for_header(
+                rendered_line.text,
+                header_prefix,
+                header_plain,
+            )
+            if preview:
+                return preview
+        return ""
+
     def _emit_text_part(
         self,
         *,
@@ -1261,6 +1527,7 @@ class ConsoleRender:
         infos: list[LineInfo],
         fg: str | None = None,
         dim: bool = False,
+        rendered_lines: list[_RenderedBlockLine] | None = None,
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
@@ -1268,7 +1535,15 @@ class ConsoleRender:
         header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
         label = f"{detail_prefix}{_color(header_plain, fg=fg, dim=dim)}"
         if collapsed:
-            preview = self._preview_for_header(text, detail_prefix, header_plain)
+            preview = (
+                self._preview_for_rendered_lines(
+                    rendered_lines,
+                    detail_prefix,
+                    header_plain,
+                )
+                if rendered_lines is not None
+                else self._preview_for_header(text, detail_prefix, header_plain)
+            )
             if preview:
                 label += f" {_color(preview, dim=True)}"
         lines.append(label)
@@ -1282,16 +1557,25 @@ class ConsoleRender:
             )
         )
         if not collapsed:
-            block = text.splitlines() or [""]
-            self._emit_content_block(
-                block,
-                content_prefix,
-                lines,
-                infos,
-                max_lines=None,
-                dim=True,
-                anchors=(key,),
-            )
+            if rendered_lines is None:
+                block = text.splitlines() or [""]
+                self._emit_content_block(
+                    block,
+                    content_prefix,
+                    lines,
+                    infos,
+                    max_lines=None,
+                    dim=True,
+                    anchors=(key,),
+                )
+            else:
+                self._emit_rendered_block(
+                    rendered_lines,
+                    content_prefix,
+                    lines,
+                    infos,
+                    anchors=(key,),
+                )
 
     def _emit_value_part(
         self,
@@ -1305,6 +1589,7 @@ class ConsoleRender:
         lines: list[str],
         infos: list[LineInfo],
         fg: str | None = None,
+        rendered_lines: list[_RenderedBlockLine] | None = None,
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
@@ -1312,7 +1597,15 @@ class ConsoleRender:
         header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
         line = f"{detail_prefix}{_color(header_plain, fg=fg)}"
         if collapsed:
-            preview = self._preview_for_header(text, detail_prefix, header_plain)
+            preview = (
+                self._preview_for_rendered_lines(
+                    rendered_lines,
+                    detail_prefix,
+                    header_plain,
+                )
+                if rendered_lines is not None
+                else self._preview_for_header(text, detail_prefix, header_plain)
+            )
             if preview:
                 line += f" {_color(preview, dim=True)}"
         lines.append(line)
@@ -1326,15 +1619,24 @@ class ConsoleRender:
             )
         )
         if not collapsed:
-            self._emit_content_block(
-                text.splitlines() or [""],
-                content_prefix,
-                lines,
-                infos,
-                max_lines=None,
-                dim=True,
-                anchors=(key,),
-            )
+            if rendered_lines is None:
+                self._emit_content_block(
+                    text.splitlines() or [""],
+                    content_prefix,
+                    lines,
+                    infos,
+                    max_lines=None,
+                    dim=True,
+                    anchors=(key,),
+                )
+            else:
+                self._emit_rendered_block(
+                    rendered_lines,
+                    content_prefix,
+                    lines,
+                    infos,
+                    anchors=(key,),
+                )
 
     def _emit_synthetic_function_row(
         self,
@@ -1502,8 +1804,9 @@ class ConsoleRender:
             if kind == "model":
                 part = payload
                 assert isinstance(part, ModelTextPart)
+                model_key = f"tp:{nv.id}:{tx_idx}:model"
                 self._emit_text_part(
-                    key=f"tp:{nv.id}:{tx_idx}:model",
+                    key=model_key,
                     title="result",
                     glyph=RESULT_GLYPH,
                     text=part.text,
@@ -1512,6 +1815,11 @@ class ConsoleRender:
                     lines=lines,
                     infos=infos,
                     fg="green",
+                    rendered_lines=self._rendered_root_result_lines_locked(
+                        model_key,
+                        part.text,
+                        content_prefix,
+                    ),
                 )
                 continue
 
@@ -1615,8 +1923,9 @@ class ConsoleRender:
             )
 
         if _has_output(nv) and not has_model_text:
+            result_key = f"ao:{nv.id}"
             self._emit_text_part(
-                key=f"ao:{nv.id}",
+                key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
                 text=str(nv.outputs),
@@ -1625,6 +1934,11 @@ class ConsoleRender:
                 lines=lines,
                 infos=infos,
                 fg="green",
+                rendered_lines=self._rendered_root_result_lines_locked(
+                    result_key,
+                    str(nv.outputs),
+                    content_prefix,
+                ),
             )
         elif has_error_outcome:
             self._emit_error_block(
@@ -1660,8 +1974,9 @@ class ConsoleRender:
                 )
 
         if _has_output(nv):
+            result_key = f"cr:{nv.id}"
             self._emit_value_part(
-                key=f"cr:{nv.id}",
+                key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
                 text=str(nv.outputs),
@@ -1670,6 +1985,11 @@ class ConsoleRender:
                 lines=lines,
                 infos=infos,
                 fg="green",
+                rendered_lines=self._rendered_root_result_lines_locked(
+                    result_key,
+                    str(nv.outputs),
+                    content_prefix,
+                ),
             )
         elif _has_error(nv) or (nv.state is NodeState.Canceled and nv.exception is not None):
             self._emit_error_block(
@@ -1836,11 +2156,15 @@ class ConsoleRender:
 
     # ── Viewport rendering ────────────────────────────────────────────────
 
-    def _render_viewport(self) -> str:
-        sz = shutil.get_terminal_size(fallback=(80, 24))
-        rows = max(1, sz.lines)
-        cols = max(1, self.width if self.width is not None else sz.columns)
-        tree_rows = max(1, rows - 1)
+    def _render_viewport(
+        self,
+        *,
+        rows: int,
+        cols: int,
+    ) -> str:
+        rows = max(1, rows)
+        cols = max(1, cols)
+        tree_rows = max(1, rows)
         self._tree_rows = tree_rows
 
         # Adjust scroll to keep cursor visible
@@ -1853,113 +2177,19 @@ class ConsoleRender:
         output: list[str] = []
         end = min(self._scroll_offset + tree_rows, len(self._lines))
         for i in range(self._scroll_offset, end):
-            line = _crop_line(self._lines[i], cols - 1)
+            line = _crop_line(self._lines[i], cols)
             if i == self._cursor:
-                line = _highlight_line(line, cols - 1)
-            output.append(f"{line}\x1b[K")
+                line = _highlight_line(line, cols)
+            if _visible_len(line) < cols:
+                line = line + " " * (cols - _visible_len(line))
+            output.append(line)
 
         # Pad to fill viewport
         while len(output) < tree_rows:
-            output.append("\x1b[K")
-
-        # Status bar
-        output.append(f"{self._status_bar(cols)}\x1b[K")
+            output.append(" " * cols)
 
         return "\n".join(output)
 
-    def _status_bar(self, cols: int) -> str:
-        pos = f"{self._cursor + 1}/{len(self._lines)}"
-
-        state_text = ""
-        if self._last_view:
-            s = self._last_view.state
-            if s is NodeState.Running:
-                tick = self._tick()
-                frame = _SPINNER_FRAMES[tick % len(_SPINNER_FRAMES)]
-                state_text = _color(f"{frame} Running", fg="cyan")
-            elif s is NodeState.Success:
-                state_text = _color("✔ Complete", fg="green")
-            elif s is NodeState.Error:
-                state_text = _color("✖ Error", fg="red")
-            elif s is NodeState.Canceled:
-                state_text = _color("⏹ Canceled", fg="yellow")
-
-        can_cancel = (
-            self._cancel_event is not None
-            and self._last_view is not None
-            and self._last_view.state not in _TERMINAL_STATES
-        )
-        is_terminal = self._last_view and self._last_view.state in _TERMINAL_STATES
-
-        quit_hint = "  q:quit" if is_terminal else ""
-        cancel_hint = "  ^C:cancel" if can_cancel else ""
-        status_text = pos if not state_text else f"{pos}  {state_text}"
-        token_text = ""
-        if self._last_view is not None:
-            token_text = self._format_total_token_bill(
-                self._last_view.total_tree_token_bill()
-            )
-
-        shortcut_variants = [
-            "↑↓/jk:move  ␣:toggle  PgUp/PgDn:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
-            "↑↓/jk:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
-            "jk/↑↓:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
-            "jk:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  g/G:top/btm  E/C:all",
-            "jk:move  ␣:toggle  Pg:page  n/N:next/prev  c:agent  E/C:all",
-            "jk ␣ Pg n/N c g/G E/C",
-            "jk ␣ Pg n/N c E/C",
-            "jk ␣ n/N c E/C",
-            "jk ␣ n/N",
-        ]
-
-        status_raw = f" {status_text} "
-        token_raw = f" {token_text} " if token_text else ""
-
-        status_len = _visible_len(status_raw)
-        token_len = _visible_len(token_raw)
-        if status_len + token_len > cols:
-            remaining = max(0, cols - status_len)
-            if remaining <= 0:
-                status_raw = _crop_line(status_raw, cols)
-                token_raw = ""
-            elif token_raw:
-                token_raw = _crop_line(token_raw, remaining) if remaining >= 8 else ""
-
-        right_len = _visible_len(status_raw) + _visible_len(token_raw)
-        left_budget = max(0, cols - right_len)
-        left_text_budget = max(0, left_budget - 1)
-
-        left = f"{shortcut_variants[-1]}{cancel_hint}{quit_hint}"
-        for candidate in shortcut_variants:
-            candidate_left = f"{candidate}{cancel_hint}{quit_hint}"
-            if _visible_len(candidate_left) <= left_text_budget:
-                left = candidate_left
-                break
-
-        if _visible_len(left) > left_text_budget:
-            if left_text_budget <= 1:
-                left = ""
-            elif left_text_budget == 2:
-                left = "…"
-            else:
-                left = left[: left_text_budget - 1] + "…"
-
-        left_raw = ""
-        if left_budget > 0:
-            left_raw = f" {left}"
-            vis_len = _visible_len(left_raw)
-            if vis_len < left_budget:
-                left_raw = left_raw + " " * (left_budget - vis_len)
-            elif vis_len > left_budget:
-                left_raw = _crop_line(left_raw, left_budget)
-
-        segments: list[str] = []
-        if left_raw:
-            segments.append(_style_block(left_raw, FG["white"], BG_STATUS_BAR))
-        segments.append(_style_block(status_raw, BOLD, FG["white"], BG_STATUS_STATE))
-        if token_raw:
-            segments.append(_style_block(token_raw, BOLD, FG["white"], BG_STATUS_TOKENS))
-        return "".join(segments)
 
     def _tick(self) -> int:
         return int((time.monotonic() - self._t0) * self.spinner_hz)
@@ -1969,517 +2199,15 @@ class ConsoleRender:
         node: Node,
     ) -> None:
         """Run the standard interactive console session for *node*."""
-        self._exit_after_terminal = False
-        self._console_session_active = True
-        self.pre_console()
-        view_thread = self._start_view_thread(node)
-        try:
-            self.interact(view_thread)
-        finally:
-            self._stop_view_loop()
-            if view_thread.is_alive():
-                view_thread.join(timeout=1.0)
-            self._console_session_active = False
-            self.restore_console()
+        from ._controllers import SingleTreeConsoleController
+        from ._driver import ConsoleSessionDriver
 
-    def _start_view_thread(self, node: Node) -> threading.Thread:
-        tick_interval = 1.0 / self.spinner_hz
-
-        with self._loop_wake:
-            self._loop_stop = False
-            self._loop_pending_view = None
-            self._loop_pending_redraw = True
-
-        def _watch_loop() -> None:
-            prev_seq = 0
-            while True:
-                with self._loop_wake:
-                    if self._loop_stop:
-                        return
-                view = node.watch(as_of_seq=prev_seq, timeout=0.1)
-                if view is None:
-                    continue
-                prev_seq = view.update_seqnum
-                with self._loop_wake:
-                    self._loop_pending_view = view
-                    self._loop_wake.notify()
-                if view.state in _TERMINAL_STATES:
-                    return
-
-        def _loop() -> None:
-            last_view: NodeView | None = None
-            next_at = time.monotonic()
-            watch_thread = threading.Thread(
-                target=_watch_loop,
-                name="netflux-view-watch",
-                daemon=True,
+        if node.cancel_event is None:
+            raise ValueError(
+                "ConsoleRender.run(node) requires the node to have a cancel_event. "
+                "Pass cancel_event=... when invoking the top-level function."
             )
-            watch_thread.start()
-            try:
-                while True:
-                    current = last_view
-                    timeout: float | None = None
-                    if current is None or current.state not in _TERMINAL_STATES:
-                        timeout = max(0.0, next_at - time.monotonic())
 
-                    with self._loop_wake:
-                        if self._loop_pending_view is None and not self._loop_pending_redraw:
-                            self._loop_wake.wait(timeout)
-                        if self._loop_stop:
-                            break
-                        view = self._loop_pending_view
-                        self._loop_pending_view = None
-                        self._loop_pending_redraw = False
-
-                    payload = self.render(view)
-                    self._ui_driver(payload)
-
-                    if view is not None:
-                        last_view = view
-
-                    current = view if view is not None else last_view
-                    if current is not None and current.state in _TERMINAL_STATES:
-                        break
-
-                    now = time.monotonic()
-                    if next_at <= now:
-                        next_at = now + tick_interval
-            finally:
-                with self._loop_wake:
-                    self._loop_stop = True
-                    self._loop_wake.notify_all()
-
-        view_thread = threading.Thread(
-            target=_loop,
-            name="netflux-view-loop",
-            daemon=True,
-        )
-        view_thread.start()
-        return view_thread
-
-    def interact(self, view_thread: threading.Thread) -> None:
-        """
-        Handle live keyboard interaction for *view_thread* and keep the
-        completed tree open until the user quits.
-        """
-        self.pre_console()
-        previous_sigint_handler = self._install_sigint_handler(view_thread)
-        try:
-            if not sys.stdin.isatty():
-                self._wait_non_interactive(view_thread)
-                return
-            if os.name == "nt":
-                self._interactive_loop_windows(view_thread)
-            else:
-                self._interactive_loop_posix(view_thread)
-        finally:
-            self._restore_sigint_handler(previous_sigint_handler)
-
-    def _wait_non_interactive(self, view_thread: threading.Thread) -> None:
-        while view_thread.is_alive():
-            try:
-                view_thread.join(timeout=0.1)
-            except KeyboardInterrupt:
-                if self._cancel_event is not None and not self._sigint_handler_installed:
-                    self._request_cancel()
-                    continue
-                raise
-
-    def _interactive_loop_windows(self, view_thread: threading.Thread) -> None:
-        while view_thread.is_alive():
-            try:
-                event = _read_key_windows(timeout=0.1)
-            except KeyboardInterrupt:
-                if self._cancel_event is not None and not self._sigint_handler_installed:
-                    self._request_cancel()
-                    continue
-                raise
-            if event is None:
-                continue
-            _handle_input_event(event, self, allow_quit=False)
-        if self._exit_after_terminal:
-            return
-        self._browse_until_quit_windows()
-
-    def _interactive_loop_posix(self, view_thread: threading.Thread) -> None:
-        if termios is None or tty is None:
-            self._wait_non_interactive(view_thread)
-            return
-
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while view_thread.is_alive():
-                try:
-                    event = _read_key(fd, timeout=0.1)
-                except KeyboardInterrupt:
-                    if self._cancel_event is not None and not self._sigint_handler_installed:
-                        self._request_cancel()
-                        continue
-                    raise
-                if event is None:
-                    continue
-                _handle_input_event(event, self, allow_quit=False)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-        if self._exit_after_terminal:
-            return
-        self._browse_until_quit_posix()
-
-    def _browse_until_quit_windows(self) -> None:
-        self._ui_driver(self.render(None))
-        last_size = _terminal_size_token()
-        while True:
-            try:
-                event = _read_key_windows(timeout=0.1)
-            except KeyboardInterrupt:
-                return
-            if event is not None:
-                should_exit = _handle_input_event(event, self, allow_quit=True)
-                self._ui_driver(self.render(None))
-                last_size = _terminal_size_token()
-                if should_exit:
-                    return
-                continue
-            size = _terminal_size_token()
-            if size != last_size:
-                last_size = size
-                self._ui_driver(self.render(None))
-
-    def _browse_until_quit_posix(self) -> None:
-        if termios is None or tty is None:
-            return
-
-        self._ui_driver(self.render(None))
-        last_size = _terminal_size_token()
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
-            tty.setcbreak(fd)
-            while True:
-                try:
-                    event = _read_key(fd, timeout=0.1)
-                except KeyboardInterrupt:
-                    return
-                if event is not None:
-                    should_exit = _handle_input_event(event, self, allow_quit=True)
-                    self._ui_driver(self.render(None))
-                    last_size = _terminal_size_token()
-                    if should_exit:
-                        return
-                    continue
-                size = _terminal_size_token()
-                if size != last_size:
-                    last_size = size
-                    self._ui_driver(self.render(None))
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
-
-    # ── Static terminal management ────────────────────────────────────────
-
-    @staticmethod
-    def pre_console() -> None:
-        """Enter alt screen, hide cursor, disable wrap, clear scrollback."""
-        if not sys.stdout.isatty():
-            return
-        with ConsoleRender._console_lock:
-            if ConsoleRender._console_ready:
-                return
-            _enable_vt_if_windows()
-            _configure_windows_console_input(enable_mouse=True)
-            sys.stdout.write(
-                "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J"
-                "\x1b[?1000h\x1b[?1006h"
-            )
-            sys.stdout.flush()
-            ConsoleRender._console_ready = True
-
-    @staticmethod
-    def restore_console() -> None:
-        """Show cursor, re-enable wrap, leave alt screen."""
-        if not sys.stdout.isatty():
-            return
-        with ConsoleRender._console_lock:
-            if not ConsoleRender._console_ready:
-                return
-            _configure_windows_console_input(enable_mouse=False)
-            sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?7h\x1b[?1049l")
-            sys.stdout.flush()
-            ConsoleRender._console_ready = False
-
-    @staticmethod
-    def ui_driver(s: str) -> None:
-        """Home the cursor and write the rendered frame."""
-        if not sys.stdout.isatty():
-            return
-        ConsoleRender.pre_console()
-        sys.stdout.write("\x1b[H")
-        sys.stdout.write(s)
-        sys.stdout.flush()
-
-
-def _terminal_size_token() -> tuple[int, int]:
-    sz = shutil.get_terminal_size(fallback=(80, 24))
-    return (sz.columns, sz.lines)
-
-
-def _enable_vt_if_windows() -> None:
-    if os.name != "nt":
-        return
-
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = kernel32.GetStdHandle(_WIN_STD_OUTPUT_HANDLE)
-    mode = ctypes.c_uint()
-    if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-        kernel32.SetConsoleMode(handle, mode.value | _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING)
-
-
-_WINDOWS_INPUT_MODE_SAVED: int | None = None
-
-
-def _configure_windows_console_input(*, enable_mouse: bool) -> None:
-    global _WINDOWS_INPUT_MODE_SAVED
-
-    if os.name != "nt":
-        return
-
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
-    mode = ctypes.c_uint()
-    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
-        return
-
-    if enable_mouse:
-        if _WINDOWS_INPUT_MODE_SAVED is None:
-            _WINDOWS_INPUT_MODE_SAVED = mode.value
-        new_mode = mode.value | _WIN_ENABLE_EXTENDED_FLAGS | _WIN_ENABLE_MOUSE_INPUT
-        new_mode &= ~_WIN_ENABLE_QUICK_EDIT_MODE
-        kernel32.SetConsoleMode(handle, new_mode)
-        return
-
-    if _WINDOWS_INPUT_MODE_SAVED is not None:
-        kernel32.SetConsoleMode(handle, _WINDOWS_INPUT_MODE_SAVED)
-        _WINDOWS_INPUT_MODE_SAVED = None
-
-
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-# Keyboard / Mouse Input
-# ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-
-def _read_key(fd: int, timeout: float = 0.1) -> str | MouseEvent | None:
-    """Read a keypress or mouse event from *fd*."""
-    if select is None:
-        return None
-    try:
-        r, _, _ = select.select([fd], [], [], timeout)
-    except (InterruptedError, OSError):
-        return None
-
-    if not r:
-        return None
-
-    raw = os.read(fd, 1)
-    if not raw:
-        return None
-    ch = raw.decode("utf-8", errors="ignore")
-
-    if ch == "\x1b":
-        seq = ""
-        while True:
-            try:
-                ready, _, _ = select.select([fd], [], [], 0.05)
-            except (InterruptedError, OSError):
-                return "escape" if not seq else None
-            if not ready:
-                return "escape" if not seq else None
-            piece = os.read(fd, 1).decode("utf-8", errors="ignore")
-            if not piece:
-                return "escape" if not seq else None
-            seq += piece
-            if piece.isalpha() or piece in ("~", "m"):
-                break
-
-        if seq == "[A":
-            return "up"
-        if seq == "[B":
-            return "down"
-        if seq == "[5~":
-            return "page_up"
-        if seq == "[6~":
-            return "page_down"
-        if seq.startswith("[<") and seq[-1] in ("M", "m"):
-            try:
-                cb_s, cx_s, cy_s = seq[2:-1].split(";")
-                cb = int(cb_s)
-                cx = int(cx_s)
-                cy = int(cy_s)
-            except (TypeError, ValueError):
-                return None
-            x = max(0, cx - 1)
-            y = max(0, cy - 1)
-            if cb & 64:
-                if cb & 1:
-                    return MouseEvent(x=x, y=y, button="wheel_down")
-                return MouseEvent(x=x, y=y, button="wheel_up")
-            if seq[-1] == "m" or (cb & 32):
-                return None
-            button_code = cb & 3
-            if button_code == 0:
-                return MouseEvent(x=x, y=y, button="left")
-            if button_code == 1:
-                return MouseEvent(x=x, y=y, button="middle")
-            if button_code == 2:
-                return MouseEvent(x=x, y=y, button="right")
-        return None
-
-    return ch
-
-
-def _decode_windows_mouse_event(event: _WinMouseEventRecord) -> MouseEvent | None:
-    x = max(0, int(event.dwMousePosition.X))
-    y = max(0, int(event.dwMousePosition.Y))
-    if event.dwEventFlags == _WIN_MOUSE_WHEELED:
-        delta = ctypes.c_short((event.dwButtonState >> 16) & 0xFFFF).value
-        return MouseEvent(
-            x=x,
-            y=y,
-            button="wheel_up" if delta > 0 else "wheel_down",
-        )
-    # Treat double-click as a second press; ignore other flagged mouse events.
-    if event.dwEventFlags not in (0, _WIN_DOUBLE_CLICK):
-        return None
-    if event.dwButtonState & _WIN_FROM_LEFT_1ST_BUTTON_PRESSED:
-        return MouseEvent(x=x, y=y, button="left")
-    if event.dwButtonState & _WIN_RIGHTMOST_BUTTON_PRESSED:
-        return MouseEvent(x=x, y=y, button="right")
-    if event.dwButtonState & _WIN_FROM_LEFT_2ND_BUTTON_PRESSED:
-        return MouseEvent(x=x, y=y, button="middle")
-    return None
-
-
-def _read_key_windows(timeout: float = 0.1) -> str | MouseEvent | None:
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        record = _WinInputRecord()
-        count = ctypes.c_uint()
-        if not kernel32.PeekConsoleInputW(handle, ctypes.byref(record), 1, ctypes.byref(count)):
-            time.sleep(0.01)
-            continue
-        if count.value == 0:
-            time.sleep(0.01)
-            continue
-        if not kernel32.ReadConsoleInputW(handle, ctypes.byref(record), 1, ctypes.byref(count)):
-            time.sleep(0.01)
-            continue
-        if record.EventType == _WIN_KEY_EVENT:
-            event = record.Event.KeyEvent
-            if not event.bKeyDown:
-                continue
-            if event.uChar == "\x03":
-                raise KeyboardInterrupt
-            vk = event.wVirtualKeyCode
-            if vk == 0x26:
-                return "up"
-            if vk == 0x28:
-                return "down"
-            if vk == 0x21:
-                return "page_up"
-            if vk == 0x22:
-                return "page_down"
-            if vk == 0x1B:
-                return "escape"
-            if vk == 0x0D:
-                return "\r"
-            if event.uChar not in ("", "\x00"):
-                return event.uChar
-            continue
-        if record.EventType == _WIN_MOUSE_EVENT:
-            decoded = _decode_windows_mouse_event(record.Event.MouseEvent)
-            if decoded is not None:
-                return decoded
-        time.sleep(0.01)
-    return None
-
-
-_KEY_BINDINGS: dict[str, str | None] = {
-    "j": "navigate_down",
-    "down": "navigate_down",
-    "k": "navigate_up",
-    "up": "navigate_up",
-    " ": "toggle_expanded",
-    "\r": "toggle_expanded",
-    "g": "go_top",
-    "G": "go_bottom",
-    "page_up": "page_up",
-    "page_down": "page_down",
-    "n": "jump_next_agent",
-    "N": "jump_prev_agent",
-    "c": "collapse_enclosing_agent",
-    "E": "expand_all_nodes",
-    "C": "collapse_all_nodes",
-    "q": None,
-    "escape": None,
-}
-
-
-def _handle_key(key: str, renderer: ConsoleRender, *, allow_quit: bool) -> bool:
-    """Process a key event, returning True if the browser should exit."""
-    action = _KEY_BINDINGS.get(key)
-    if action is None:
-        return allow_quit and key in _KEY_BINDINGS
-    getattr(renderer, action)()
-    return False
-
-
-def _handle_input_event(
-    event: str | MouseEvent,
-    renderer: ConsoleRender,
-    *,
-    allow_quit: bool,
-) -> bool:
-    if isinstance(event, MouseEvent):
-        renderer.handle_click(event.x, event.y, button=event.button)
-        return False
-    return _handle_key(event, renderer, allow_quit=allow_quit)
-
-
-def keyboard_loop(
-    renderer: ConsoleRender,
-    view_thread: threading.Thread,
-) -> None:
-    """Run the renderer-managed interactive session for an existing view loop."""
-    renderer._console_session_active = True
-    renderer.pre_console()
-    try:
-        if os.name == "nt":
-            renderer._interactive_loop_windows(view_thread)
-        else:
-            renderer._interactive_loop_posix(view_thread)
-    finally:
-        renderer._console_session_active = False
-        renderer.restore_console()
-
-
-def interactive_browse(renderer: ConsoleRender, last_view: NodeView) -> None:
-    """Post-completion interactive tree browser.
-
-    Launches an interactive session where the user can navigate and
-    expand/collapse the completed execution tree.  Exits on 'q' or Esc.
-    """
-    renderer.reset_for_browse()
-    renderer._console_session_active = True
-    renderer.pre_console()
-    try:
-        renderer._ui_driver(renderer.render(last_view))
-        if os.name == "nt":
-            renderer._browse_until_quit_windows()
-        else:
-            renderer._browse_until_quit_posix()
-    finally:
-        renderer._console_session_active = False
-        renderer.restore_console()
+        driver = ConsoleSessionDriver(spinner_hz=self.spinner_hz)
+        controller = SingleTreeConsoleController(self, node)
+        driver.run(controller)

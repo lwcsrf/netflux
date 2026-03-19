@@ -1,7 +1,7 @@
 from ..core import AgentFunction, FunctionArg, Provider
-from .bash import bash
+from .bash_func import bash
 from .raise_exception import raise_exception
-from .text_editor import text_editor
+from .text_editor_func import text_editor
 
 apply_diff_patch = AgentFunction(
     name="apply_diff_patch",

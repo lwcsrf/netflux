@@ -1,8 +1,10 @@
 import os
 from .console import ConsoleRender
+from .tui import TUI
 
 __all__ = [
     "ConsoleRender",
+    "TUI",
 ]
 
 def enable_vt_if_windows() -> None:

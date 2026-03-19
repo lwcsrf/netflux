@@ -50,3 +50,14 @@ The script creates a disposable workspace, changes into it before invoking the a
 Run:
 
 `python3 -m netflux.demos.bash_stress --provider={gemini,anthropic} [--custom-instruction "..."]`
+
+## TUI (`tui.py`)
+
+The above examples are also used as top-level Functions to demo the interactive TUI.
+It lets you launch multiple tree roots from one terminal session and switch between their live or completed execution trees.
+
+Run:
+
+`python3 -m netflux.demos.tui`
+
+Each tree launch chooses its provider in the TUI launch form. For `AgentFunction` roots, the provider field defaults to that `AgentFunction`'s `default_model`; changing it overrides only that top-level invoke.

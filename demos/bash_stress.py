@@ -6,10 +6,9 @@ from pathlib import Path
 from typing import List, Optional
 
 from ..core import AgentFunction, FunctionArg, NodeState, Provider
-from ..func_lib.bash import bash
-from ..func_lib.raise_exception import raise_exception
+from ..func_lib import bash, raise_exception
 from ..runtime import Runtime
-from ..viz import ConsoleRender
+from ..tui import ConsoleRender
 
 
 BASH_STRESS_SYSTEM_PROMPT = (
@@ -176,7 +175,7 @@ def run_bash_stress_tree(
             cancel_event=cancel_evt,
         )
 
-        render = ConsoleRender(spinner_hz=10.0, cancel_event=cancel_evt)
+        render = ConsoleRender(spinner_hz=10.0)
 
         final_result: Optional[str] = None
         run_exception: Optional[Exception] = None
@@ -192,8 +191,6 @@ def run_bash_stress_tree(
             final_result = str(node.result())
         except Exception as ex:
             run_exception = ex
-
-        print(str(render.render(runtime.watch(node))))
 
         if node.state == NodeState.Success:
             print("\n--- Final Report ---\n")

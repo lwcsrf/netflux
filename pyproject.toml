@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netflux"
-version = "0.2.12"
+version = "0.3.0"
 maintainers = [
   { name="LW Computational Science Research Foundation" },
 ]
@@ -31,6 +31,11 @@ test = [
     "pytest",
 ]
 
+# Optional `tui` subpackage dependencies
+tui = [
+    "rich>=12.6.0",
+]
+
 # Provider-specific dependencies
 anthropic = [
     "anthropic>=0.79.0, <1.0.0",
@@ -47,6 +52,7 @@ xai = ["xai-sdk>=1.2.0, <2.0.0"]
 # if running the demos or doing E2E integration tests.
 all = [
     "netflux[test]",
+    "netflux[tui]",
     "netflux[anthropic]",
     "netflux[gemini]",
     "netflux[openai]",
@@ -58,7 +64,8 @@ packages = [
     "netflux",
     "netflux.providers",
     "netflux.tests",
-    "netflux.viz",
+    "netflux.tests.tui",
+    "netflux.tui",
     "netflux.func_lib",
     "netflux.demos",
 ]
