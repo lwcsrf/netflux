@@ -6,7 +6,7 @@ from typing import Optional
 from unittest.mock import patch
 
 from ..core import RunContext, SessionBag, SessionScope
-from ..func_lib.text_editor import TextEditor, TextEditorException
+from ..func_lib.text_editor_func import TextEditor, TextEditorException
 
 
 class _DummyNode:
@@ -288,7 +288,7 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
                     self.assertEqual(3, n)
                     return "deadbe"
 
-                with patch("netflux.func_lib.text_editor.secrets.token_hex", _fake_token_hex):
+                with patch("netflux.func_lib.text_editor_func.secrets.token_hex", _fake_token_hex):
                     before_paths = set(base_dir.iterdir())
                     with self.assertRaises(FileExistsError) as cm:
                         self.editor.call(
@@ -374,7 +374,7 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
             alt_path = target.with_name(alt_name)
             alt_path.mkdir()
 
-            with patch("netflux.func_lib.text_editor.secrets.token_hex", _fake_token_hex):
+            with patch("netflux.func_lib.text_editor_func.secrets.token_hex", _fake_token_hex):
                 with self.assertRaises(FileExistsError) as cm:
                     self.editor.call(
                         self.ctx,

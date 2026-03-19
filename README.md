@@ -45,7 +45,7 @@ Everything in netflux is a `Function`. There are two concrete kinds:
 
 * **`CodeFunction`** — Deterministic Python code (your callable) with a declared signature. Think basic utilities, orchestrators, and agent decorators.
 
-  *Example utility:* `TextEditor` (`func_lib/text_editor.py`) provides file viewing and editing commands.
+  *Example utility:* `TextEditor` (`func_lib/text_editor_func.py`) provides file viewing and editing commands.
 
 * **`AgentFunction`** — An LLM‑backed function with a schema (arguments), a system prompt, and an initial user prompt template. Under the hood it runs an **agent loop** and can call other Functions in-between thinking. We casually say *“Agent”* to mean an instance of `AgentFunction`.
 
@@ -222,8 +222,8 @@ def _fix_bug_workflow(ctx: RunContext, *, root: str, error_message: str) -> str:
 
     return f"{summary}\nReport: {report_path}"
 
-# `CodeFunction`s are often just defined as instances, but sometimes it is convenient to define
-# them as subclasses of `CodeFunction` (see `func_lib/text_editor.py` example).
+# `CodeFunction`s are often just defined as instances of `CodeFunction`, but sometimes it is convenient to define
+# one as a subclass of `CodeFunction` and then instantiate the subclass (see `func_lib/text_editor_func.py` -> `text_editor` example).
 
 fix_bug_workflow = CodeFunction(
     name="fix_bug_workflow",
@@ -406,7 +406,7 @@ Below we **reuse** the earlier definitions:
 from netflux import NodeState, Provider, Runtime, TerminalNodeStates
 
 # Built-ins
-from netflux.func_lib.text_editor import text_editor           # CodeFunction (leaf tool)
+from netflux.func_lib.text_editor_func import text_editor      # CodeFunction (leaf tool)
 from netflux.func_lib.apply_diff import apply_diff_patch       # AgentFunction (built-in)
 from netflux.func_lib.raise_exception import raise_exception   # CodeFunction (to raise AgentException)
 from netflux.func_lib.ensemble import Ensemble                 # CodeFunction decorator

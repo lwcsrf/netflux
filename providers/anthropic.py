@@ -96,7 +96,7 @@ from anthropic.types.tool_param import InputSchemaTyped
     * text editor
         * Ref: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/text-editor-tool
         * Specified without reference implementation.
-        * We implemented very robustly in `func_lib/text_editor.py`.
+        * We implemented very robustly in `func_lib/text_editor_func.py`.
     * bash tool
         * Ref: https://docs.anthropic.com/en/docs/agents-and-tools/tool-use/bash-tool
         * Specified without reference implementation.   

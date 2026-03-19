@@ -70,6 +70,11 @@ It redraws when:
 
 It does not use recurring polling to discover runtime updates or keyboard/mouse input.
 
+Input decoding:
+- on POSIX, incomplete escape/control sequences are buffered across reads instead of leaking trailing bytes as raw keypresses,
+- this includes a briefly delayed byte immediately after the initial `Escape`,
+- a real standalone `Escape` key still resolves as `Escape` once that short grace interval expires.
+
 Interactive terminal setup:
 - enters the alternate screen,
 - hides the cursor,
@@ -332,6 +337,7 @@ There is currently no dedicated normal-keyboard quit path for the multi-pane TUI
 Mouse routing:
 - the outer `TUI` owns absolute-screen hit testing,
 - left-pane clicks select runs or open launch forms,
+- in the functions pane, only clicks on the visible `(index) function_name` label open the launch form; padding to the right of that label is ignored,
 - clicks on the separator, bottom bar, or right-pane left margin are ignored,
 - only clicks in the right-pane body are translated to right-pane-local coordinates and routed to the selected `ConsoleRender`,
 - non-left clicks in the left pane are ignored.
