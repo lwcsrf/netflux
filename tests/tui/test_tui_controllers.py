@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import io
 import multiprocessing as mp
 import os
 import re
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -2800,6 +2802,14 @@ class _SingleKeyExitController(_RecordingController):
         return True
 
 
+class _TTYWithoutFileno:
+    def isatty(self) -> bool:
+        return True
+
+    def fileno(self) -> int:
+        raise io.UnsupportedOperation("redirected stdin is pseudofile, has no fileno()")
+
+
 class TestTerminalIO(unittest.TestCase):
     def test_read_key_buffers_split_posix_mouse_sequence_until_complete(self) -> None:
         select_results = iter([
@@ -2989,6 +2999,16 @@ class TestConsoleSessionDriver(unittest.TestCase):
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
         ), patch("netflux.tui._driver.os.name", "posix"), patch(
+            "netflux.tui._driver.termios",
+            SimpleNamespace(tcgetattr=Mock(), tcsetattr=Mock(), TCSADRAIN=0),
+        ), patch(
+            "netflux.tui._driver.tty",
+            SimpleNamespace(setcbreak=Mock()),
+        ), patch.object(
+            ConsoleSessionDriver,
+            "_stdin_fileno",
+            return_value=0,
+        ), patch(
             "netflux.tui._driver.threading.current_thread", return_value=fake_current
         ), patch(
             "netflux.tui._driver.threading.main_thread", return_value=fake_main
@@ -3008,6 +3028,16 @@ class TestConsoleSessionDriver(unittest.TestCase):
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
         ), patch("netflux.tui._driver.os.name", "posix"), patch(
+            "netflux.tui._driver.termios",
+            SimpleNamespace(tcgetattr=Mock(), tcsetattr=Mock(), TCSADRAIN=0),
+        ), patch(
+            "netflux.tui._driver.tty",
+            SimpleNamespace(setcbreak=Mock()),
+        ), patch.object(
+            ConsoleSessionDriver,
+            "_stdin_fileno",
+            return_value=0,
+        ), patch(
             "netflux.tui._driver.threading.current_thread", return_value=fake_current
         ), patch(
             "netflux.tui._driver.threading.main_thread", return_value=fake_main
@@ -3028,6 +3058,16 @@ class TestConsoleSessionDriver(unittest.TestCase):
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
         ), patch("netflux.tui._driver.os.name", "posix"), patch(
+            "netflux.tui._driver.termios",
+            SimpleNamespace(tcgetattr=Mock(), tcsetattr=Mock(), TCSADRAIN=0),
+        ), patch(
+            "netflux.tui._driver.tty",
+            SimpleNamespace(setcbreak=Mock()),
+        ), patch.object(
+            ConsoleSessionDriver,
+            "_stdin_fileno",
+            return_value=0,
+        ), patch(
             "netflux.tui._driver.threading.current_thread", return_value=fake_main
         ), patch(
             "netflux.tui._driver.threading.main_thread", return_value=fake_main
@@ -3131,6 +3171,34 @@ class TestConsoleSessionDriver(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stop boom"):
                 driver.run(controller)
 
+        self.assertTrue(restore_console.called)
+
+    def test_posix_stdin_without_fileno_falls_back_to_noninteractive(self) -> None:
+        controller = _StopFailureController()
+        driver = ConsoleSessionDriver()
+        fake_current = object()
+        fake_main = object()
+
+        with patch.object(sys, "stdin", _TTYWithoutFileno()), patch(
+            "sys.stdout.isatty", return_value=True
+        ), patch("netflux.tui._driver.os.name", "posix"), patch(
+            "netflux.tui._driver.termios",
+            SimpleNamespace(tcgetattr=Mock(), tcsetattr=Mock(), TCSADRAIN=0),
+        ), patch(
+            "netflux.tui._driver.tty",
+            SimpleNamespace(setcbreak=Mock()),
+        ), patch(
+            "netflux.tui._driver.threading.current_thread", return_value=fake_current
+        ), patch(
+            "netflux.tui._driver.threading.main_thread", return_value=fake_main
+        ), patch("netflux.tui._driver.pre_console") as pre_console, patch(
+            "netflux.tui._driver.restore_console"
+        ) as restore_console, patch("netflux.tui._driver.ui_driver"):
+            with self.assertRaisesRegex(RuntimeError, "stop boom"):
+                driver.run(controller)
+
+        self.assertFalse(controller.interactive)
+        self.assertFalse(pre_console.called)
         self.assertTrue(restore_console.called)
 
     def test_controller_veto_skips_console_setup(self) -> None:

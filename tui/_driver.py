@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import io
 import os
 import signal
 import sys
@@ -155,6 +156,12 @@ class ConsoleSessionDriver:
         cols, lines = terminal_size_token()
         return TerminalSize(columns=max(1, cols), lines=max(1, lines))
 
+    def _stdin_fileno(self) -> int | None:
+        try:
+            return sys.stdin.fileno()
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+            return None
+
     def _render_if_needed(
         self,
         controller: SessionController,
@@ -185,10 +192,18 @@ class ConsoleSessionDriver:
         stdout_tty = sys.stdout.isatty()
         interactive = sys.stdin.isatty() and stdout_tty
         start_attempted = False
+        stdin_fd: int | None = None
         old_settings = None
         raised: BaseException | None = None
 
         try:
+            if interactive and os.name != "nt":
+                if termios is None or tty is None:
+                    interactive = False
+                else:
+                    stdin_fd = self._stdin_fileno()
+                    if stdin_fd is None:
+                        interactive = False
             self._validate_interactive_startup(interactive=interactive)
             self._setup_wakeup(interactive=interactive)
             controller.set_wakeup(self._request_wakeup)
@@ -198,13 +213,10 @@ class ConsoleSessionDriver:
                 return
 
             if interactive and os.name != "nt":
-                if termios is None or tty is None:
-                    interactive = False
-                else:
-                    fd = sys.stdin.fileno()
-                    old_settings = termios.tcgetattr(fd)
-                    tty.setcbreak(fd)
-                    self._install_sigwinch()
+                assert stdin_fd is not None
+                old_settings = termios.tcgetattr(stdin_fd)
+                tty.setcbreak(stdin_fd)
+                self._install_sigwinch()
 
             if interactive:
                 pre_console()
@@ -214,7 +226,8 @@ class ConsoleSessionDriver:
             elif os.name == "nt":
                 self._loop_windows(controller)
             else:
-                self._loop_posix(controller, sys.stdin.fileno())
+                assert stdin_fd is not None
+                self._loop_posix(controller, stdin_fd)
         except BaseException as exc:  # pragma: no cover - exercised through tests
             raised = exc
         finally:
@@ -228,8 +241,8 @@ class ConsoleSessionDriver:
             cleanup_error: BaseException | None = None
             try:
                 self._restore_sigwinch()
-                if old_settings is not None and termios is not None:
-                    termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, old_settings)
+                if old_settings is not None and termios is not None and stdin_fd is not None:
+                    termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
                 if stdout_tty:
                     restore_console()
             except BaseException as exc:  # pragma: no cover - exercised through tests
