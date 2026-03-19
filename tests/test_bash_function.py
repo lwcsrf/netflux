@@ -259,10 +259,9 @@ class TestBashFunctionCommands(unittest.TestCase):
 
         self.assertEqual([line for line in output.strip().splitlines()], ["alpha", "done"])
 
-    def test_set_e_and_pipefail_restored(self) -> None:
+    def test_pipefail_can_be_enabled_without_breaking_successful_command(self) -> None:
         command = "\n".join(
             [
-                "set -e",
                 "set -o pipefail",
                 "echo start",
                 "false || true",
@@ -493,7 +492,7 @@ class TestBashEdgeCases(unittest.TestCase):
             output = self.bash._call(self.ctx, command="echo hi", session_id=0)
 
         self.assertEqual(output.strip(), "hi")
-        self.assertNotIn("__nf_was_e", output)
+        self.assertNotIn("__nf_ec", output)
         self.assertNotIn("__NETFLUX_BASH_DONE__", output)
 
     def test_new_session_does_not_import_inherited_bash_functions(self) -> None:
@@ -712,33 +711,54 @@ class TestBashEdgeCases(unittest.TestCase):
         )
         self.assertIn("Output truncated", output)
 
-    def test_set_e_restored_between_calls(self) -> None:
-        """The wrapper suppresses -e during execution for safety (prevents the
-        shell from dying on failed commands) but preserves it at the shell level
-        between calls.  Because set +e runs before each command, the user's code
-        observes -e as off — this is the documented design trade-off.
-        Verify the session stays healthy and the wrapper's save/restore cycle
-        does not corrupt other shell state."""
+    def test_set_e_from_prior_call_does_not_persist_into_next_command(self) -> None:
+        """A prior successful `set -e` call should not make the next command run
+        under errexit because the wrapper always forces `set +e` at call entry."""
         self.bash._call(self.ctx, command="set -e", session_id=30)
         self.bash._call(self.ctx, command="echo middle", session_id=30)
-        # The wrapper always does set +e before the user's command for safety,
-        # so $- will NOT contain 'e' inside the command (by design).
         output = self.bash._call(self.ctx, command='case $- in *e*) echo YES;; *) echo NO;; esac', session_id=30)
         self.assertEqual(output.strip(), "NO")
-        # Session is still healthy after the set -e round-trip
         output2 = self.bash._call(self.ctx, command="echo still_ok", session_id=30)
         self.assertEqual(output2.strip(), "still_ok")
 
-    def test_set_e_wrapper_prevents_premature_exit(self) -> None:
-        """Even with set -e, the wrapper's set +e prevents the shell from dying
-        mid-block. Both echos should run."""
+    def test_prior_call_set_e_does_not_break_later_command(self) -> None:
         self.bash._call(self.ctx, command="set -e", session_id=31)
-        # Without the wrapper's set +e, `false` would kill the shell.
         output = self.bash._call(
             self.ctx, command="echo before; false; echo after", session_id=31
         )
         self.assertIn("before", output)
         self.assertIn("after", output)
+
+    def test_same_call_set_e_crash_includes_errexit_hint(self) -> None:
+        with self.assertRaises(BashSessionCrashedException) as cm:
+            self.bash._call(self.ctx, command="set -e\nfalse", session_id=32)
+
+        message = str(cm.exception)
+        self.assertIn("set -e", message)
+        self.assertIn("unsupported", message)
+        self.assertIn("child 'bash' process", message)
+
+    def test_same_call_set_e_timeout_includes_errexit_hint(self) -> None:
+        with self.assertRaises(BashCommandTimeoutException) as cm:
+            self.bash._call(self.ctx, command="set -e\nsleep 5", session_id=33, timeout_sec=1)
+
+        message = str(cm.exception)
+        self.assertIn("set -e", message)
+        self.assertIn("unsupported", message)
+
+    def test_plain_exit_crash_does_not_include_errexit_hint(self) -> None:
+        with self.assertRaises((BashSessionCrashedException, BashCommandTimeoutException)) as cm:
+            self.bash._call(self.ctx, command="exit 0", session_id=34, timeout_sec=2)
+
+        self.assertNotIn("set -e", str(cm.exception))
+
+    def test_child_bash_may_use_set_e_without_crashing_session(self) -> None:
+        with self.assertRaises(BashNonZeroExitCodeException) as cm:
+            self.bash._call(self.ctx, command="bash -lc 'set -e; false'", session_id=35, timeout_sec=2)
+
+        self.assertEqual(cm.exception.exit_code, 1)
+        follow_up = self.bash._call(self.ctx, command="echo alive", session_id=35, timeout_sec=2)
+        self.assertEqual(follow_up.strip(), "alive")
 
     # ── Timeout → restart recovery ──
 
@@ -767,6 +787,14 @@ class TestBashEdgeCases(unittest.TestCase):
         with self.assertRaises(BashCommandTimeoutException) as cm:
             self.bash._call(self.ctx, command="sleep 5", session_id=49, timeout_sec=1)
         self.assertNotIn(hint, str(cm.exception))
+
+    def test_timeout_hint_can_include_both_noexec_and_errexit_reasons(self) -> None:
+        with self.assertRaises(BashCommandTimeoutException) as cm:
+            self.bash._call(self.ctx, command="set -n\nset -e", session_id=50, timeout_sec=1)
+
+        message = str(cm.exception)
+        self.assertIn("set -n' / 'set -o noexec", message)
+        self.assertIn("set -e' / 'set -o errexit", message)
 
     def test_terminate_closes_process_pipes(self) -> None:
         session = BashSession(41)
@@ -823,38 +851,19 @@ class TestBashEdgeCases(unittest.TestCase):
         self.assertTrue(session.requires_restart)
         self.assertIsNone(session._proc)
 
-    def test_legacy_internal_var_names_do_not_collide_with_wrapper(self) -> None:
-        self.bash._call(
-            self.ctx,
-            command="readonly __nf_ec=7; readonly __nf_was_e=1",
-            session_id=43,
-        )
-        output = self.bash._call(self.ctx, command="echo hi", session_id=43)
-        self.assertEqual(output.strip(), "hi")
-
-    def test_set_u_and_legacy_internal_var_names_do_not_crash_wrapper(self) -> None:
-        output = self.bash._call(
-            self.ctx,
-            command="set -u; unset __nf_was_e; echo body",
-            session_id=44,
-        )
-        self.assertEqual(output.strip(), "body")
-        follow_up = self.bash._call(self.ctx, command="echo alive", session_id=44)
-        self.assertEqual(follow_up.strip(), "alive")
-
     def test_per_call_internal_vars_do_not_accumulate_in_session(self) -> None:
         sid = 45
         count_cmd = r"compgen -A variable | grep -Ec '^__nf_.*_[0-9a-f]{32}$' || true"
 
         baseline = self.bash._call(self.ctx, command=count_cmd, session_id=sid)
-        self.assertEqual(baseline.strip(), "1")
+        self.assertEqual(baseline.strip(), "0")
 
         for i in range(10):
             output = self.bash._call(self.ctx, command=f"echo run-{i}", session_id=sid)
             self.assertEqual(output.strip(), f"run-{i}")
 
         after = self.bash._call(self.ctx, command=count_cmd, session_id=sid)
-        self.assertEqual(after.strip(), "1")
+        self.assertEqual(after.strip(), "0")
 
     @unittest.skipUnless(os.name == "nt", "Windows-specific process tree termination")
     def test_windows_terminate_uses_ctrl_break_before_taskkill(self) -> None:
