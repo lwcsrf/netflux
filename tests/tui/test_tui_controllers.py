@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import ctypes
 import io
+import logging
 import multiprocessing as mp
 import os
 import re
 import sys
+import tempfile
 import threading
 import time
 from types import SimpleNamespace
@@ -27,6 +29,7 @@ from ...core import (
 from ...providers import Provider
 from ...runtime import Runtime
 from ...tui import ConsoleRender
+from ...tui._logging import close_tui_logging
 from ...tui._controller_helpers import (
     compose_bottom_bar,
     multi_pane_shortcut_variants,
@@ -567,6 +570,38 @@ class TestBottomBarFormatting(unittest.TestCase):
         self.assertNotIn("^C:can…", plain)
 
 class TestTUIState(unittest.TestCase):
+    def test_tui_creates_default_error_log_path(self) -> None:
+        runtime = Runtime([_make_code_function("fn0")], client_factories={})
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "netflux.tui._logging.tempfile.gettempdir",
+            return_value=tmpdir,
+        ):
+            tui = TUI(runtime)
+            try:
+                self.assertTrue(tui.log_path.is_file())
+                self.assertEqual(os.path.dirname(str(tui.log_path)), tmpdir)
+                self.assertRegex(tui.log_path.name, r"^netflux_tui_\d{8}_.+\.log$")
+            finally:
+                close_tui_logging(tui.log_path)
+
+    def test_tui_uses_custom_error_log_path(self) -> None:
+        runtime = Runtime([_make_code_function("fn0")], client_factories={})
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            expected = os.path.abspath(os.path.join(tmpdir, "custom-tui.log"))
+            tui = TUI(runtime, log_path=expected)
+
+            self.assertEqual(str(tui.log_path), expected)
+            self.assertTrue(os.path.isfile(expected))
+            with patch("sys.stdin.isatty", return_value=False), patch(
+                "sys.stdout.isatty",
+                return_value=False,
+            ):
+                tui.run()
+
+            os.remove(expected)
+            self.assertFalse(os.path.exists(expected))
+
     def test_terminal_callback_receives_total_tree_bill(self) -> None:
         fn = _make_agent_function("billed")
         child_fn = _make_agent_function("child")
@@ -1264,7 +1299,7 @@ class TestTUIState(unittest.TestCase):
             _RunUpdateEvent(run_index=0, view=_make_view(fn, state=NodeState.Success, update_seqnum=2))
         )
 
-        with patch("netflux.tui.tui.logging.exception") as log_exception:
+        with patch("netflux.tui.tui.logger.exception") as log_exception:
             self.assertTrue(tui.pump_events())
 
         log_exception.assert_called_once()
@@ -2606,7 +2641,11 @@ class TestTUIState(unittest.TestCase):
             return original_start(thread_self, *args, **kwargs)
 
         with patch.object(threading.Thread, "start", autospec=True, side_effect=fail_watcher_start):
-            with patch("netflux.tui.tui.restore_console"), patch(
+            with patch("netflux.tui.tui.logger.critical") as log_critical, patch(
+                "netflux.tui.tui.logging.shutdown"
+            ) as logging_shutdown, patch("netflux.tui.tui.restore_console"), patch(
+                "builtins.print"
+            ), patch(
                 "netflux.tui.tui.os._exit",
                 side_effect=SystemExit(1),
             ):
@@ -2614,6 +2653,8 @@ class TestTUIState(unittest.TestCase):
                     tui._submit_form()
 
         self.assertEqual(len(tui._runs), 0)
+        log_critical.assert_called_once()
+        logging_shutdown.assert_called_once()
 
     def test_submit_requests_cancellation_if_watcher_start_fails_after_launch(self) -> None:
         started = threading.Event()
@@ -2645,6 +2686,8 @@ class TestTUIState(unittest.TestCase):
 
         with patch.object(threading.Thread, "start", autospec=True, side_effect=fail_watcher_start):
             with patch("netflux.tui.tui.restore_console"), patch(
+                "netflux.tui.tui.logging.shutdown"
+            ), patch("builtins.print"), patch(
                 "netflux.tui.tui.os._exit",
                 side_effect=SystemExit(1),
             ):
@@ -2685,6 +2728,8 @@ class TestTUIState(unittest.TestCase):
 
         with patch("netflux.tui.tui.ConsoleRender", _BoomRender):
             with patch("netflux.tui.tui.restore_console"), patch(
+                "netflux.tui.tui.logging.shutdown"
+            ), patch("builtins.print"), patch(
                 "netflux.tui.tui.os._exit",
                 side_effect=SystemExit(1),
             ):
@@ -2941,6 +2986,24 @@ class _SingleRenderController(_RecordingController):
 
     def should_exit(self) -> bool:
         return self.render_calls > 0
+
+
+class _RenderFailureController(_RecordingController):
+    def render_frame(self, size: TerminalSize, tick: int) -> str:
+        del size, tick
+        raise RuntimeError("render boom")
+
+    def should_exit(self) -> bool:
+        return False
+
+
+class _ShouldExitFailureController(_RecordingController):
+    def render_frame(self, size: TerminalSize, tick: int) -> str:
+        del size, tick
+        return "frame"
+
+    def should_exit(self) -> bool:
+        raise RuntimeError("should_exit boom")
 
 
 class _SingleKeyExitController(_RecordingController):
@@ -3309,8 +3372,8 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         controller = SingleTreeConsoleController(ConsoleRender(), node)
         driver = ConsoleSessionDriver()
-        fake_current = object()
-        fake_main = object()
+        fake_current = SimpleNamespace(name="worker-thread")
+        fake_main = SimpleNamespace(name="main-thread")
 
         self.assertIsNone(controller._watch_thread.ident)
 
@@ -3340,8 +3403,8 @@ class TestConsoleSessionDriver(unittest.TestCase):
     def test_interactive_posix_requires_main_thread(self) -> None:
         controller = _RecordingController()
         driver = ConsoleSessionDriver()
-        fake_current = object()
-        fake_main = object()
+        fake_current = SimpleNamespace(name="worker-thread")
+        fake_main = SimpleNamespace(name="main-thread")
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
@@ -3370,7 +3433,7 @@ class TestConsoleSessionDriver(unittest.TestCase):
     def test_interactive_posix_requires_default_sigint_handler(self) -> None:
         controller = _RecordingController()
         driver = ConsoleSessionDriver()
-        fake_main = object()
+        fake_main = SimpleNamespace(name="main-thread")
         custom_handler = lambda _signum, _frame: None
 
         with patch("sys.stdin.isatty", return_value=True), patch(
@@ -3463,6 +3526,36 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         self.assertEqual(ui_driver.call_count, 1)
 
+    def test_render_failure_logs_controller_stage(self) -> None:
+        controller = _RenderFailureController()
+        driver = ConsoleSessionDriver()
+
+        with patch("sys.stdin.isatty", return_value=False), patch(
+            "sys.stdout.isatty", return_value=False
+        ), patch("netflux.tui._driver.ui_driver"), self.assertLogs(
+            "netflux.tui._driver",
+            level=logging.ERROR,
+        ) as captured:
+            with self.assertRaisesRegex(RuntimeError, "render boom"):
+                driver.run(controller)
+
+        self.assertTrue(any("render_frame" in message for message in captured.output))
+
+    def test_should_exit_failure_logs_controller_stage(self) -> None:
+        controller = _ShouldExitFailureController()
+        driver = ConsoleSessionDriver()
+
+        with patch("sys.stdin.isatty", return_value=False), patch(
+            "sys.stdout.isatty", return_value=False
+        ), patch("netflux.tui._driver.ui_driver"), self.assertLogs(
+            "netflux.tui._driver",
+            level=logging.ERROR,
+        ) as captured:
+            with self.assertRaisesRegex(RuntimeError, "should_exit boom"):
+                driver.run(controller)
+
+        self.assertTrue(any("should_exit" in message for message in captured.output))
+
     def test_start_failure_still_calls_on_session_stop(self) -> None:
         controller = _StartFailureController()
         driver = ConsoleSessionDriver()
@@ -3494,8 +3587,8 @@ class TestConsoleSessionDriver(unittest.TestCase):
     def test_posix_stdin_without_fileno_falls_back_to_noninteractive(self) -> None:
         controller = _StopFailureController()
         driver = ConsoleSessionDriver()
-        fake_current = object()
-        fake_main = object()
+        fake_current = SimpleNamespace(name="worker-thread")
+        fake_main = SimpleNamespace(name="main-thread")
 
         with patch.object(sys, "stdin", _TTYWithoutFileno()), patch(
             "sys.stdout.isatty", return_value=True
@@ -3553,7 +3646,6 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         read_key_mock.assert_called_once_with(7, timeout=0)
         self.assertEqual(controller.keys, ["escape"])
-
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

@@ -18,7 +18,6 @@ ROOT_FUNCTIONS: tuple[Function, ...] = (
     apply_diff_patch,
 )
 
-
 class _DemoRuntime(Runtime):
     def __init__(
         self,
@@ -57,7 +56,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
     runtime = build_runtime()
-    TUI(runtime, spinner_hz=args.spinner_hz).run()
+    tui = TUI(runtime, spinner_hz=args.spinner_hz)
+    print(f"TUI log file: {tui.log_path}")
+    tui.run()
 
 
 if __name__ == "__main__":

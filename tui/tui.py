@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import os
+from pathlib import Path
 import queue
 import re
 import threading
@@ -35,6 +36,7 @@ from .console import (
     _visible_len,
 )
 from ._driver import ConsoleSessionDriver
+from ._logging import close_tui_logging, configure_tui_logging
 from ._terminal_io import restore_console
 
 
@@ -65,6 +67,8 @@ _RIGHT_PANE_MARGIN_COLS = 2
 
 TokenBills = Mapping[Provider, TokenBill]
 TerminalCallback = Callable[[TokenBills], None]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -172,7 +176,9 @@ class TUI(SessionController):
         runtime: Runtime,
         *,
         spinner_hz: float = 10.0,
+        log_path: str | os.PathLike[str] | None = None,
     ) -> None:
+        self.log_path: Path = configure_tui_logging(log_path)
         self.runtime = runtime
         self.spinner_hz = max(1.0, float(spinner_hz))
         self.invocable_functions = runtime.invocable_functions
@@ -197,7 +203,10 @@ class TUI(SessionController):
         self._flash_until: float = 0.0
 
     def run(self) -> None:
-        ConsoleSessionDriver(spinner_hz=self.spinner_hz).run(self)
+        try:
+            ConsoleSessionDriver(spinner_hz=self.spinner_hz).run(self)
+        finally:
+            close_tui_logging(self.log_path)
 
     def register_terminal_callback(
         self,
@@ -695,7 +704,12 @@ class TUI(SessionController):
                         parsed_args[field.arg.name] = None
                     continue
                 parsed_args[field.arg.name] = self._parse_arg(field.arg, raw)
-            cancel_event = mp.Event()
+        except ValueError as exc:
+            self._form_state.error = str(exc)
+            return
+
+        cancel_event = mp.Event()
+        try:
             node = self.runtime.invoke(
                 None,
                 fn,
@@ -704,11 +718,16 @@ class TUI(SessionController):
                 cancel_event=cancel_event,
             )
         except Exception as exc:
+            logger.error(
+                "TUI launch failed for function '%s': %s",
+                fn.name,
+                exc,
+            )
             self._form_state.error = str(exc)
             return
 
+        run_name = self._form_state.fields[0].value.strip() or f"{fn.name} #{len(self._runs)}"
         try:
-            run_name = self._form_state.fields[0].value.strip() or f"{fn.name} #{len(self._runs)}"
             renderer = ConsoleRender(cancel_event=cancel_event, spinner_hz=self.spinner_hz)
             run = _RunRecord(
                 name=run_name,
@@ -726,8 +745,14 @@ class TUI(SessionController):
                 daemon=True,
             )
             run.watcher_thread.start()
-        except Exception:
-            self._fatal_after_launch(cancel_event)
+        except Exception as exc:
+            self._fatal_after_launch(
+                cancel_event,
+                fn_name=fn.name,
+                node_id=node.id,
+                run_name=run_name,
+                exc=exc,
+            )
         self._runs.append(run)
         run_index = len(self._runs) - 1
         self._set_selected_run(run_index)
@@ -736,12 +761,46 @@ class TUI(SessionController):
         self._form_state = None
         self._sync_visible_run()
 
-    @staticmethod
-    def _fatal_after_launch(cancel_event: MpEvent) -> None:
-        cancel_event.set()
-        # Continuing would leave a real launched root running without tracked UI
-        # state, so this path requests cancellation and fails fast.
-        restore_console()
+    def _fatal_after_launch(
+        self,
+        cancel_event: MpEvent,
+        *,
+        fn_name: str,
+        node_id: int,
+        run_name: str,
+        exc: BaseException,
+    ) -> None:
+        self._fatal(
+            (
+                "TUI failed after launching run "
+                f"{run_name!r} for function '{fn_name}' (node_id={node_id})."
+            ),
+            cancel_event=cancel_event,
+            exc=exc,
+        )
+
+    def _fatal(
+        self,
+        message: str,
+        *,
+        cancel_event: MpEvent | None = None,
+        exc: BaseException | None = None,
+    ) -> None:
+        if exc is None:
+            logger.critical(message)
+        else:
+            logger.critical(
+                message,
+                exc_info=(type(exc), exc, exc.__traceback__),
+            )
+        if cancel_event is not None:
+            cancel_event.set()
+        try:
+            restore_console()
+        except Exception:
+            logger.exception("Failed to restore the terminal during fatal TUI shutdown.")
+        print(f"TUI log file: {self.log_path}", flush=True)
+        logging.shutdown()
         os._exit(1)
 
     @staticmethod
@@ -780,15 +839,25 @@ class TUI(SessionController):
 
     def _watch_run(self, run_index: int, node: Node, stop_event: threading.Event) -> None:
         prev_seq = 0
-        while not stop_event.is_set():
-            view = node.watch(as_of_seq=prev_seq)
-            if view is None:
-                continue
-            prev_seq = view.update_seqnum
-            self._event_queue.put(_RunUpdateEvent(run_index=run_index, view=view))
-            self._wakeup()
-            if view.state in TerminalNodeStates:
-                return
+        try:
+            while not stop_event.is_set():
+                view = node.watch(as_of_seq=prev_seq)
+                if view is None:
+                    continue
+                prev_seq = view.update_seqnum
+                self._event_queue.put(_RunUpdateEvent(run_index=run_index, view=view))
+                self._wakeup()
+                if view.state in TerminalNodeStates:
+                    return
+        except Exception as exc:
+            self._fatal(
+                (
+                    "TUI watcher failed for "
+                    f"run_index={run_index}, node_id={node.id}, fn='{node.fn.name}'."
+                ),
+                cancel_event=node.cancel_event,
+                exc=exc,
+            )
 
     def _attempt_terminal_callbacks_for_all_runs(
         self,
@@ -807,6 +876,11 @@ class TUI(SessionController):
         try:
             run.latest_view = self.runtime.get_view(node_id)
         except KeyError:
+            logger.error(
+                "TUI could not refresh run '%s' because node_id=%s was missing from the runtime.",
+                run.name,
+                node_id,
+            )
             return
 
     def _invoke_terminal_callback_if_needed(
@@ -827,7 +901,7 @@ class TUI(SessionController):
         try:
             callback(final_view.total_tree_token_bill())
         except Exception:
-            logging.exception(
+            logger.exception(
                 "TUI terminal callback failed for top-level run '%s'.",
                 run.name,
             )

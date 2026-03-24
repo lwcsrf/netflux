@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import io
+import logging
 import os
 import signal
 import sys
@@ -36,11 +37,14 @@ _WIN_WAIT_OBJECT_0 = 0
 _WIN_WAIT_TIMEOUT = 258
 _WIN_INFINITE = 0xFFFFFFFF
 
+logger = logging.getLogger(__name__)
+
 
 class ConsoleSessionDriver:
     def __init__(self, *, spinner_hz: float = 10.0) -> None:
         self.spinner_hz = max(1.0, float(spinner_hz))
         self._t0 = time.monotonic()
+        self._stage = "initialization"
         self._thread_wakeup = threading.Event()
         self._wake_pipe_read: int | None = None
         self._wake_pipe_write: int | None = None
@@ -170,18 +174,22 @@ class ConsoleSessionDriver:
         last_tick: int,
         force_render: bool,
     ) -> tuple[TerminalSize, int, bool, bool]:
+        self._stage = f"{type(controller).__name__}.pump_events"
         changed = controller.pump_events()
         size = self._current_size()
         if size != last_size:
             changed = True
 
+        self._stage = f"{type(controller).__name__}.wants_animation_ticks"
         wants_ticks = controller.wants_animation_ticks()
         tick = self._tick()
         if wants_ticks and tick != last_tick:
             changed = True
 
         if changed or force_render:
+            self._stage = f"{type(controller).__name__}.render_frame"
             frame = controller.render_frame(size, tick)
+            self._stage = "ui_driver"
             ui_driver(frame)
             last_tick = tick
             force_render = False
@@ -197,6 +205,7 @@ class ConsoleSessionDriver:
         raised: BaseException | None = None
 
         try:
+            self._stage = "interactive startup detection"
             if interactive and os.name != "nt":
                 if termios is None or tty is None:
                     interactive = False
@@ -204,21 +213,29 @@ class ConsoleSessionDriver:
                     stdin_fd = self._stdin_fileno()
                     if stdin_fd is None:
                         interactive = False
+            self._stage = "interactive startup validation"
             self._validate_interactive_startup(interactive=interactive)
+            self._stage = "wakeup setup"
             self._setup_wakeup(interactive=interactive)
+            self._stage = f"{type(controller).__name__}.set_wakeup"
             controller.set_wakeup(self._request_wakeup)
             start_attempted = True
+            self._stage = f"{type(controller).__name__}.on_session_start"
             controller.on_session_start(interactive=interactive)
+            self._stage = f"{type(controller).__name__}.should_exit"
             if controller.should_exit():
                 return
 
             if interactive and os.name != "nt":
                 assert stdin_fd is not None
+                self._stage = "terminal cbreak setup"
                 old_settings = termios.tcgetattr(stdin_fd)
                 tty.setcbreak(stdin_fd)
+                self._stage = "SIGWINCH handler installation"
                 self._install_sigwinch()
 
             if interactive:
+                self._stage = "console initialization"
                 pre_console()
 
             if not interactive:
@@ -230,24 +247,42 @@ class ConsoleSessionDriver:
                 self._loop_posix(controller, stdin_fd)
         except BaseException as exc:  # pragma: no cover - exercised through tests
             raised = exc
+            if not isinstance(exc, KeyboardInterrupt):
+                logger.exception(
+                    "Console session driver failed during %s.",
+                    self._stage,
+                )
         finally:
             stop_error: BaseException | None = None
             if start_attempted:
                 try:
+                    self._stage = f"{type(controller).__name__}.on_session_stop"
                     controller.on_session_stop()
                 except BaseException as exc:  # pragma: no cover - exercised through tests
                     stop_error = exc
+                    logger.exception(
+                        "Console session driver failed during %s.",
+                        self._stage,
+                    )
 
             cleanup_error: BaseException | None = None
             try:
+                self._stage = "SIGWINCH handler restoration"
                 self._restore_sigwinch()
                 if old_settings is not None and termios is not None and stdin_fd is not None:
+                    self._stage = "terminal attribute restoration"
                     termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_settings)
                 if stdout_tty:
+                    self._stage = "console restoration"
                     restore_console()
             except BaseException as exc:  # pragma: no cover - exercised through tests
                 cleanup_error = exc
+                logger.exception(
+                    "Console session driver failed during %s.",
+                    self._stage,
+                )
             finally:
+                self._stage = "wakeup cleanup"
                 self._cleanup_wakeup()
 
             if raised is not None:
@@ -270,14 +305,17 @@ class ConsoleSessionDriver:
                     last_tick=last_tick,
                     force_render=force_render,
                 )
+                self._stage = f"{type(controller).__name__}.should_exit"
                 if controller.should_exit():
                     break
 
                 timeout = self._seconds_until_next_tick(last_tick) if wants_ticks else None
+                self._stage = "noninteractive wake wait"
                 self._thread_wakeup.wait(timeout=timeout)
                 self._thread_wakeup.clear()
                 force_render = True
             except KeyboardInterrupt:
+                self._stage = f"{type(controller).__name__}.handle_interrupt"
                 if controller.handle_interrupt():
                     break
                 force_render = True
@@ -299,6 +337,7 @@ class ConsoleSessionDriver:
                     last_tick=last_tick,
                     force_render=force_render,
                 )
+                self._stage = f"{type(controller).__name__}.should_exit"
                 if controller.should_exit():
                     break
 
@@ -306,15 +345,19 @@ class ConsoleSessionDriver:
                 pending_timeout = posix_pending_input_timeout()
                 if pending_timeout is not None:
                     timeout = pending_timeout if timeout is None else min(timeout, pending_timeout)
+                self._stage = "posix input wait"
                 ready, _, _ = select.select([fd, self._wake_pipe_read], [], [], timeout)
                 if not ready:
                     pending_timeout = posix_pending_input_timeout()
                     if pending_timeout is not None and pending_timeout <= 0.0:
+                        self._stage = "posix read_key"
                         event = read_key(fd, timeout=0)
                         if event is not None:
                             if hasattr(event, "button"):
+                                self._stage = f"{type(controller).__name__}.handle_mouse"
                                 should_exit = controller.handle_mouse(event)
                             else:
+                                self._stage = f"{type(controller).__name__}.handle_key"
                                 should_exit = controller.handle_key(event)
                             if should_exit:
                                 break
@@ -322,21 +365,26 @@ class ConsoleSessionDriver:
                     continue
 
                 if self._wake_pipe_read in ready:
+                    self._stage = "posix wake drain"
                     self._drain_posix_wakeup()
                     force_render = True
 
                 if fd in ready:
+                    self._stage = "posix read_key"
                     event = read_key(fd, timeout=0)
                     if event is None:
                         continue
                     if hasattr(event, "button"):
+                        self._stage = f"{type(controller).__name__}.handle_mouse"
                         should_exit = controller.handle_mouse(event)
                     else:
+                        self._stage = f"{type(controller).__name__}.handle_key"
                         should_exit = controller.handle_key(event)
                     if should_exit:
                         break
                     force_render = True
             except KeyboardInterrupt:
+                self._stage = f"{type(controller).__name__}.handle_interrupt"
                 if controller.handle_interrupt():
                     break
                 force_render = True
@@ -359,6 +407,7 @@ class ConsoleSessionDriver:
                     last_tick=last_tick,
                     force_render=force_render,
                 )
+                self._stage = f"{type(controller).__name__}.should_exit"
                 if controller.should_exit():
                     break
 
@@ -366,6 +415,7 @@ class ConsoleSessionDriver:
                 if wants_ticks:
                     timeout_ms = max(0, int(self._seconds_until_next_tick(last_tick) * 1000))
 
+                self._stage = "windows input wait"
                 result = self._win_kernel32.WaitForMultipleObjects(
                     2,
                     handles,
@@ -382,8 +432,10 @@ class ConsoleSessionDriver:
                 if result != _WIN_WAIT_OBJECT_0:
                     raise OSError(f"WaitForMultipleObjects failed: {result}")
 
+                self._stage = "windows read_key"
                 event = read_key_windows()
                 if isinstance(event, InterruptEvent):
+                    self._stage = f"{type(controller).__name__}.handle_interrupt"
                     if controller.handle_interrupt():
                         break
                     force_render = True
@@ -394,13 +446,16 @@ class ConsoleSessionDriver:
                 if event is None:
                     continue
                 if hasattr(event, "button"):
+                    self._stage = f"{type(controller).__name__}.handle_mouse"
                     should_exit = controller.handle_mouse(event)
                 else:
+                    self._stage = f"{type(controller).__name__}.handle_key"
                     should_exit = controller.handle_key(event)
                 if should_exit:
                     break
                 force_render = True
             except KeyboardInterrupt:
+                self._stage = f"{type(controller).__name__}.handle_interrupt"
                 if controller.handle_interrupt():
                     break
                 force_render = True
