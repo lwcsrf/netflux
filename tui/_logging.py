@@ -13,15 +13,7 @@ _TUI_FILE_HANDLER_NAME = "netflux.tui.file"
 def configure_tui_logging(log_path: str | os.PathLike[str] | None = None) -> Path:
     path = _resolve_tui_log_path(log_path)
     logger = logging.getLogger("netflux")
-
-    for handler in list(logger.handlers):
-        if handler.name != _TUI_FILE_HANDLER_NAME:
-            continue
-        logger.removeHandler(handler)
-        try:
-            handler.flush()
-        finally:
-            handler.close()
+    _remove_tui_file_handlers(logger)
 
     handler = logging.FileHandler(path, encoding="utf-8")
     handler.name = _TUI_FILE_HANDLER_NAME
@@ -36,9 +28,15 @@ def configure_tui_logging(log_path: str | os.PathLike[str] | None = None) -> Pat
     return path
 
 
+def close_tui_logging(log_path: str | os.PathLike[str] | None = None) -> None:
+    logger = logging.getLogger("netflux")
+    target_path = None if log_path is None else Path(log_path).expanduser().resolve()
+    _remove_tui_file_handlers(logger, target_path=target_path)
+
+
 def default_tui_log_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d")
-    tmp_dir = Path("/tmp") if os.name != "nt" else Path(tempfile.gettempdir())
+    tmp_dir = Path(tempfile.gettempdir())
     fd, raw_path = tempfile.mkstemp(
         dir=tmp_dir,
         prefix=f"netflux_tui_{stamp}_",
@@ -56,3 +54,23 @@ def _resolve_tui_log_path(log_path: str | os.PathLike[str] | None) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.touch(exist_ok=True)
     return path
+
+
+def _remove_tui_file_handlers(
+    logger: logging.Logger,
+    *,
+    target_path: Path | None = None,
+) -> None:
+    for handler in list(logger.handlers):
+        if handler.name != _TUI_FILE_HANDLER_NAME:
+            continue
+        if target_path is not None:
+            if not isinstance(handler, logging.FileHandler):
+                continue
+            if Path(handler.baseFilename).resolve() != target_path:
+                continue
+        logger.removeHandler(handler)
+        try:
+            handler.flush()
+        finally:
+            handler.close()

@@ -36,7 +36,7 @@ from .console import (
     _visible_len,
 )
 from ._driver import ConsoleSessionDriver
-from ._logging import configure_tui_logging
+from ._logging import close_tui_logging, configure_tui_logging
 from ._terminal_io import restore_console
 
 
@@ -203,7 +203,10 @@ class TUI(SessionController):
         self._flash_until: float = 0.0
 
     def run(self) -> None:
-        ConsoleSessionDriver(spinner_hz=self.spinner_hz).run(self)
+        try:
+            ConsoleSessionDriver(spinner_hz=self.spinner_hz).run(self)
+        finally:
+            close_tui_logging(self.log_path)
 
     def register_terminal_callback(
         self,

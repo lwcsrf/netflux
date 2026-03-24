@@ -28,8 +28,8 @@ from ...core import (
 )
 from ...providers import Provider
 from ...runtime import Runtime
-from ...demos import tui as demo_tui
 from ...tui import ConsoleRender
+from ...tui._logging import close_tui_logging
 from ...tui._controller_helpers import (
     compose_bottom_bar,
     multi_pane_shortcut_variants,
@@ -572,10 +572,17 @@ class TestBottomBarFormatting(unittest.TestCase):
 class TestTUIState(unittest.TestCase):
     def test_tui_creates_default_error_log_path(self) -> None:
         runtime = Runtime([_make_code_function("fn0")], client_factories={})
-        tui = TUI(runtime)
-
-        self.assertTrue(tui.log_path.is_file())
-        self.assertRegex(tui.log_path.name, r"^netflux_tui_\d{8}_.+\.log$")
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "netflux.tui._logging.tempfile.gettempdir",
+            return_value=tmpdir,
+        ):
+            tui = TUI(runtime)
+            try:
+                self.assertTrue(tui.log_path.is_file())
+                self.assertEqual(os.path.dirname(str(tui.log_path)), tmpdir)
+                self.assertRegex(tui.log_path.name, r"^netflux_tui_\d{8}_.+\.log$")
+            finally:
+                close_tui_logging(tui.log_path)
 
     def test_tui_uses_custom_error_log_path(self) -> None:
         runtime = Runtime([_make_code_function("fn0")], client_factories={})
@@ -586,7 +593,14 @@ class TestTUIState(unittest.TestCase):
 
             self.assertEqual(str(tui.log_path), expected)
             self.assertTrue(os.path.isfile(expected))
-            TUI(runtime)
+            with patch("sys.stdin.isatty", return_value=False), patch(
+                "sys.stdout.isatty",
+                return_value=False,
+            ):
+                tui.run()
+
+            os.remove(expected)
+            self.assertFalse(os.path.exists(expected))
 
     def test_terminal_callback_receives_total_tree_bill(self) -> None:
         fn = _make_agent_function("billed")
@@ -3632,33 +3646,6 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         read_key_mock.assert_called_once_with(7, timeout=0)
         self.assertEqual(controller.keys, ["escape"])
-
-
-class TestTUIDemoMain(unittest.TestCase):
-    def test_main_uses_tui_default_log_path(self) -> None:
-        runtime = object()
-        fake_tui = SimpleNamespace(log_path="C:/tmp/netflux-demo.log", run=Mock())
-
-        with patch("netflux.demos.tui.build_runtime", return_value=runtime), patch(
-            "netflux.demos.tui.TUI",
-            return_value=fake_tui,
-        ) as tui_ctor, patch("builtins.print") as print_mock:
-            demo_tui.main([])
-
-        tui_ctor.assert_called_once_with(runtime, spinner_hz=10.0)
-        print_mock.assert_called_once_with(f"TUI log file: {fake_tui.log_path}")
-        fake_tui.run.assert_called_once_with()
-
-    def test_main_propagates_startup_failure_without_printing_log_path(self) -> None:
-        with patch(
-            "netflux.demos.tui.build_runtime",
-            side_effect=RuntimeError("startup boom"),
-        ), patch("builtins.print") as print_mock:
-            with self.assertRaisesRegex(RuntimeError, "startup boom"):
-                demo_tui.main([])
-
-        print_mock.assert_not_called()
-
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
