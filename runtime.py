@@ -31,6 +31,9 @@ from .core import (
 from .providers import Provider, get_AgentNode_impl
 
 
+logger = logging.getLogger(__name__)
+
+
 @dataclass
 class NodeObservable:
     cond: Condition
@@ -225,7 +228,8 @@ class Runtime:
         return bags
 
     def _fatal(self, msg: str) -> None:
-        logging.critical(msg)
+        logger.critical(msg)
+        logging.shutdown()
         os._exit(1)
 
     def _build_node_view(self, node: Node) -> NodeView:
@@ -432,7 +436,7 @@ class Runtime:
             node.done.set()
 
         # Log immediately so there is trace of it even if consumer never collects .result()
-        logging.error(f"Node {node.id} ({node.fn.name}) faulted: {exception}")
+        logger.error(f"Node {node.id} ({node.fn.name}) ended with exception: {exception}")
 
     def post_cancel(
         self,
