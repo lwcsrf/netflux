@@ -199,6 +199,15 @@ class AnthropicAgentNode(AgentNode):
                         output_config=OUTPUT_CFG,
                     ) as stream:
                         resp = stream.get_final_message()
+
+                        # Observed rare corner case: SDK may return a partial streamed Message snapshot with
+                        # `stop_reason` still None if the SSE body ends prematurely after normal headers, contradictory
+                        # to SDK docstring for `stop_reason`. Move this case onto the existing retriable connection path.
+                        if resp.stop_reason is None:
+                            raise anthropic.APIConnectionError(
+                                message="client response message ended with stop_reason=None, against protocol.",
+                                request=stream.response.request,
+                            )
                         break
 
                 except (
