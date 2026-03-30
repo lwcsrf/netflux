@@ -2354,6 +2354,10 @@ class TestTUIState(unittest.TestCase):
             provider=None,
             cancel_event=unittest.mock.ANY,
         )
+        self.assertIsInstance(
+            invoke_mock.call_args.kwargs["cancel_event"],
+            threading.Event,
+        )
 
     def test_launch_form_agent_provider_override_is_forwarded_only_for_root_invoke(self) -> None:
         fn = AgentFunction(

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import os
 from pathlib import Path
 import queue
@@ -10,7 +9,6 @@ import threading
 import textwrap
 import time
 from dataclasses import dataclass, field
-from multiprocessing.synchronize import Event as MpEvent
 from typing import Callable, Mapping
 
 from ..core import AgentFunction, Function, FunctionArg, Node, NodeState, NodeView, TerminalNodeStates, TokenBill
@@ -77,7 +75,7 @@ class _RunRecord:
     fn: Function
     node: Node
     renderer: ConsoleRender
-    cancel_event: MpEvent
+    cancel_event: threading.Event
     latest_view: NodeView | None = None
     terminal_callback_invoked: bool = False
     terminal_browse_applied: bool = False
@@ -708,7 +706,7 @@ class TUI(SessionController):
             self._form_state.error = str(exc)
             return
 
-        cancel_event = mp.Event()
+        cancel_event = threading.Event()
         try:
             node = self.runtime.invoke(
                 None,
@@ -763,7 +761,7 @@ class TUI(SessionController):
 
     def _fatal_after_launch(
         self,
-        cancel_event: MpEvent,
+        cancel_event: threading.Event,
         *,
         fn_name: str,
         node_id: int,
@@ -783,7 +781,7 @@ class TUI(SessionController):
         self,
         message: str,
         *,
-        cancel_event: MpEvent | None = None,
+        cancel_event: threading.Event | None = None,
         exc: BaseException | None = None,
     ) -> None:
         if exc is None:

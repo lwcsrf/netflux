@@ -3,18 +3,19 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Union, get_args, Mapping
 import inspect
-from threading import Thread
-import multiprocessing as mp
-from multiprocessing import Lock
-from multiprocessing.synchronize import Event
+import logging
+from threading import Event, Lock, Thread
 from overrides import override
+
+from .providers import Provider
 
 AllowedArgTypeUnion = Union[Type[str], Type[int], Type[float], Type[bool]]
 AllowedArgTypeTuple: tuple[type, ...] = tuple(
     inner for t in get_args(AllowedArgTypeUnion) for inner in get_args(t)
 )
 
-from .providers import Provider
+
+logger = logging.getLogger(__name__)
 
 class CancellationException(Exception):
     """Raised when a node cooperatively acknowledges a cancellation request."""
@@ -76,19 +77,60 @@ class TokenBill:
     output_tokens_total: int = 0
 
 class SessionBag:
-    """Thread-safe namespace/key object registry for a Node scope."""
+    """
+    Thread-safe namespace/key object registry owned by a single Node scope.
+
+    A SessionBag owns the lifecycle of the objects stored within it. `close()` is idempotent,
+    causes rejection of future `get_or_put()` calls, and transitively calls `close()` on each
+    closeable stored object, and then drops all remaining references even if some cleanup
+    failed or some objects are not closeable (so garbage collection finishes the cleanup).
+
+    The Runtime enforces that a Node cannot enter terminal state until its direct children have,
+    so ancestor SessionBags remain valid for descendants until the relevant subtree is terminal.
+    """
     def __init__(self) -> None:
         self._lock = Lock()
         self._values: Dict[str, Dict[str, Any]] = {}
+        self._closed: bool = False
 
     def get_or_put(self, namespace: str, key: str, factory: Callable[[], Any]) -> Any:
         with self._lock:
+            if self._closed:
+                raise RuntimeError("SessionBag is terminally closed")
             ns = self._values.setdefault(namespace, {})
             if key in ns:
                 return ns[key]
             value = factory()
             ns[key] = value
             return value
+
+    def close(self) -> None:
+        """Idempotently close the bag and release all owned references."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            values = self._values
+            self._values = {}
+
+        # Get all the unique object references in the bag with de-dup in case the same object was
+        # under multiple keys/namespaces (uncommon).
+        unique_objs: List[Any] = {
+            id(value): value for ns in values.values() for value in ns.values()
+        }.values()
+
+        # The assumption remains that the SessionBag is the sole parent container of these objects
+        # and owns their lifecycle, so should transitively close() all such owned objects.
+        for obj in unique_objs:
+            close = getattr(obj, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.exception(
+                        f"SessionBag: close() failed for owned object {obj!r}. "
+                        "However, it will be subject to GC.",
+                    )
 
 @dataclass(frozen=True)
 class FunctionArg:
@@ -210,6 +252,18 @@ class Function(ABC):
         return isinstance(self, CodeFunction)
 
 class AgentFunction(Function):
+    """
+    Declarative specification for an LLM-backed Function.
+
+    Provider implementations may invoke child Functions while driving the agent loop. Only the
+    main thread that entered the provider's `run()` method may call `RunContext.invoke()` or any
+    `RunContext.post_*()` method, otherwise behavior is undefined; helper threads spawned by the
+    main thread must not touch those APIs.
+    
+    If the agent determines its own outcome before those direct children finish and does not wait on children,
+    the Runtime keeps the node in Running state until the children are terminal. Thus, once the
+    agent node is terminal, its descendant subtree is terminal too, and that terminal outcome is immutable.
+    """
     def __init__(
         self,
         *,
@@ -243,6 +297,19 @@ class AgentFunction(Function):
         return list(self.uses_funcs)
 
 class CodeFunction(Function):
+    """
+    Declarative specification for deterministic Python code executed with a RunContext.
+
+    The callable's main invocation thread is the only thread that may call
+    `RunContext.invoke()` or any `RunContext.post_*()` method; helper threads spawned by the
+    main thread must not touch those APIs, otherwise the behavior is undefined.
+    
+    Authors should prefer ordinary control flow: return a value for success and raise
+    an Exception for failure. If the callable launches child Functions and does not wait on them
+    all, the Runtime keeps the node in Running state until its direct children are terminal. Thus,
+    once the code node is terminal, its descendant subtree is terminal too, and that terminal
+    outcome is immutable.
+    """
     def __init__(
         self,
         *,
@@ -386,17 +453,29 @@ class RunContext:
             tool_use_id=tool_use_id,
         )
 
-    def post_status_update(self, state: 'NodeState') -> None:
+    def post_running(self) -> None:
         if self.node is None:
-            raise RuntimeError("post_status_update may only be called from within a Node execution context")
-        self.runtime.post_status_update(self.node, state)
+            raise RuntimeError("post_running may only be called from within a Node execution context")
+        self.runtime.post_running(self.node)
 
     def post_success(self, outputs: Any) -> None:
+        """
+        Mark the current node as successful with the given outputs.
+
+        If the node still has direct children running, the Runtime will block here and keep the
+        node in Running state until those children have terminated.
+        """
         if self.node is None:
             raise RuntimeError("post_success may only be called from within a Node execution context")
         self.runtime.post_success(self.node, outputs)
 
     def post_exception(self, exception: Exception) -> None:
+        """
+        Mark the current node as failed with the given exception.
+
+        If the node still has direct children running, the Runtime will block here and keep the
+        node in Running state until those children have terminated.
+        """
         if self.node is None:
             raise RuntimeError("post_exception may only be called from within a Node execution context")
         self.runtime.post_exception(self.node, exception)
@@ -406,6 +485,9 @@ class RunContext:
         Inform the Runtime that the current Node is being cooperatively canceled.
         The `exception` may be provided to indicate the reason for cancellation,
         otherwise a generic `CancellationException` will be used.
+
+        If the node still has direct children running, the Runtime will block here and keep the
+        node in Running state until those children have terminated.
         """
         if self.node is None:
             raise RuntimeError("post_cancel may only be called from within a Node execution context")
@@ -513,7 +595,7 @@ class Node(ABC):
         self.parent: Optional[Node] = parent
         self.children: List[Node] = []
         self.thread: Optional[Thread] = None
-        self.done: Event = mp.Event()
+        self.done: Event = Event()
         self.session_bag: SessionBag = SessionBag()
         self.cancel_event: Optional[Event] = cancel_event
         self.started_at: Optional[float] = None
@@ -535,7 +617,7 @@ class Node(ABC):
         self.thread.start()
 
     def run_wrapper(self) -> None:
-        self.ctx.post_status_update(NodeState.Running)
+        self.ctx.post_running()
 
         try:
             self.run()
@@ -545,6 +627,7 @@ class Node(ABC):
             self.ctx.post_exception(ex)
         assert self.state in TerminalNodeStates
         assert self.done.is_set()
+        self.on_terminal_cleanup()
 
     @abstractmethod
     def run(self) -> None:
@@ -580,6 +663,9 @@ class Node(ABC):
             return False
         return self.cancel_event.is_set()
 
+    def on_terminal_cleanup(self) -> None:
+        self.session_bag.close()
+
 class CodeNode(Node):
     """
     The invoked CodeFunction is expected to expose a Python callable under the attribute
@@ -594,6 +680,20 @@ class CodeNode(Node):
     A caller will typically call `node.result()` to wait for completion and get the
     output string. Alternatively, the Callable may raise an Exception, which will be
     propagated upon calling `node.result()`.
+
+    If the Callable explicitly posts a terminal outcome itself via `self.ctx.post_*()`,
+    and then later returns or raises, the later return/exception is ignored. Thus, authors
+    are encouraged to use return value or exception for signaling the outcome.
+
+    If the Callable launches children and then returns or raises before those children
+    are terminal, the Runtime will keep this node in Running state and block its
+    terminalization until its direct children are terminal. Authors should still
+    explicitly wait on the children they launch where practical, because that is
+    cleaner and keeps child results/errors part of normal control flow.
+    
+    Only the main thread executing the Callable may use `RunContext.invoke()` and
+    `RunContext.post_*()`. Helper threads must not touch those APIs, and should be joined before
+    the Callable returns, raises, or posts a terminal outcome.
     """
     def __init__(
         self,
@@ -610,9 +710,8 @@ class CodeNode(Node):
 
     def run(self) -> None:
         assert isinstance(self.fn, CodeFunction)
-        func: CodeFunction = self.fn
         try:
-            result = func.callable(self.ctx, **self.inputs)
+            result = self.fn.callable(self.ctx, **self.inputs)
             self.ctx.post_success(result)
         except CancellationException as e:
             self.ctx.post_cancel(e)
@@ -628,7 +727,16 @@ class AgentNode(Node):
 
     Subclasses must implement `run()` to drive a provider-specific tool loop, and therein
     use the `RunContext` to submit children `Function` calls as a result of tool use.
-    Before returning from `run()`, they should have set `self.outputs` or `self.exception`.
+    Before returning from `run()`, they should use `self.ctx.post_success()`, `self.ctx.post_exception()`,
+    or `self.ctx.post_cancel()`.
+
+    Only the main thread that entered `run()` may call `RunContext.invoke()` or any
+    `RunContext.post_*()` method. Helper threads must not touch those APIs, and should be joined
+    before `run()` returns, raises, or posts a terminal outcome.
+
+    The Runtime will block terminalization if, and as long as, direct children are still running,
+    but provider implementations should still explicitly wait on the children they launch because
+    it is cleaner and keeps transcript/error handling deliberate.
     """
     def __init__(
         self,
@@ -669,7 +777,7 @@ class AgentNode(Node):
 
     @override
     def run_wrapper(self) -> None:
-        self.ctx.post_status_update(NodeState.Running)
+        self.ctx.post_running()
         try:
             self.run()
         except AgentException as e:
@@ -692,6 +800,7 @@ class AgentNode(Node):
             self.ctx.post_exception(mpe)
         assert self.state in TerminalNodeStates
         assert self.done.is_set()
+        self.on_terminal_cleanup()
 
     def build_user_text(self) -> str:
         # Templated user prompt injection.

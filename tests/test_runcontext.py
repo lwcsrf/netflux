@@ -69,6 +69,59 @@ class TestSessionBag(unittest.TestCase):
         for obj in results:
             self.assertIs(obj, results[0])
 
+    def test_session_bag_close_dedups_closers_and_continues_after_failure(self) -> None:
+        bag = SessionBag()
+
+        class CloseTracker:
+            def __init__(self, *, fail: bool = False) -> None:
+                self.fail = fail
+                self.close_calls = 0
+
+            def close(self) -> None:
+                self.close_calls += 1
+                if self.fail:
+                    raise RuntimeError("close failed")
+
+        shared = CloseTracker()
+        failing = CloseTracker(fail=True)
+        trailing = CloseTracker()
+
+        bag.get_or_put("ns-a", "shared-a", lambda: shared)
+        bag.get_or_put("ns-b", "shared-b", lambda: shared)
+        bag.get_or_put("ns-a", "failing", lambda: failing)
+        bag.get_or_put("ns-b", "trailing", lambda: trailing)
+
+        bag.close()
+
+        self.assertTrue(bag._closed)
+        self.assertEqual(bag._values, {})
+        self.assertEqual(shared.close_calls, 1)
+        self.assertEqual(failing.close_calls, 1)
+        self.assertEqual(trailing.close_calls, 1)
+
+        bag.close()
+
+        self.assertEqual(shared.close_calls, 1)
+        self.assertEqual(failing.close_calls, 1)
+        self.assertEqual(trailing.close_calls, 1)
+
+    def test_session_bag_get_or_put_rejects_new_entries_after_close(self) -> None:
+        bag = SessionBag()
+        factory_calls = 0
+
+        bag.get_or_put("ns", "existing", lambda: object())
+        bag.close()
+
+        def factory() -> object:
+            nonlocal factory_calls
+            factory_calls += 1
+            return object()
+
+        with self.assertRaisesRegex(RuntimeError, "terminally closed"):
+            bag.get_or_put("ns", "new", factory)
+
+        self.assertEqual(factory_calls, 0)
+
 
 class TestRunContextSessionBags(unittest.TestCase):
     def _build_runtime(self, root_fn: CodeFunction) -> Runtime:

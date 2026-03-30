@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from multiprocessing.synchronize import Event
+from threading import Event
 from typing import Any, Iterator, Mapping
 
 from rich.console import Console

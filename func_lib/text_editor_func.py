@@ -1,9 +1,9 @@
 from pathlib import Path
-from multiprocessing import Lock
 import tempfile
 import os
 import re
 import secrets
+from threading import Lock
 from typing import Set, Optional
 
 from ..core import FunctionArg, CodeFunction, RunContext, SessionScope

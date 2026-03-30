@@ -1,8 +1,14 @@
+import gc
 import logging
+import os
 import queue
+import sys
+import tempfile
 import threading
 import time
 import unittest
+import weakref
+from pathlib import Path
 from typing import Any, Iterable, List, Optional, Union
 from unittest.mock import patch
 import multiprocessing as mp
@@ -22,8 +28,11 @@ from ..core import (
     SessionScope,
     TokenBill,
     TokenUsage,
+    ModelTextPart,
     CancellationException,
 )
+from ..func_lib.bash_func import Bash, BashSession
+from ..func_lib.text_editor_func import TextEditor
 from ..providers import Provider
 
 
@@ -109,7 +118,7 @@ def _register_dummy_node(runtime: Runtime, node: Node) -> None:
         runtime._global_seqno += 1
         # Create NodeObservable with initial view
         runtime._node_observables[node.id] = NodeObservable(
-            cond=mp.Condition(runtime._lock),
+            cond=threading.Condition(runtime._lock),
             touch_seqno=runtime._global_seqno,
             view=runtime._build_node_view(node),
         )
@@ -359,6 +368,88 @@ class TestRuntimeInvocation(unittest.TestCase):
         child_node = node.children[0]
         self.assertIs(child_node.ctx.cancel_event, override_event)
 
+    def test_invoke_returns_root_in_error_state_when_thread_start_fails(self) -> None:
+        fn = _make_code_function("root_start_failure")
+        runtime = Runtime([fn], client_factories={})
+        orig_start = Node.start
+
+        def fail_start(node: Node) -> None:
+            if node.fn.name != "root_start_failure":
+                orig_start(node)
+                return
+            if node.thread is not None:
+                return
+            node.thread = threading.Thread(
+                target=node.run_wrapper,
+                name=f"netflux-node-{node.id}",
+                daemon=True,
+            )
+            raise RuntimeError("can't start new thread")
+
+        with patch("netflux.core.Node.start", new=fail_start), self.assertLogs(
+            "netflux.runtime", level=logging.ERROR
+        ):
+            node = runtime.invoke(None, fn, {})
+
+        self.assertEqual(node.state, NodeState.Error)
+        self.assertTrue(node.done.is_set())
+        self.assertIsNone(node.thread)
+        self.assertIsInstance(node.exception, RuntimeError)
+        with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+            node.result()
+
+        view = runtime.get_view(node.id)
+        self.assertEqual(view.state, NodeState.Error)
+        self.assertIsInstance(view.exception, RuntimeError)
+
+    def test_invoke_returns_child_in_error_state_when_thread_start_fails(self) -> None:
+        child_fn = _make_code_function("child_start_failure")
+        captured_child: dict[str, Node] = {}
+
+        def parent_callable(ctx: RunContext) -> str:
+            child = ctx.invoke(child_fn, {})
+            captured_child["node"] = child
+            return "parent"
+
+        parent_fn = _make_code_function("parent", callable=parent_callable, uses=[child_fn])
+        runtime = Runtime([parent_fn], client_factories={})
+        orig_start = Node.start
+
+        def fail_start(node: Node) -> None:
+            if node.fn.name != "child_start_failure":
+                orig_start(node)
+                return
+            if node.thread is not None:
+                return
+            node.thread = threading.Thread(
+                target=node.run_wrapper,
+                name=f"netflux-node-{node.id}",
+                daemon=True,
+            )
+            raise RuntimeError("can't start new thread")
+
+        with patch("netflux.core.Node.start", new=fail_start), self.assertLogs(
+            "netflux.runtime", level=logging.ERROR
+        ):
+            parent_node = runtime.invoke(None, parent_fn, {})
+            self.assertEqual(parent_node.result(), "parent")
+
+        self.assertEqual(len(parent_node.children), 1)
+        child_node = parent_node.children[0]
+        self.assertIs(child_node, captured_child["node"])
+        self.assertEqual(parent_node.state, NodeState.Success)
+        self.assertTrue(parent_node.done.is_set())
+        self.assertEqual(child_node.state, NodeState.Error)
+        self.assertTrue(child_node.done.is_set())
+        self.assertIsNone(child_node.thread)
+        self.assertIsInstance(child_node.exception, RuntimeError)
+        with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+            child_node.result()
+
+        child_view = runtime.get_view(child_node.id)
+        self.assertEqual(child_view.state, NodeState.Error)
+        self.assertIsInstance(child_view.exception, RuntimeError)
+
     def test_cancel_event_triggers_cancellation(self) -> None:
         cancel_event = mp.Event()
         started = threading.Event()
@@ -382,6 +473,796 @@ class TestRuntimeInvocation(unittest.TestCase):
         self.assertEqual(node.state, NodeState.Canceled)
         self.assertIsNotNone(node.exception)
         self.assertIsInstance(node.exception, CancellationException)
+
+    def test_terminal_node_closes_its_session_bag_values(self) -> None:
+        closed = threading.Event()
+
+        class Closeable:
+            def close(self) -> None:
+                closed.set()
+
+        def callable(ctx: RunContext) -> str:
+            ctx.get_or_put(SessionScope.Self, "ns", "key", Closeable)
+            return "done"
+
+        fn = _make_code_function("cleanup", callable=callable)
+        runtime = Runtime([fn], client_factories={})
+        node = runtime.invoke(None, fn, {})
+
+        self.assertEqual(node.result(), "done")
+        assert node.thread is not None
+        node.thread.join(timeout=1)
+        self.assertTrue(closed.wait(timeout=1))
+        self.assertTrue(node.session_bag._closed)
+
+    def test_result_waits_for_terminal_cleanup_to_finish(self) -> None:
+        close_started = threading.Event()
+        closed = threading.Event()
+
+        class Closeable:
+            def close(self) -> None:
+                close_started.set()
+                time.sleep(0.1)
+                closed.set()
+
+        def callable(ctx: RunContext) -> str:
+            ctx.get_or_put(SessionScope.Self, "cleanup.wait", "resource", Closeable)
+            return "done"
+
+        fn = _make_code_function("cleanup_waits", callable=callable)
+        runtime = Runtime([fn], client_factories={})
+        node = runtime.invoke(None, fn, {})
+
+        self.assertEqual(node.result(), "done")
+        self.assertTrue(close_started.is_set())
+        self.assertTrue(closed.is_set())
+        self.assertTrue(node.session_bag._closed)
+
+    def test_terminal_node_cleans_up_self_bag_across_terminal_outcomes(self) -> None:
+        for outcome in ("success", "error", "cancel"):
+            with self.subTest(outcome=outcome):
+                closed = threading.Event()
+                started = threading.Event()
+
+                class Closeable:
+                    def __init__(self) -> None:
+                        self.close_calls = 0
+
+                    def close(self) -> None:
+                        self.close_calls += 1
+                        closed.set()
+
+                resource = Closeable()
+                cancel_event = threading.Event() if outcome == "cancel" else None
+
+                def callable(ctx: RunContext) -> str:
+                    ctx.get_or_put(SessionScope.Self, "cleanup.self", "resource", lambda: resource)
+                    started.set()
+                    if outcome == "success":
+                        return "done"
+                    if outcome == "error":
+                        raise RuntimeError("boom")
+                    while not ctx.cancel_requested():
+                        time.sleep(0.01)
+                    raise CancellationException("stop")
+
+                fn = _make_code_function(f"cleanup_{outcome}", callable=callable)
+                runtime = Runtime([fn], client_factories={})
+                node = runtime.invoke(None, fn, {}, cancel_event=cancel_event)
+
+                if outcome == "success":
+                    self.assertEqual(node.result(), "done")
+                elif outcome == "error":
+                    with self.assertRaisesRegex(RuntimeError, "boom"):
+                        node.result()
+                else:
+                    self.assertTrue(started.wait(timeout=1))
+                    assert cancel_event is not None
+                    cancel_event.set()
+                    with self.assertRaises(CancellationException):
+                        node.result()
+
+                assert node.thread is not None
+                node.thread.join(timeout=1)
+                self.assertTrue(closed.wait(timeout=1))
+                self.assertEqual(resource.close_calls, 1)
+                self.assertTrue(node.session_bag._closed)
+                self.assertEqual(node.session_bag._values, {})
+                with self.assertRaisesRegex(RuntimeError, "terminally closed"):
+                    node.session_bag.get_or_put("cleanup.self", "late", lambda: object())
+
+    def test_terminal_agent_closes_parent_scoped_bash_session(self) -> None:
+        bash_fn = Bash()
+        agent_fn = _make_agent_function("agent_bash_cleanup", uses=[bash_fn])
+        captured: dict[str, Any] = {}
+
+        def linux_proc_identity(pid: int) -> Optional[tuple[str, str]]:
+            stat_path = Path(f"/proc/{pid}/stat")
+            try:
+                stat = stat_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+
+            stat_tail_idx = stat.rfind(")")
+            self.assertNotEqual(stat_tail_idx, -1, f"unexpected /proc/{pid}/stat format: {stat!r}")
+
+            fields = stat[stat_tail_idx + 2:].split()
+            self.assertGreaterEqual(
+                len(fields),
+                20,
+                f"unexpected /proc/{pid}/stat field count: {len(fields)}",
+            )
+            state = fields[0]
+            start_time = fields[19]
+            return state, start_time
+
+        class FakeAgentNode(AgentNode):
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage()
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
+            def run(self) -> None:
+                child = self.ctx.invoke(
+                    bash_fn,
+                    {"command": "echo hello from bash", "session_id": 7},
+                    tool_use_id="tool-1",
+                )
+                result = child.result()
+                session = self.session_bag._values["bash.session"][bash_fn._bag_key(7)]
+                proc = session._proc
+                assert proc is not None
+                captured["session"] = session
+                captured["proc"] = proc
+                captured["pid"] = proc.pid
+                if sys.platform.startswith("linux") and Path("/proc").is_dir():
+                    captured["linux_proc_identity_before_cleanup"] = linux_proc_identity(proc.pid)
+                captured["parent_bag_populated_before_cleanup"] = bool(self.session_bag._values)
+                captured["child_bag_empty"] = child.session_bag._values == {}
+                self.ctx.post_success(result)
+
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
+            runtime = Runtime([agent_fn], client_factories={Provider.Anthropic: lambda: object()})
+            node = runtime.invoke(None, agent_fn, {})
+            self.assertEqual(node.result().strip(), "hello from bash")
+            assert node.thread is not None
+            node.thread.join(timeout=2)
+
+        session = captured["session"]
+        proc = captured["proc"]
+        pid = captured["pid"]
+        self.assertIsInstance(session, BashSession)
+        self.assertTrue(captured["parent_bag_populated_before_cleanup"])
+        self.assertTrue(captured["child_bag_empty"])
+        self.assertFalse(session.alive())
+        self.assertIsNotNone(proc.returncode)
+        self.assertIsNone(session._proc)
+        self.assertIsNone(session._stdout_thread)
+        self.assertFalse(session.requires_restart)
+        self.assertFalse(session._alive_once_started)
+        self.assertTrue(node.session_bag._closed)
+        self.assertEqual(node.session_bag._values, {})
+
+        if os.name == "posix":
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+
+        if sys.platform.startswith("linux") and Path("/proc").is_dir():
+            before = captured["linux_proc_identity_before_cleanup"]
+            self.assertIsNotNone(before)
+            after = linux_proc_identity(pid)
+            if after is not None:
+                self.assertNotEqual(
+                    after[1],
+                    before[1],
+                    f"/proc/{pid}/stat still identifies the original bash process after cleanup "
+                    f"(state={after[0]!r})",
+                )
+
+    def test_terminal_root_clears_top_level_text_editor_lock_created_by_descendant(self) -> None:
+        editor_fn = TextEditor()
+        captured: dict[str, Any] = {}
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "notes.txt"
+            target.write_text("before\n", encoding="utf-8")
+
+            def grandchild_callable(ctx: RunContext) -> str:
+                editor_node = ctx.invoke(
+                    editor_fn,
+                    {
+                        "command": "str_replace",
+                        "path": str(target),
+                        "old_str": "before\n",
+                        "new_str": "after\n",
+                    },
+                )
+                result = editor_node.result()
+                top_bag = ctx.object_bags[SessionScope.TopLevel]
+                lock_key = editor_fn._file_lock_key(target.resolve())
+                lock = top_bag._values[editor_fn._FILE_LOCK_NAMESPACE][lock_key]
+                captured["top_level_bag_id"] = id(top_bag)
+                captured["lock_ref"] = weakref.ref(lock)
+                captured["lock_keys_before_cleanup"] = tuple(
+                    top_bag._values[editor_fn._FILE_LOCK_NAMESPACE].keys()
+                )
+                return result
+
+            grandchild_fn = _make_code_function(
+                "grandchild_editor_cleanup",
+                callable=grandchild_callable,
+                uses=[editor_fn],
+            )
+
+            def child_callable(ctx: RunContext) -> str:
+                return ctx.invoke(grandchild_fn, {}).result()
+
+            child_fn = _make_code_function(
+                "child_editor_cleanup",
+                callable=child_callable,
+                uses=[grandchild_fn],
+            )
+
+            def root_callable(ctx: RunContext) -> str:
+                return ctx.invoke(child_fn, {}).result()
+
+            root_fn = _make_code_function(
+                "root_editor_cleanup",
+                callable=root_callable,
+                uses=[child_fn],
+            )
+
+            runtime = Runtime([root_fn], client_factories={})
+            root_node = runtime.invoke(None, root_fn, {})
+            self.assertEqual(root_node.result(), "Replace successful.")
+            assert root_node.thread is not None
+            root_node.thread.join(timeout=1)
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
+            self.assertEqual(captured["top_level_bag_id"], id(root_node.session_bag))
+            self.assertTrue(captured["lock_keys_before_cleanup"])
+            self.assertTrue(root_node.session_bag._closed)
+            self.assertEqual(root_node.session_bag._values, {})
+
+            gc.collect()
+            self.assertIsNone(captured["lock_ref"]())
+
+    def test_descendant_can_use_ancestor_session_bags_while_ancestor_terminalization_is_deferred(self) -> None:
+        root_returning = threading.Event()
+        child_returning = threading.Event()
+        grandchild_started = threading.Event()
+        allow_grandchild_finish = threading.Event()
+        observed: dict[str, Any] = {}
+
+        def grandchild_callable(ctx: RunContext) -> str:
+            grandchild_started.set()
+            self.assertTrue(root_returning.wait(timeout=1))
+            self.assertTrue(child_returning.wait(timeout=1))
+
+            assert ctx.node is not None
+            assert ctx.node.parent is not None
+            root_node = ctx.node.parent.parent
+            child_node = ctx.node.parent
+            assert root_node is not None
+
+            deadline = time.monotonic() + 1
+            while time.monotonic() < deadline:
+                if (
+                    root_node.state is NodeState.Running
+                    and child_node.state is NodeState.Running
+                    and not root_node.done.is_set()
+                    and not child_node.done.is_set()
+                ):
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("Ancestors did not remain Running while terminalization was deferred")
+
+            top_bag = ctx.object_bags[SessionScope.TopLevel]
+            parent_bag = ctx.object_bags[SessionScope.Parent]
+            observed["root_bag_closed_before_access"] = top_bag._closed
+            observed["child_bag_closed_before_access"] = parent_bag._closed
+            observed["root_value"] = ctx.get_or_put(
+                SessionScope.TopLevel,
+                "deferred.cleanup",
+                "root",
+                lambda: "wrong-root",
+            )
+            observed["child_value"] = ctx.get_or_put(
+                SessionScope.Parent,
+                "deferred.cleanup",
+                "child",
+                lambda: "wrong-child",
+            )
+
+            self.assertTrue(allow_grandchild_finish.wait(timeout=5))
+            return "grandchild-done"
+
+        grandchild_fn = _make_code_function(
+            "grandchild_deferred_bag",
+            callable=grandchild_callable,
+        )
+
+        def child_callable(ctx: RunContext) -> str:
+            ctx.get_or_put(
+                SessionScope.Self,
+                "deferred.cleanup",
+                "child",
+                lambda: "child-value",
+            )
+            ctx.invoke(grandchild_fn, {})
+            child_returning.set()
+            return "child-done"
+
+        child_fn = _make_code_function(
+            "child_deferred_bag",
+            callable=child_callable,
+            uses=[grandchild_fn],
+        )
+
+        def root_callable(ctx: RunContext) -> str:
+            ctx.get_or_put(
+                SessionScope.Self,
+                "deferred.cleanup",
+                "root",
+                lambda: "root-value",
+            )
+            ctx.invoke(child_fn, {})
+            root_returning.set()
+            return "root-done"
+
+        root_fn = _make_code_function(
+            "root_deferred_bag",
+            callable=root_callable,
+            uses=[child_fn],
+        )
+
+        runtime = Runtime([root_fn], client_factories={})
+        root_node = runtime.invoke(None, root_fn, {})
+
+        self.assertTrue(grandchild_started.wait(timeout=1))
+        self.assertTrue(root_returning.wait(timeout=1))
+        self.assertTrue(child_returning.wait(timeout=1))
+
+        self.assertEqual(root_node.state, NodeState.Running)
+        self.assertFalse(root_node.done.is_set())
+        child_node = root_node.children[0]
+        grandchild_node = child_node.children[0]
+        self.assertEqual(child_node.state, NodeState.Running)
+        self.assertFalse(child_node.done.is_set())
+
+        allow_grandchild_finish.set()
+
+        self.assertEqual(root_node.result(), "root-done")
+        self.assertEqual(child_node.result(), "child-done")
+        self.assertEqual(grandchild_node.result(), "grandchild-done")
+
+        assert root_node.thread is not None
+        assert child_node.thread is not None
+        assert grandchild_node.thread is not None
+        root_node.thread.join(timeout=1)
+        child_node.thread.join(timeout=1)
+        grandchild_node.thread.join(timeout=1)
+
+        self.assertFalse(observed["root_bag_closed_before_access"])
+        self.assertFalse(observed["child_bag_closed_before_access"])
+        self.assertEqual(observed["root_value"], "root-value")
+        self.assertEqual(observed["child_value"], "child-value")
+        self.assertTrue(root_node.session_bag._closed)
+        self.assertTrue(child_node.session_bag._closed)
+        self.assertTrue(grandchild_node.session_bag._closed)
+
+    def test_terminal_root_implies_descendant_subtree_is_terminal(self) -> None:
+        root_returning = threading.Event()
+        child_returning = threading.Event()
+        grandchild_started = threading.Event()
+        allow_grandchild_finish = threading.Event()
+
+        def grandchild_callable(ctx: RunContext) -> str:
+            grandchild_started.set()
+            self.assertTrue(allow_grandchild_finish.wait(timeout=5))
+            return "grandchild-done"
+
+        grandchild_fn = _make_code_function(
+            "grandchild_subtree_terminal",
+            callable=grandchild_callable,
+        )
+
+        def child_callable(ctx: RunContext) -> str:
+            ctx.invoke(grandchild_fn, {})
+            child_returning.set()
+            return "child-done"
+
+        child_fn = _make_code_function(
+            "child_subtree_terminal",
+            callable=child_callable,
+            uses=[grandchild_fn],
+        )
+
+        def root_callable(ctx: RunContext) -> str:
+            ctx.invoke(child_fn, {})
+            root_returning.set()
+            return "root-done"
+
+        root_fn = _make_code_function(
+            "root_subtree_terminal",
+            callable=root_callable,
+            uses=[child_fn],
+        )
+
+        runtime = Runtime([root_fn], client_factories={})
+        root_node = runtime.invoke(None, root_fn, {})
+
+        self.assertTrue(grandchild_started.wait(timeout=1))
+        self.assertTrue(root_returning.wait(timeout=1))
+        self.assertTrue(child_returning.wait(timeout=1))
+
+        child_node = root_node.children[0]
+        grandchild_node = child_node.children[0]
+
+        self.assertEqual(root_node.state, NodeState.Running)
+        self.assertEqual(child_node.state, NodeState.Running)
+        self.assertEqual(grandchild_node.state, NodeState.Running)
+        self.assertFalse(root_node.done.is_set())
+        self.assertFalse(child_node.done.is_set())
+        self.assertFalse(grandchild_node.done.is_set())
+
+        allow_grandchild_finish.set()
+
+        self.assertEqual(root_node.result(), "root-done")
+        self.assertEqual(child_node.result(), "child-done")
+        self.assertEqual(grandchild_node.result(), "grandchild-done")
+        self.assertEqual(root_node.state, NodeState.Success)
+        self.assertEqual(child_node.state, NodeState.Success)
+        self.assertEqual(grandchild_node.state, NodeState.Success)
+        self.assertTrue(root_node.done.is_set())
+        self.assertTrue(child_node.done.is_set())
+        self.assertTrue(grandchild_node.done.is_set())
+
+    def test_watch_keeps_node_running_while_terminalization_is_blocked_on_child(self) -> None:
+        child_started = threading.Event()
+        root_returning = threading.Event()
+        child_release = threading.Event()
+
+        child_fn = _make_code_function(
+            "child_watch_running",
+            callable=_make_code_callable(
+                "child-done",
+                start_event=child_started,
+                proceed_event=child_release,
+            ),
+        )
+
+        def root_callable(ctx: RunContext) -> str:
+            ctx.invoke(child_fn, {})
+            root_returning.set()
+            return "root-done"
+
+        root_fn = _make_code_function(
+            "root_watch_running",
+            callable=root_callable,
+            uses=[child_fn],
+        )
+
+        runtime = Runtime([root_fn], client_factories={})
+        root_node = runtime.invoke(None, root_fn, {})
+
+        self.assertTrue(child_started.wait(timeout=1))
+        self.assertTrue(root_returning.wait(timeout=1))
+        time.sleep(0.05)
+
+        running_view = runtime.get_view(root_node.id)
+        self.assertEqual(running_view.state, NodeState.Running)
+        self.assertFalse(root_node.done.is_set())
+        self.assertIsNone(root_node.watch(as_of_seq=running_view.update_seqnum, timeout=0.05))
+        self.assertEqual(runtime.get_view(root_node.id).state, NodeState.Running)
+
+        child_release.set()
+        self.assertEqual(root_node.result(), "root-done")
+        self.assertEqual(runtime.get_view(root_node.id).state, NodeState.Success)
+
+    def test_terminalization_waits_for_direct_children_across_terminal_outcomes(self) -> None:
+        for outcome, expected_state in (
+            ("success", NodeState.Success),
+            ("error", NodeState.Error),
+            ("cancel", NodeState.Canceled),
+        ):
+            with self.subTest(outcome=outcome):
+                child_started = threading.Event()
+                child_release = threading.Event()
+                cancel_event = threading.Event() if outcome == "cancel" else None
+
+                child_fn = _make_code_function(
+                    f"child_wait_{outcome}",
+                    callable=_make_code_callable(
+                        "child-done",
+                        start_event=child_started,
+                        proceed_event=child_release,
+                    ),
+                )
+
+                def parent_callable(ctx: RunContext) -> str:
+                    ctx.invoke(child_fn, {})
+                    if outcome == "success":
+                        return "parent-done"
+                    if outcome == "error":
+                        raise RuntimeError("parent boom")
+                    while not ctx.cancel_requested():
+                        time.sleep(0.01)
+                    raise CancellationException("parent cancel")
+
+                parent_fn = _make_code_function(
+                    f"parent_wait_{outcome}",
+                    callable=parent_callable,
+                    uses=[child_fn],
+                )
+
+                runtime = Runtime([parent_fn], client_factories={})
+                parent_node = runtime.invoke(None, parent_fn, {}, cancel_event=cancel_event)
+
+                self.assertTrue(child_started.wait(timeout=1))
+                if cancel_event is not None:
+                    cancel_event.set()
+                time.sleep(0.05)
+
+                self.assertEqual(parent_node.state, NodeState.Running)
+                self.assertFalse(parent_node.done.is_set())
+                self.assertEqual(len(parent_node.children), 1)
+                child_node = parent_node.children[0]
+                self.assertFalse(child_node.done.is_set())
+
+                child_release.set()
+
+                if outcome == "success":
+                    self.assertEqual(parent_node.result(), "parent-done")
+                elif outcome == "error":
+                    with self.assertRaisesRegex(RuntimeError, "parent boom"):
+                        parent_node.result()
+                else:
+                    with self.assertRaises(CancellationException):
+                        parent_node.result()
+
+                self.assertEqual(parent_node.state, expected_state)
+                self.assertTrue(parent_node.done.is_set())
+                self.assertTrue(child_node.done.is_set())
+
+    def test_agent_node_preserves_explicit_terminal_outcome_against_wrapper_exception(self) -> None:
+        agent_fn = _make_agent_function("agent_terminal_immutability")
+
+        class FakeAgentNode(AgentNode):
+            def run(self) -> None:
+                self.ctx.post_success("early")
+                raise RuntimeError("late boom")
+
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage()
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
+            runtime = Runtime([agent_fn], client_factories={Provider.Anthropic: lambda: object()})
+            with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
+                node = runtime.invoke(None, agent_fn, {})
+                self.assertEqual(node.result(), "early")
+
+            assert node.thread is not None
+            node.thread.join(timeout=1)
+
+        self.assertEqual(node.state, NodeState.Success)
+        self.assertIsNone(node.exception)
+        self.assertTrue(
+            any("post_exception" in msg and "has no effect and is ignored" in msg for msg in captured.output)
+        )
+
+    def test_agent_node_ignores_post_terminal_transcript_update(self) -> None:
+        agent_fn = _make_agent_function("agent_transcript_immutability")
+
+        class FakeAgentNode(AgentNode):
+            def run(self) -> None:
+                self.ctx.post_success("early")
+                self.transcript.append(ModelTextPart(text="late"))
+                self.ctx.post_transcript_update()
+
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage()
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
+            runtime = Runtime([agent_fn], client_factories={Provider.Anthropic: lambda: object()})
+            with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
+                node = runtime.invoke(None, agent_fn, {})
+                self.assertEqual(node.result(), "early")
+
+            assert node.thread is not None
+            node.thread.join(timeout=1)
+
+        view = runtime.get_view(node.id)
+        self.assertEqual(view.state, NodeState.Success)
+        self.assertEqual(view.transcript, ())
+        self.assertTrue(
+            any(
+                "post_transcript_update" in msg and "has no effect and is ignored" in msg
+                for msg in captured.output
+            )
+        )
+
+    def test_code_node_preserves_explicit_terminal_outcome(self) -> None:
+        cases = (
+            (
+                "success_then_return",
+                lambda ctx: (ctx.post_success("early"), "late")[1],
+                NodeState.Success,
+                "early",
+                None,
+            ),
+            (
+                "exception_then_return",
+                lambda ctx: (ctx.post_exception(RuntimeError("early boom")), "late")[1],
+                NodeState.Error,
+                None,
+                RuntimeError,
+            ),
+            (
+                "cancel_then_return",
+                lambda ctx: (
+                    ctx.post_cancel(CancellationException("early cancel")),
+                    "late",
+                )[1],
+                NodeState.Canceled,
+                None,
+                CancellationException,
+            ),
+            (
+                "success_then_raise",
+                lambda ctx: (_ for _ in ()).throw(RuntimeError("late boom")),
+                NodeState.Success,
+                "early",
+                None,
+            ),
+        )
+
+        for name, body, expected_state, expected_output, expected_exc_type in cases:
+            with self.subTest(case=name):
+                def callable(ctx: RunContext) -> Any:
+                    if name == "success_then_raise":
+                        ctx.post_success("early")
+                    return body(ctx)
+
+                fn = _make_code_function(name, callable=callable)
+                runtime = Runtime([fn], client_factories={})
+                with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
+                    node = runtime.invoke(None, fn, {})
+
+                    if expected_exc_type is None:
+                        self.assertEqual(node.result(), expected_output)
+                    elif expected_exc_type is RuntimeError:
+                        with self.assertRaisesRegex(RuntimeError, "early boom"):
+                            node.result()
+                    else:
+                        with self.assertRaisesRegex(CancellationException, "early cancel"):
+                            node.result()
+
+                    assert node.thread is not None
+                    node.thread.join(timeout=1)
+                self.assertEqual(node.state, expected_state)
+                self.assertTrue(any("has no effect and is ignored" in msg for msg in captured.output))
+
+    def test_invoke_rejects_child_after_explicit_terminal_post_success_or_exception(self) -> None:
+        child_fn = _make_code_function("late_child")
+        cases = (
+            (
+                "success",
+                lambda ctx: ctx.post_success("early"),
+                NodeState.Success,
+                "early",
+                None,
+            ),
+            (
+                "exception",
+                lambda ctx: ctx.post_exception(RuntimeError("early boom")),
+                NodeState.Error,
+                None,
+                RuntimeError,
+            ),
+        )
+
+        for name, post_terminal, expected_state, expected_output, expected_exc_type in cases:
+            with self.subTest(case=name):
+                def parent_callable(ctx: RunContext) -> str:
+                    post_terminal(ctx)
+                    with self.assertRaisesRegex(RuntimeError, "terminal node"):
+                        ctx.invoke(child_fn, {})
+                    return "late"
+
+                parent_fn = _make_code_function(
+                    f"terminal_parent_{name}",
+                    callable=parent_callable,
+                    uses=[child_fn],
+                )
+                runtime = Runtime([parent_fn], client_factories={})
+                with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
+                    parent_node = runtime.invoke(None, parent_fn, {})
+
+                    if expected_exc_type is None:
+                        self.assertEqual(parent_node.result(), expected_output)
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "early boom"):
+                            parent_node.result()
+
+                assert parent_node.thread is not None
+                parent_node.thread.join(timeout=1)
+                self.assertEqual(parent_node.state, expected_state)
+                self.assertEqual(parent_node.children, [])
+                self.assertTrue(any("has no effect and is ignored" in msg for msg in captured.output))
+
+    def test_invoke_rejects_terminal_agent_child_before_construction(self) -> None:
+        agent_fn = _make_agent_function("late_agent")
+        observed = {"factory_calls": 0, "agent_inits": 0}
+
+        class FakeAgentNode(AgentNode):
+            def __init__(
+                self,
+                ctx: RunContext,
+                id: int,
+                fn: Function,
+                inputs: dict[str, Any],
+                parent: Optional[Node],
+                cancel_event=None,
+                client_factory=None,
+                tool_use_id=None,
+            ) -> None:
+                observed["agent_inits"] += 1
+                super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory, tool_use_id)
+                assert client_factory is not None
+                self.client = client_factory()
+
+            def run(self) -> None:
+                self.ctx.post_success("agent-output")
+
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage()
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
+        def factory() -> object:
+            observed["factory_calls"] += 1
+            return object()
+
+        def parent_callable(ctx: RunContext) -> str:
+            ctx.post_success("early")
+            with self.assertRaisesRegex(RuntimeError, "terminal node"):
+                ctx.invoke(agent_fn, {})
+            return "late"
+
+        parent_fn = _make_code_function(
+            "terminal_parent_agent_child",
+            callable=parent_callable,
+            uses=[agent_fn],
+        )
+
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
+            runtime = Runtime([parent_fn], client_factories={Provider.Anthropic: factory})
+            parent_node = runtime.invoke(None, parent_fn, {})
+            self.assertEqual(parent_node.result(), "early")
+
+        assert parent_node.thread is not None
+        parent_node.thread.join(timeout=1)
+        self.assertEqual(parent_node.children, [])
+        self.assertEqual(observed["agent_inits"], 0)
+        self.assertEqual(observed["factory_calls"], 0)
 
 
 class TestRuntimeObservability(unittest.TestCase):
@@ -447,7 +1328,7 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         _register_dummy_node(runtime, node)
         return runtime, node
 
-    def test_post_status_update_mutates_state_and_notifies(self) -> None:
+    def test_post_running_transitions_waiting_to_running_and_notifies(self) -> None:
         runtime, node = self._make_runtime_with_dummy_node()
         initial_view = runtime.get_view(node.id)
 
@@ -466,13 +1347,40 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         self.assertTrue(watcher_started.wait(timeout=1))
         self.assertTrue(results.empty())
 
-        runtime.post_status_update(node, NodeState.Running)
+        runtime.post_running(node)
         thread.join(timeout=1)
         self.assertFalse(thread.is_alive())
         updated = results.get(timeout=1)
         self.assertEqual(node.state, NodeState.Running)
         self.assertEqual(updated.state, NodeState.Running)
         self.assertGreater(updated.update_seqnum, initial_view.update_seqnum)
+
+    def test_post_running_is_noop_when_already_running(self) -> None:
+        runtime, node = self._make_runtime_with_dummy_node()
+        runtime.post_running(node)
+        initial_view = runtime.get_view(node.id)
+
+        runtime.post_running(node)
+
+        self.assertEqual(node.state, NodeState.Running)
+        self.assertEqual(runtime.get_view(node.id), initial_view)
+        self.assertIsNone(runtime.watch(node.id, as_of_seq=initial_view.update_seqnum, timeout=0.01))
+
+    def test_post_running_ignores_terminal_node(self) -> None:
+        runtime, node = self._make_runtime_with_dummy_node()
+        runtime.post_success(node, "ok")
+        initial_view = runtime.get_view(node.id)
+
+        with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
+            runtime.post_running(node)
+
+        self.assertEqual(node.state, NodeState.Success)
+        self.assertEqual(node.outputs, "ok")
+        self.assertTrue(node.done.is_set())
+        self.assertEqual(runtime.get_view(node.id), initial_view)
+        self.assertTrue(
+            any("post_running" in msg and "no effect and is ignored" in msg for msg in captured.output)
+        )
 
     def test_post_success_sets_outputs_and_marks_done(self) -> None:
         runtime, node = self._make_runtime_with_dummy_node(node_id=2)
@@ -511,6 +1419,58 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         self.assertEqual(view.state, NodeState.Canceled)
         self.assertIsNotNone(view.exception)
         self.assertIsInstance(view.exception, CancellationException)
+
+    def test_terminal_posts_ignore_later_terminal_transitions(self) -> None:
+        cases = (
+            (
+                "success_then_exception",
+                lambda runtime, node: runtime.post_success(node, "ok"),
+                lambda runtime, node: runtime.post_exception(node, RuntimeError("late boom")),
+                NodeState.Success,
+                "ok",
+                None,
+                "post_exception",
+            ),
+            (
+                "error_then_cancel",
+                lambda runtime, node: runtime.post_exception(node, RuntimeError("boom")),
+                lambda runtime, node: runtime.post_cancel(node, CancellationException("late cancel")),
+                NodeState.Error,
+                None,
+                RuntimeError,
+                "post_cancel",
+            ),
+            (
+                "canceled_then_success",
+                lambda runtime, node: runtime.post_cancel(node, CancellationException("cancel")),
+                lambda runtime, node: runtime.post_success(node, "late"),
+                NodeState.Canceled,
+                None,
+                CancellationException,
+                "post_success",
+            ),
+        )
+
+        for name, first_post, second_post, expected_state, expected_output, expected_exc_type, ignored_call in cases:
+            with self.subTest(case=name):
+                runtime, node = self._make_runtime_with_dummy_node()
+                first_post(runtime, node)
+                first_exception = node.exception
+
+                with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
+                    second_post(runtime, node)
+
+                self.assertEqual(node.state, expected_state)
+                self.assertEqual(node.outputs, expected_output)
+                if expected_exc_type is None:
+                    self.assertIsNone(node.exception)
+                else:
+                    self.assertIs(node.exception, first_exception)
+                    self.assertIsInstance(node.exception, expected_exc_type)
+                self.assertTrue(node.done.is_set())
+                self.assertTrue(
+                    any(ignored_call in msg and "has no effect and is ignored" in msg for msg in captured.output)
+                )
 
     def test_publish_viewtree_update_refreshes_ancestors(self) -> None:
         runtime = Runtime([], client_factories={})

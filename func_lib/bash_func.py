@@ -163,6 +163,18 @@ class BashSession:
         self._drain_queue_nowait()
         self.start()
 
+    def close(self) -> None:
+        self._terminate_group_if_alive()
+        try:
+            if self._stdout_thread is not None:
+                self._stdout_thread.join(timeout=0.25)
+        except Exception:
+            pass
+        self._stdout_thread = None
+        self._drain_queue_nowait()
+        self.requires_restart = False
+        self._alive_once_started = False
+
     def alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 

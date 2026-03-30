@@ -4,12 +4,10 @@ import logging
 import time
 from types import MappingProxyType
 from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Sequence, Union
-import multiprocessing as mp
-from multiprocessing import Lock
-from multiprocessing.synchronize import Event, Condition
 from collections import deque
 import os
 import threading
+from threading import Condition, Event, Lock
 
 from .core import (
     Node,
@@ -24,6 +22,7 @@ from .core import (
     SessionScope,
     SessionBag,
     CancellationException,
+    TerminalNodeStates,
     TokenUsage,
     ToolUsePart,
     ToolResultPart,
@@ -156,6 +155,11 @@ class Runtime:
         inputs = fn.validate_coerce_args(inputs)
 
         with self._lock:
+            if caller is not None and caller.state in TerminalNodeStates:
+                raise RuntimeError(
+                    f"Cannot invoke child function '{fn.name}' from terminal node "
+                    f"{caller.id} ({caller.fn.name})."
+                )
             node_id = self._next_node_id
             self._next_node_id += 1
 
@@ -198,7 +202,7 @@ class Runtime:
 
             self._nodes_by_id[node_id] = node
             self._node_observables[node_id] = NodeObservable(
-                cond=mp.Condition(self._lock),
+                cond=Condition(self._lock),
                 touch_seqno=self._global_seqno,
                 view=self._build_node_view(node),
             )
@@ -210,7 +214,11 @@ class Runtime:
            
             self._publish_viewtree_update(node)
 
-        node.start()
+        try:
+            node.start()
+        except Exception as ex:
+            node.thread = None
+            self.post_exception(node, ex)
         return node
 
     def _build_session_bags(self, node: Node) -> Dict[SessionScope, SessionBag]:
@@ -406,17 +414,57 @@ class Runtime:
             return node.id
         return node
 
-    def post_status_update(self, node: Node, state: NodeState) -> None:
+    def post_running(self, node: Node) -> None:
         with self._lock:
+            if node.state is NodeState.Running:
+                return
+            if node.state in TerminalNodeStates:
+                logger.error(
+                    "Ignoring post_running for already-terminal node %s (%s); "
+                    "it shall have no effect and is ignored.",
+                    node.id, node.fn.name,
+                )
+                return
+            assert node.state is NodeState.Waiting, (
+                f"Unexpected node state for post_running: {node.state.value}"
+            )
+            
             self._global_seqno += 1
-            # Record start time on first transition to Running
-            if state is NodeState.Running and not node.started_at:
+            if not node.started_at:
                 node.started_at = time.time()
-            node.state = state
+            node.state = NodeState.Running
             self._publish_viewtree_update(node)
 
-    def post_success(self, node: Node, outputs: Any) -> None:
+    def wait_for_children_finished(self, node: Node) -> None:
+        """
+        Block until all direct children of `node` are in terminal states
+        and also totally non-runnable going forward.
+
+        The runtime enforces this before allowing a node to enter any terminal state.
+        Because every child is subject to the same rule before it can become terminal,
+        waiting for direct children is sufficient by induction to imply the entire
+        descendant subtree is terminal when this returns.
+        """
         with self._lock:
+            children = tuple(node.children)
+        for child in children:
+            child.done.wait()
+            if child.thread is not None:
+                child.thread.join()
+
+    def post_success(self, node: Node, outputs: Any) -> None:
+        self.wait_for_children_finished(node)
+        node.on_terminal_cleanup()
+
+        with self._lock:
+            if node.state in TerminalNodeStates:
+                logger.error(
+                    "Ignoring post_success for terminal node %s (%s); transition from %s "
+                    "to %s has no effect and is ignored.",
+                    node.id, node.fn.name, node.state.value, NodeState.Success.value,
+                )
+                return
+        
             self._global_seqno += 1
             node.outputs = outputs
             node.state = NodeState.Success
@@ -426,7 +474,18 @@ class Runtime:
             node.done.set()
 
     def post_exception(self, node: Node, exception: Exception) -> None:
+        self.wait_for_children_finished(node)
+        node.on_terminal_cleanup()
+        
         with self._lock:
+            if node.state in TerminalNodeStates:
+                logger.error(
+                    "Ignoring post_exception for terminal node %s (%s); transition from %s "
+                    "to %s has no effect and is ignored.",
+                    node.id, node.fn.name, node.state.value, NodeState.Error.value,
+                )
+                return
+        
             self._global_seqno += 1
             node.exception = exception
             node.state = NodeState.Error
@@ -443,9 +502,22 @@ class Runtime:
         node: Node,
         exception: Optional[CancellationException] = None,
     ) -> None:
-        """`exception` can be provided to explain the reason for cancellation
-        otherwise the Node is assigned a no-reason CancellationException."""
+        """
+        `exception` can be provided to explain the reason for cancellation
+        otherwise the Node is assigned a no-reason CancellationException.
+        """
+        self.wait_for_children_finished(node)
+        node.on_terminal_cleanup()
+
         with self._lock:
+            if node.state in TerminalNodeStates:
+                logger.error(
+                    "Ignoring post_cancel for terminal node %s (%s); transition from %s "
+                    "to %s has no effect and is ignored.",
+                    node.id, node.fn.name, node.state.value, NodeState.Canceled.value,
+                )
+                return
+        
             self._global_seqno += 1
             node.exception = exception or CancellationException()
             node.state = NodeState.Canceled
@@ -457,5 +529,12 @@ class Runtime:
     def post_transcript_update(self, node: Node) -> None:
         """Called by a Node when its transcript changed and a new NodeView snapshot should be published."""
         with self._lock:
+            if node.state in TerminalNodeStates:
+                logger.error(
+                    "Ignoring post_transcript_update for terminal node %s (%s); "
+                    "it has no effect and is ignored.",
+                    node.id, node.fn.name,
+                )
+                return
             self._global_seqno += 1
             self._publish_viewtree_update(node)
