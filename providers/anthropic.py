@@ -1,9 +1,10 @@
 from types import SimpleNamespace, MappingProxyType
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
-from multiprocessing.synchronize import Event
+import logging
 import time
 import random
+from threading import Event
 from overrides import override
 
 from ..core import (
@@ -30,6 +31,9 @@ from anthropic.types import (
 
 )
 from anthropic.types.tool_param import InputSchemaTyped
+
+
+logger = logging.getLogger(__name__)
 
 """
 ## Misc Research Notes (applicable to Claude 4 models)
@@ -172,7 +176,6 @@ class AnthropicAgentNode(AgentNode):
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
 
             # Apply watermark to *latest* user message only (just-in-time).
@@ -244,7 +247,6 @@ class AnthropicAgentNode(AgentNode):
 
                     if self.is_cancel_requested():
                         self.ctx.post_cancel()
-                        self.client.close()
                         return
 
                     delay = base_delay * (2 ** (attempt - 1))
@@ -256,7 +258,6 @@ class AnthropicAgentNode(AgentNode):
                     if self.cancel_event:
                         if self.cancel_event.wait(delay):
                             self.ctx.post_cancel()
-                            self.client.close()
                             return
                     else:
                         time.sleep(delay)
@@ -271,7 +272,6 @@ class AnthropicAgentNode(AgentNode):
 
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
 
             # Incremental token accounting.
@@ -347,14 +347,12 @@ class AnthropicAgentNode(AgentNode):
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_transcript_update()
                 self.ctx.post_success(final_text)
-                self.client.close()
                 return
 
             # Make sure we check for cancellation right before commencing possibly
             # lengthy sub-tasks.
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
 
             # Assert expectation: model requested tool use in this turn.
@@ -435,11 +433,9 @@ class AnthropicAgentNode(AgentNode):
             # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
-                self.client.close()
                 return
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
             
             # Per protocol: next user message contains only tool_result blocks
@@ -557,3 +553,12 @@ class AnthropicAgentNode(AgentNode):
         if py_t is float: return "number"
         if py_t is bool:  return "boolean"
         return "string"  # fallback
+
+    @override
+    def on_terminal_cleanup(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            logger.exception("Anthropic client cleanup failed for node %s", self.id)
+        self.client = None  # type: ignore[assignment]
+        super().on_terminal_cleanup()

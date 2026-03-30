@@ -2,9 +2,10 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from types import MappingProxyType
 import copy
 import base64
+import logging
 import time
 import random
-from multiprocessing.synchronize import Event
+from threading import Event
 import httpx
 from overrides import override
 
@@ -18,6 +19,9 @@ from . import ModelNames, Provider
 import google.genai as genai
 from google.genai import types
 from google.genai import errors as genai_errors
+
+
+logger = logging.getLogger(__name__)
 
 """
 ## Misc Research Notes.
@@ -159,7 +163,6 @@ class GeminiAgentNode(AgentNode):
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
 
             # One thinking-tool turn.
@@ -239,7 +242,6 @@ class GeminiAgentNode(AgentNode):
 
                     if self.is_cancel_requested():
                         self.ctx.post_cancel()
-                        self.client.close()
                         return
 
                     delay = base_delay * (2 ** (attempt - 1))
@@ -251,7 +253,6 @@ class GeminiAgentNode(AgentNode):
                     if self.cancel_event:
                         if self.cancel_event.wait(delay):
                             self.ctx.post_cancel()
-                            self.client.close()
                             return
                     else:
                         time.sleep(delay)
@@ -266,7 +267,6 @@ class GeminiAgentNode(AgentNode):
             
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
 
             # Incremental token accounting.
@@ -284,7 +284,6 @@ class GeminiAgentNode(AgentNode):
                 # No new content and we are done.
                 # Finalize with whatever is in the transcript.
                 self.ctx.post_success(self._final_text())
-                self.client.close()
                 return
             
             # Thoughts are supposed to be empty (hidden) or we want to know of API change.
@@ -326,7 +325,6 @@ class GeminiAgentNode(AgentNode):
                 assert candidate.finish_reason == types.FinishReason.STOP, (
                     "Expected finish_reason=STOP when no function calls")
                 self.ctx.post_success(self._final_text())
-                self.client.close()
                 return
 
             # At this point, there are function calls to process. First, sanity check:
@@ -337,7 +335,6 @@ class GeminiAgentNode(AgentNode):
             # lengthy sub-tasks.
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
 
             # Execute requested tools in parallel and aggregate all function responses.
@@ -425,11 +422,9 @@ class GeminiAgentNode(AgentNode):
             # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
-                self.client.close()
                 return
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
-                self.client.close()
                 return
             
             # Per protocol: next user message contains only function results.
@@ -532,3 +527,12 @@ class GeminiAgentNode(AgentNode):
         if py_t is float: return types.Type.NUMBER
         if py_t is bool:  return types.Type.BOOLEAN
         return types.Type.STRING
+
+    @override
+    def on_terminal_cleanup(self) -> None:
+        try:
+            self.client.close()
+        except Exception:
+            logger.exception("Gemini client cleanup failed for node %s", self.id)
+        self.client = None  # type: ignore[assignment]
+        super().on_terminal_cleanup()

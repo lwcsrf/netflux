@@ -314,11 +314,11 @@ TUI(runtime).run()
 If you already have a top-level `Node` and just want to inspect that one tree, use `ConsoleRender` directly instead of writing your own watch loop:
 
 ```python
-import multiprocessing as mp
+import threading
 
 from netflux.tui import ConsoleRender
 
-cancel_evt = mp.Event()
+cancel_evt = threading.Event()
 node = ctx.invoke(top_level_fn, {...}, cancel_event=cancel_evt)
 render = ConsoleRender(spinner_hz=10.0)
 render.run(node)
@@ -332,7 +332,7 @@ For the standalone `ConsoleRender.run(node)` entrypoint, the top-level `Node` mu
 
 ## `SessionBag` & Objects
 
-In OOP, methods are functions that mutate an object’s state. netflux supports similar patterns with a **`SessionBag`**, a scoped object store with the **lifetime of a task** (and handy access to parent/root scopes). There are two important use cases in mind:
+In OOP, methods are functions that mutate an object’s state. netflux supports similar patterns with a **`SessionBag`**, an owned scoped object store with the **lifetime of a task** (and handy access to parent/root scopes). The framework enforces that a `Node` cannot actually enter a terminal state until its direct children are terminal, so in practice these bags remain valid until the relevant subtree is terminal. When the owning `Node` finally reaches terminal cleanup, the bag closes, rejects new entries, best-effort closes stored closeable objects, and drops its references. There are two important use cases in mind:
 
 * `Function`s can stash and retrieve objects to act like methods scoped to their parent or root ancestor. A good example of this is an agent that uses `bash` to perform its task, where it needs to persist a `BashSession` across command invocations (in this case, the `BashSession` is kept in the agent-scope `SessionBag` and the children invocations retrieve it).
 * `Function`s may use the `SessionBag` objects to pass input/output across sub‑tasks without serializing through text.
@@ -341,7 +341,7 @@ In OOP, methods are functions that mutate an object’s state. netflux supports 
 
 ## Concurrency (fan‑out)
 
-A task and its sub‑tasks form a **tree** where each node’s children are ordered by invocation (child edges record the call sequence). Like `Future`s, you can **launch multiple children in parallel** and defer collecting each `node.result()` until you’re ready to block. For `AgentFunction`s, this also works when the underlying model supports **parallel tool calling**.
+A task and its sub‑tasks form a **tree** where each node’s children are ordered by invocation (child edges record the call sequence). Like `Future`s, you can **launch multiple children in parallel** and defer collecting each `node.result()` until you’re ready to block. For `AgentFunction`s, this also works when the underlying model supports **parallel tool calling**. A callable or agent loop may determine its own success, exception, or cancellation before those children are terminal, but the framework will enforce that the node cannot actually *enter* a terminal state until its direct children are terminal. In that case the node remains in Running state and the terminalization call blocks until the children finish. By induction, if a node is terminal then its descendant subtree is terminal too; in particular, when a root node is done the entire tree is done. Once a node actually enters `Success`, `Error`, or `Canceled`, that terminal outcome is immutable. Authors should still explicitly wait on the children they launch where practical, because that is cleaner and makes handling child outputs, errors, and cancellation more deliberate.
 
 ---
 
@@ -367,14 +367,15 @@ See the detailed [Exception Model](#exception-model) below for guidance on when 
 
 ## Cooperative Cancellation
 
-**Cooperative Cancellation** uses cancellation token chaining, similar to that seen in languages like C# (`CancellationToken`s) and Go (`Context`s). For now we simply use `mp.Event` for these. Since tasks can be long-running, especially when they are agents, it's imperative to be able to timely interrupt entire trees or sub-trees to save resources when agents are not going in the desired direction or progress is not meeting time deadlines, and also just for responsive user experience.
+**Cooperative Cancellation** uses cancellation token chaining, similar to that seen in languages like C# (`CancellationToken`s) and Go (`Context`s). For now we simply use standard Python `Event` objects such as `threading.Event` for these. Since tasks can be long-running, especially when they are agents, it's imperative to be able to timely interrupt entire trees or sub-trees to save resources when agents are not going in the desired direction or progress is not meeting time deadlines, and also just for responsive user experience.
 
 By "cooperative", we refer to the pattern of cancellation chaining that requires framework consumers to properly adhere to the pattern in order to get the benefit. This means:
 
 * New `providers/` extensions (`AgentNode` subtypes) should check for cancellation at opportune times (before invoking children; before initial remote model invocation or before following up with function results). `AgentNode`s should `post_cancel()` in their agent loops and then simply exit the loop (return), or alternatively they can raise `cancellationException`. See `providers/anthropic.py` for an example.
 * `CodeFunction` callables should similarly be responsive to `self.is_cancel_requested()` and simply raise `cancellationException` as opportune times.
 * Always check for cancellation before invoking children tasks.
-* Always collect running children (e.g. block on each child `node.result()`) before responding to a cancellation request.
+* The framework will delay any terminal cancellation until direct children are terminal, so a node may remain in Running state while `post_cancel()` blocks waiting for its children to finish.
+* Even so, it is cleaner for authors to explicitly collect running children (e.g. block on each child `node.result()`) before responding to a cancellation request, because that keeps child outcomes part of normal control flow.
 * If an agent loop or callable is able to determine a success/exception outcome at or near the same time it would respond to cancellation, it should always prioritize concluding with success/exception instead of reacting to the cancellation request. This is because the work was done anyway, so you want the transcripts to show whatever was actually done at the time of cancellation.
 
 ---
@@ -574,11 +575,16 @@ This refined example shows:
     * `cancel_event: Optional[Event]`: cooperative cancellation token inherited from the caller unless explicitly overridden by the caller.
 * Methods:
     * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None) -> Node`: invoke a `Function`, optionally overriding the cancellation scope, and return the created `Node`.
+        * Child invocations may be launched asynchronously and awaited later, but the Runtime will not allow the caller to enter a terminal state until its direct children are terminal. If the caller returns, raises, or posts any terminal outcome early, terminalization blocks while the node remains in Running state.
+        * Therefore, once a node is terminal, its descendant subtree is terminal too.
+        * Once the caller has actually entered a terminal state, further child invocations from it are rejected.
+        * It is still cleaner for authors to explicitly wait on the children they launch, because that keeps outputs/errors/cancellation handling deliberate.
         * `tool_use_id` is primarily for provider/framework internals to correlate agent transcript tool-call entries with created child nodes. Typical top-level and `CodeFunction` call sites should leave it as `None`.
-    * `post_status_update(state: NodeState)`: update the current node's status.
-    * `post_success(outputs: Any)`: mark the current node as successful with given outputs.
-    * `post_exception(exception: Exception)`: mark the current node as failed with given exception.
-    * `post_cancel()`: mark the current node as terminally canceled.
+    * `post_running()`: transition the current node from Waiting to Running. This is mainly for framework internals; repeated calls while already Running are a no-op, and calls after terminalization are ignored with an error log.
+    * Once a node actually reaches `Success`, `Error`, or `Canceled`, that terminal outcome is immutable; later terminal posts are logged and ignored.
+    * `post_success(outputs: Any)`: mark the current node as successful with given outputs. If direct children are still running, the call blocks and the node remains in Running state until they are terminal.
+    * `post_exception(exception: Exception)`: mark the current node as failed with given exception. If direct children are still running, the call blocks and the node remains in Running state until they are terminal.
+    * `post_cancel()`: mark the current node as terminally canceled. If direct children are still running, the call blocks and the node remains in Running state until they are terminal.
     * `cancel_requested() -> bool`: helper to check whether the associated cancellation token has been triggered. This does not mean that the `Node` is already canceled and in canceled state -- it means there is active signaled *intention* to cancel.
 * Narrow Scope: `RunContext` is just a mechanism to pass on `Function` invocation directives to the `Runtime` to act on them.
 
@@ -600,12 +606,14 @@ This refined example shows:
         * Always ordered to reflect the sequence in which `Function`s were invoked. 
         * For consumers outside the framework, use `NodeView.children: tuple[NodeView, ...]` instead to access child information safely.
     * Has states (Waiting, Running, Success, Error, Canceled) but also sub-state including tool use (`Function` invocation) that it is waiting on.
-    * `AgentNode` is completed once it returns final assistant text or the model decides to `RaiseException` (if it has been given as an option).
+    * An `AgentNode` may determine its own terminal outcome before its children do, but it does not actually enter a terminal state until its direct children are terminal (either cooperatively or by framework enforcement). While blocked on that boundary it remains in `Running`.
+    * Therefore, once an `AgentNode` is terminal, its descendant subtree is terminal too.
     * `TokenUsage` cumulative accounting must be reportable by every `AgentNode` and kept up to date throughout the agent loop (updated on every request/response iteration).
         * Subtype implementations must use the provider SDK's token usage meta to track the accumulation.
 * `CodeNode`: represents and manages the state and running of a `CodeFunction` invocation.
     * Simpler than `AgentFunction` because it is just a function call (unlike LLM session complexity). Authors invoke `Function`s directly from within the `Callable`.
-    * `CodeNode` is completed once it either returns or raises.
+    * A `CodeNode` may return or raise before its children finish, but it does not actually enter a terminal state until its direct children are terminal. While blocked on that boundary it remains in `Running`. It's recommended to explicitly wait on all children to finish before returning or raising, but the framework will enforce the terminalization order regardless.
+    * Therefore, once a `CodeNode` is terminal, its descendant subtree is terminal too.
 * Fields / Properties:
     * `id: int`: monotonically increasing unique identifier when Node is to be used as key in any lookup. This is one and the same as "task id".
     * `fn: Function`: which `Function` the `Node` is an instance of.
@@ -644,8 +652,10 @@ This refined example shows:
 ## `SessionBag`
 
 * Collection of arbitrary objects that may be read, mutated, and persisted by `Function`s.
-* Each `Node` created introduces a `SessionBag` with its lifetime. The `Node` and its children can access the bag.
+* Each `Node` created introduces a `SessionBag` that it owns for that node-scoped lifetime. The `Node` and its children can access the bag.
     * Thus, the `Node` can also access its parent's `SessionBag`, if it has a parent.
+    * While a callable is free to return, raise, or post a terminal outcome before its children are terminal, the framework will keep that `Node` in Running state and block terminalization until its direct children are terminal.
+    * This is why closing a `SessionBag` on `Node` terminal cleanup is safe: by the time the bag closes, the relevant subtree is already terminal.
 * Each `Node` can also access the `SessionBag` of the root `Node`.
 * `SessionScope`: enum of lifetime scopes, each of which would refer to a different `SessionBag` that a `Node` can access:
     * `TopLevel`: Lifetime envelopes all Nodes in a top-level tree. This would give the root `Node`'s bag.
@@ -667,9 +677,12 @@ This refined example shows:
         * To simplify, this is the only mechanism to be used by `Function`s for access. Concurrency-safe in case of parallel `Function` invocations. Simplify by invoking `factory` under the lock since not high-frequency.
         * `Function` implementations should cooperate to use descript namespaces and keys, composed of static string constants and instance numbers if multiplicity is possible.
     * `Runtime` is responsible for creating `SessionBag` with each `Node` and propagating references to new descendants.
-* Framework will currently rely on ref counting, garbage collection, and self-disposing object behavior (author responsibility).
-    * `Runtime` destruction, or explicit user request to delete a finished tree, will induce disposal of all `SessionBag`-referenced objects and their resources.
-    * This keeps objects alive long past their usable scope (potential resource leak), but is very worth the debuggability for finished subtrees. We can make this more configurable in the future (e.g. mandatory finalizers and dispose on `Node` completion).
+* `SessionBag` ownership is enforced by the framework at `Node` terminal cleanup.
+    * When a `Node` enters a terminal state, its `SessionBag` is closed.
+    * After closure, new `get_or_put()` attempts are rejected.
+    * Any owned objects with callable `close()` are closed transitively on a best-effort basis.
+    * Objects without `close()`, or whose `close()` fails, are still released because the bag drops its references.
+    * Because the Runtime delays terminalization until direct children are terminal, ancestor bags remain usable to descendants until the relevant subtree is done.
 
 ## Exception Model
 
@@ -729,6 +742,7 @@ This refined example shows:
     * A batch of parallel tool calls may result in 0, 1, or more of them succeeding or excepting and this is normal.
     * When a model issues a batch of tool calls and one of them is RaiseException (unusual), honor the model's intent and propagate `AgentException` to end the agent loop after the whole batch is attempted.
 * `CodeFunction` authors guidance:
+    * Prefer ordinary control flow for your own outcome: return a value for success and raise an `Exception` for failure.
     * Be aware that `Node.result()` from invoked functions may raise.
     * Ensure raisable `Exception`s from the Callable have descript type names and sufficient detail. If bubbling, sometimes this requires try-catch interception just to augment details (e.g. is the error pertaining to an input or output) and then re-raising.
     * Consider `AgentException`: may be difficult to handle statically; consider: retry, change provider. If repeatable, wrap attempts, augment context, and bubble up.
@@ -736,7 +750,7 @@ This refined example shows:
 * `AgentFunction` authors guidance:
     * Add the built-in `RaiseException` to the `AgentFunction.uses` property to enlist in `AgentException`s.
     * Provide additional guidance on when to raise, when to bubble up, (or how hard to retry alternatives first) in the system and user prompt. Iterate through trial and error. This will be very specific to the agent's purpose and scope.
-    * Strongly consider instructing the model to invoke `human_in_loop()` **before** considering `raise_exception()`.
+    * Consider instructing the model to invoke something like `human_in_loop()` **before** considering `raise_exception()`.
 
 ## `NodeView`
 
@@ -753,7 +767,7 @@ This refined example shows:
 
 - What triggers a new `NodeView`
   - Node creation and linking into the tree
-  - Status changes (`post_status_update`), success/exception/cancel
+  - Automatic transition to Running, plus success/exception/cancel
   - Transcript appends (agents call `post_transcript_update()` after each append)
 
 - Consistency model (origin-only live rebuild)

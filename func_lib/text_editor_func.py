@@ -1,15 +1,26 @@
 from pathlib import Path
-from multiprocessing import Lock
 import tempfile
 import os
 import re
 import secrets
+from threading import Lock
 from typing import Set, Optional
 
 from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
 
 class TextEditorException(Exception):
     """Raised for business-logic violations in the TextEditor tool."""
+
+
+class _FileLock:
+    def __init__(self) -> None:
+        self._lock = Lock()
+
+    def acquire(self, *args, **kwargs):
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self) -> None:
+        self._lock.release()
 
 class TextEditor(CodeFunction):
     """
@@ -137,7 +148,7 @@ class TextEditor(CodeFunction):
             SessionScope.TopLevel,
             namespace=self._FILE_LOCK_NAMESPACE,
             key=self._file_lock_key(p),
-            factory=Lock,
+            factory=_FileLock,
         )
 
     def handle_view(
