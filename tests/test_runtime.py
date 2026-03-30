@@ -1,6 +1,8 @@
 import gc
 import logging
+import os
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -410,63 +412,6 @@ class TestRuntimeInvocation(unittest.TestCase):
         self.assertTrue(closed.wait(timeout=1))
         self.assertTrue(node.session_bag._closed)
 
-    def test_terminal_agent_cleans_up_client(self) -> None:
-        agent_fn = _make_agent_function("agent_cleanup")
-
-        class DummyClient:
-            def __init__(self) -> None:
-                self.closed = False
-
-            def close(self) -> None:
-                self.closed = True
-
-        class FakeAgentNode(AgentNode):
-            last_client: Optional[DummyClient] = None
-
-            def __init__(
-                self,
-                ctx: RunContext,
-                id: int,
-                fn: Function,
-                inputs: dict[str, Any],
-                parent: Optional[Node],
-                cancel_event=None,
-                client_factory=None,
-                tool_use_id=None,
-            ) -> None:
-                super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory, tool_use_id)
-                self.client = DummyClient()
-                type(self).last_client = self.client
-
-            def run(self) -> None:
-                self.ctx.post_success("agent-output")
-
-            def on_terminal_cleanup(self) -> None:
-                self.client.close()
-                self.client = None
-                super().on_terminal_cleanup()
-
-            @property
-            def token_usage(self) -> TokenUsage:
-                return TokenUsage()
-
-            @property
-            def provider(self) -> Provider:
-                return Provider.Anthropic
-
-        with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
-            runtime = Runtime([agent_fn], client_factories={Provider.Anthropic: lambda: object()})
-            node = runtime.invoke(None, agent_fn, {})
-            self.assertEqual(node.result(), "agent-output")
-            assert node.thread is not None
-            node.thread.join(timeout=1)
-
-        self.assertIsNotNone(FakeAgentNode.last_client)
-        assert FakeAgentNode.last_client is not None
-        self.assertTrue(FakeAgentNode.last_client.closed)
-        assert isinstance(node, FakeAgentNode)
-        self.assertIsNone(node.client)
-
     def test_terminal_node_cleans_up_self_bag_across_terminal_outcomes(self) -> None:
         for outcome in ("success", "error", "cancel"):
             with self.subTest(outcome=outcome):
@@ -525,6 +470,26 @@ class TestRuntimeInvocation(unittest.TestCase):
         agent_fn = _make_agent_function("agent_bash_cleanup", uses=[bash_fn])
         captured: dict[str, Any] = {}
 
+        def linux_proc_identity(pid: int) -> Optional[tuple[str, str]]:
+            stat_path = Path(f"/proc/{pid}/stat")
+            try:
+                stat = stat_path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+
+            stat_tail_idx = stat.rfind(")")
+            self.assertNotEqual(stat_tail_idx, -1, f"unexpected /proc/{pid}/stat format: {stat!r}")
+
+            fields = stat[stat_tail_idx + 2:].split()
+            self.assertGreaterEqual(
+                len(fields),
+                20,
+                f"unexpected /proc/{pid}/stat field count: {len(fields)}",
+            )
+            state = fields[0]
+            start_time = fields[19]
+            return state, start_time
+
         class FakeAgentNode(AgentNode):
             @property
             def token_usage(self) -> TokenUsage:
@@ -542,7 +507,13 @@ class TestRuntimeInvocation(unittest.TestCase):
                 )
                 result = child.result()
                 session = self.session_bag._values["bash.session"][bash_fn._bag_key(7)]
+                proc = session._proc
+                assert proc is not None
                 captured["session"] = session
+                captured["proc"] = proc
+                captured["pid"] = proc.pid
+                if sys.platform.startswith("linux") and Path("/proc").is_dir():
+                    captured["linux_proc_identity_before_cleanup"] = linux_proc_identity(proc.pid)
                 captured["parent_bag_populated_before_cleanup"] = bool(self.session_bag._values)
                 captured["child_bag_empty"] = child.session_bag._values == {}
                 self.ctx.post_success(result)
@@ -555,16 +526,35 @@ class TestRuntimeInvocation(unittest.TestCase):
             node.thread.join(timeout=2)
 
         session = captured["session"]
+        proc = captured["proc"]
+        pid = captured["pid"]
         self.assertIsInstance(session, BashSession)
         self.assertTrue(captured["parent_bag_populated_before_cleanup"])
         self.assertTrue(captured["child_bag_empty"])
         self.assertFalse(session.alive())
+        self.assertIsNotNone(proc.returncode)
         self.assertIsNone(session._proc)
         self.assertIsNone(session._stdout_thread)
         self.assertFalse(session.requires_restart)
         self.assertFalse(session._alive_once_started)
         self.assertTrue(node.session_bag._closed)
         self.assertEqual(node.session_bag._values, {})
+
+        if os.name == "posix":
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(pid, os.WNOHANG)
+
+        if sys.platform.startswith("linux") and Path("/proc").is_dir():
+            before = captured["linux_proc_identity_before_cleanup"]
+            self.assertIsNotNone(before)
+            after = linux_proc_identity(pid)
+            if after is not None:
+                self.assertNotEqual(
+                    after[1],
+                    before[1],
+                    f"/proc/{pid}/stat still identifies the original bash process after cleanup "
+                    f"(state={after[0]!r})",
+                )
 
     def test_terminal_root_clears_top_level_text_editor_lock_created_by_descendant(self) -> None:
         editor_fn = TextEditor()

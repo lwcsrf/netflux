@@ -425,14 +425,6 @@ class RunContext:
         Proxy to the Runtime to invoke a Function and create associated Node + edges.
         Returns the created `Node`.
 
-        Child Nodes may be launched and then awaited later, but the Runtime enforces that this
-        caller cannot actually enter a terminal state until its direct children are terminal. This
-        means terminalization may block while the caller remains in Running state. Authors should
-        still explicitly wait on launched children where practical, because that keeps handling of
-        child outputs, exceptions, and cancellation more deliberate and easier to reason about.
-        Once the caller has actually entered a terminal state, further child invocations from it
-        are rejected by the Runtime.
-
         For AgentFunction calls only, optionally specify `provider` to override the default model.
 
         Provide `cancel_event` to enforce a particular cancellation scope for the child node.

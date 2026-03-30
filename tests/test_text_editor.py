@@ -440,6 +440,25 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
 
 
 class TestTextEditorConcurrency(unittest.TestCase):
+    def test_get_file_lock_reuses_same_lock_for_same_top_level_bag_and_path(self) -> None:
+        editor = TextEditor()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "file.txt"
+
+            top_bag = SessionBag()
+            node_a = _DummyNode()
+            node_b = _DummyNode()
+            ctx_a = RunContext(runtime=None, node=node_a)  # type: ignore[arg-type]
+            ctx_b = RunContext(runtime=None, node=node_b)  # type: ignore[arg-type]
+            ctx_a.object_bags = {SessionScope.TopLevel: top_bag, SessionScope.Self: node_a.session_bag}
+            ctx_b.object_bags = {SessionScope.TopLevel: top_bag, SessionScope.Self: node_b.session_bag}
+
+            lock_a = editor._get_file_lock(ctx_a, target.resolve())
+            lock_b = editor._get_file_lock(ctx_b, target.resolve())
+
+            self.assertIs(lock_a, lock_b)
+
     def test_parallel_str_replace_same_file_is_serialized(self) -> None:
         editor = TextEditor()
 
@@ -457,29 +476,11 @@ class TestTextEditorConcurrency(unittest.TestCase):
             # Ensure LF line endings (Path.write_text() may translate to CRLF on Windows).
             editor.call(ctx_a, command="create", path=str(target), file_text="a=1\nb=2\n")
 
-            file_lock = editor._get_file_lock(ctx_a, target.resolve())
-            orig_acquire = file_lock.acquire
-            orig_release = file_lock.release
-
-            b_waiting_on_lock = threading.Event()
-            b_acquired_lock = threading.Event()
-
-            def patched_acquire(*args, **kwargs):
-                if threading.current_thread().name == "writer-b":
-                    if not orig_acquire(False):
-                        b_waiting_on_lock.set()
-                    else:
-                        orig_release()
-                    out = orig_acquire(*args, **kwargs)
-                    b_acquired_lock.set()
-                    return out
-                return orig_acquire(*args, **kwargs)
-
-            file_lock.acquire = patched_acquire
-
             a_prewrite = threading.Event()
             allow_a_write = threading.Event()
             a_read_started = threading.Event()
+            b_waiting_on_lock = threading.Event()
+            b_acquired_lock = threading.Event()
             b_read_started = threading.Event()
             errors: list[Exception] = []
 
@@ -488,6 +489,26 @@ class TestTextEditorConcurrency(unittest.TestCase):
 
             reads: dict[str, str] = {}
             writes: dict[str, str] = {}
+
+            class _TestFileLock:
+                def __init__(self) -> None:
+                    self._lock = threading.Lock()
+
+                def acquire(self, *args, **kwargs):
+                    if threading.current_thread().name == "writer-b":
+                        if not self._lock.acquire(False):
+                            b_waiting_on_lock.set()
+                        else:
+                            self._lock.release()
+                        out = self._lock.acquire(*args, **kwargs)
+                        b_acquired_lock.set()
+                        return out
+                    return self._lock.acquire(*args, **kwargs)
+
+                def release(self) -> None:
+                    self._lock.release()
+
+            file_lock = _TestFileLock()
 
             def patched_atomic_write(p: Path, data: str) -> None:
                 writes[threading.current_thread().name] = data
@@ -505,6 +526,11 @@ class TestTextEditorConcurrency(unittest.TestCase):
                 if threading.current_thread().name == "writer-b":
                     b_read_started.set()
                 return content
+
+            def patched_get_file_lock(ctx: RunContext, p: Path):
+                self.assertIn(ctx, (ctx_a, ctx_b))
+                self.assertEqual(target.resolve(), p)
+                return file_lock
 
             def worker_a() -> None:
                 try:
@@ -531,6 +557,7 @@ class TestTextEditorConcurrency(unittest.TestCase):
                     errors.append(exc)
 
             with (
+                patch.object(editor, "_get_file_lock", side_effect=patched_get_file_lock),
                 patch.object(editor, "_atomic_write_text", side_effect=patched_atomic_write),
                 patch.object(editor, "_read_text_preserve_eols", side_effect=patched_read_text),
             ):

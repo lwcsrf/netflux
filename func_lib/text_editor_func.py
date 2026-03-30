@@ -11,17 +11,6 @@ from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
 class TextEditorException(Exception):
     """Raised for business-logic violations in the TextEditor tool."""
 
-
-class _FileLock:
-    def __init__(self) -> None:
-        self._lock = Lock()
-
-    def acquire(self, *args, **kwargs):
-        return self._lock.acquire(*args, **kwargs)
-
-    def release(self) -> None:
-        self._lock.release()
-
 class TextEditor(CodeFunction):
     """
     A text editor tool for reading and modifying files inspired by and aligned with Anthropic's
@@ -148,7 +137,7 @@ class TextEditor(CodeFunction):
             SessionScope.TopLevel,
             namespace=self._FILE_LOCK_NAMESPACE,
             key=self._file_lock_key(p),
-            factory=_FileLock,
+            factory=Lock,
         )
 
     def handle_view(
