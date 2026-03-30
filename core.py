@@ -255,10 +255,14 @@ class AgentFunction(Function):
     """
     Declarative specification for an LLM-backed Function.
 
-    Provider implementations may invoke child Functions while driving the agent loop. If the
-    agent determines its own outcome before those direct children finish, the Runtime keeps the
-    node in Running state until the children are terminal. Thus, once the agent node is terminal,
-    its descendant subtree is terminal too, and that terminal outcome is immutable.
+    Provider implementations may invoke child Functions while driving the agent loop. Only the
+    main thread that entered the provider's `run()` method may call `RunContext.invoke()` or any
+    `RunContext.post_*()` method, otherwise behavior is undefined; helper threads spawned by the
+    main thread must not touch those APIs.
+    
+    If the agent determines its own outcome before those direct children finish and does not wait on children,
+    the Runtime keeps the node in Running state until the children are terminal. Thus, once the
+    agent node is terminal, its descendant subtree is terminal too, and that terminal outcome is immutable.
     """
     def __init__(
         self,
@@ -296,11 +300,15 @@ class CodeFunction(Function):
     """
     Declarative specification for deterministic Python code executed with a RunContext.
 
-    Authors should prefer ordinary control flow: return a value for success and raise an
-    Exception for failure. If the callable launches child Functions and concludes before they do,
-    the Runtime keeps the node in Running state until its direct children are terminal. Thus, once
-    the code node is terminal, its descendant subtree is terminal too, and that terminal outcome
-    is immutable.
+    The callable's main invocation thread is the only thread that may call
+    `RunContext.invoke()` or any `RunContext.post_*()` method; helper threads spawned by the
+    main thread must not touch those APIs, otherwise the behavior is undefined.
+    
+    Authors should prefer ordinary control flow: return a value for success and raise
+    an Exception for failure. If the callable launches child Functions and does not wait on them
+    all, the Runtime keeps the node in Running state until its direct children are terminal. Thus,
+    once the code node is terminal, its descendant subtree is terminal too, and that terminal
+    outcome is immutable.
     """
     def __init__(
         self,
@@ -683,7 +691,9 @@ class CodeNode(Node):
     explicitly wait on the children they launch where practical, because that is
     cleaner and keeps child results/errors part of normal control flow.
     
-    Authors must not use `RunContext` from a different thread otherwise behavior is undefined.
+    Only the main thread executing the Callable may use `RunContext.invoke()` and
+    `RunContext.post_*()`. Helper threads must not touch those APIs, and should be joined before
+    the Callable returns, raises, or posts a terminal outcome.
     """
     def __init__(
         self,
@@ -719,6 +729,10 @@ class AgentNode(Node):
     use the `RunContext` to submit children `Function` calls as a result of tool use.
     Before returning from `run()`, they should use `self.ctx.post_success()`, `self.ctx.post_exception()`,
     or `self.ctx.post_cancel()`.
+
+    Only the main thread that entered `run()` may call `RunContext.invoke()` or any
+    `RunContext.post_*()` method. Helper threads must not touch those APIs, and should be joined
+    before `run()` returns, raises, or posts a terminal outcome.
 
     The Runtime will block terminalization if, and as long as, direct children are still running,
     but provider implementations should still explicitly wait on the children they launch because

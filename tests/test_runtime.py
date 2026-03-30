@@ -28,6 +28,7 @@ from ..core import (
     SessionScope,
     TokenBill,
     TokenUsage,
+    ModelTextPart,
     CancellationException,
 )
 from ..func_lib.bash_func import Bash, BashSession
@@ -367,6 +368,88 @@ class TestRuntimeInvocation(unittest.TestCase):
         child_node = node.children[0]
         self.assertIs(child_node.ctx.cancel_event, override_event)
 
+    def test_invoke_returns_root_in_error_state_when_thread_start_fails(self) -> None:
+        fn = _make_code_function("root_start_failure")
+        runtime = Runtime([fn], client_factories={})
+        orig_start = Node.start
+
+        def fail_start(node: Node) -> None:
+            if node.fn.name != "root_start_failure":
+                orig_start(node)
+                return
+            if node.thread is not None:
+                return
+            node.thread = threading.Thread(
+                target=node.run_wrapper,
+                name=f"netflux-node-{node.id}",
+                daemon=True,
+            )
+            raise RuntimeError("can't start new thread")
+
+        with patch("netflux.core.Node.start", new=fail_start), self.assertLogs(
+            "netflux.runtime", level=logging.ERROR
+        ):
+            node = runtime.invoke(None, fn, {})
+
+        self.assertEqual(node.state, NodeState.Error)
+        self.assertTrue(node.done.is_set())
+        self.assertIsNone(node.thread)
+        self.assertIsInstance(node.exception, RuntimeError)
+        with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+            node.result()
+
+        view = runtime.get_view(node.id)
+        self.assertEqual(view.state, NodeState.Error)
+        self.assertIsInstance(view.exception, RuntimeError)
+
+    def test_invoke_returns_child_in_error_state_when_thread_start_fails(self) -> None:
+        child_fn = _make_code_function("child_start_failure")
+        captured_child: dict[str, Node] = {}
+
+        def parent_callable(ctx: RunContext) -> str:
+            child = ctx.invoke(child_fn, {})
+            captured_child["node"] = child
+            return "parent"
+
+        parent_fn = _make_code_function("parent", callable=parent_callable, uses=[child_fn])
+        runtime = Runtime([parent_fn], client_factories={})
+        orig_start = Node.start
+
+        def fail_start(node: Node) -> None:
+            if node.fn.name != "child_start_failure":
+                orig_start(node)
+                return
+            if node.thread is not None:
+                return
+            node.thread = threading.Thread(
+                target=node.run_wrapper,
+                name=f"netflux-node-{node.id}",
+                daemon=True,
+            )
+            raise RuntimeError("can't start new thread")
+
+        with patch("netflux.core.Node.start", new=fail_start), self.assertLogs(
+            "netflux.runtime", level=logging.ERROR
+        ):
+            parent_node = runtime.invoke(None, parent_fn, {})
+            self.assertEqual(parent_node.result(), "parent")
+
+        self.assertEqual(len(parent_node.children), 1)
+        child_node = parent_node.children[0]
+        self.assertIs(child_node, captured_child["node"])
+        self.assertEqual(parent_node.state, NodeState.Success)
+        self.assertTrue(parent_node.done.is_set())
+        self.assertEqual(child_node.state, NodeState.Error)
+        self.assertTrue(child_node.done.is_set())
+        self.assertIsNone(child_node.thread)
+        self.assertIsInstance(child_node.exception, RuntimeError)
+        with self.assertRaisesRegex(RuntimeError, "can't start new thread"):
+            child_node.result()
+
+        child_view = runtime.get_view(child_node.id)
+        self.assertEqual(child_view.state, NodeState.Error)
+        self.assertIsInstance(child_view.exception, RuntimeError)
+
     def test_cancel_event_triggers_cancellation(self) -> None:
         cancel_event = mp.Event()
         started = threading.Event()
@@ -410,6 +493,29 @@ class TestRuntimeInvocation(unittest.TestCase):
         assert node.thread is not None
         node.thread.join(timeout=1)
         self.assertTrue(closed.wait(timeout=1))
+        self.assertTrue(node.session_bag._closed)
+
+    def test_result_waits_for_terminal_cleanup_to_finish(self) -> None:
+        close_started = threading.Event()
+        closed = threading.Event()
+
+        class Closeable:
+            def close(self) -> None:
+                close_started.set()
+                time.sleep(0.1)
+                closed.set()
+
+        def callable(ctx: RunContext) -> str:
+            ctx.get_or_put(SessionScope.Self, "cleanup.wait", "resource", Closeable)
+            return "done"
+
+        fn = _make_code_function("cleanup_waits", callable=callable)
+        runtime = Runtime([fn], client_factories={})
+        node = runtime.invoke(None, fn, {})
+
+        self.assertEqual(node.result(), "done")
+        self.assertTrue(close_started.is_set())
+        self.assertTrue(closed.is_set())
         self.assertTrue(node.session_bag._closed)
 
     def test_terminal_node_cleans_up_self_bag_across_terminal_outcomes(self) -> None:
@@ -952,6 +1058,42 @@ class TestRuntimeInvocation(unittest.TestCase):
         self.assertIsNone(node.exception)
         self.assertTrue(
             any("post_exception" in msg and "has no effect and is ignored" in msg for msg in captured.output)
+        )
+
+    def test_agent_node_ignores_post_terminal_transcript_update(self) -> None:
+        agent_fn = _make_agent_function("agent_transcript_immutability")
+
+        class FakeAgentNode(AgentNode):
+            def run(self) -> None:
+                self.ctx.post_success("early")
+                self.transcript.append(ModelTextPart(text="late"))
+                self.ctx.post_transcript_update()
+
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage()
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
+            runtime = Runtime([agent_fn], client_factories={Provider.Anthropic: lambda: object()})
+            with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
+                node = runtime.invoke(None, agent_fn, {})
+                self.assertEqual(node.result(), "early")
+
+            assert node.thread is not None
+            node.thread.join(timeout=1)
+
+        view = runtime.get_view(node.id)
+        self.assertEqual(view.state, NodeState.Success)
+        self.assertEqual(view.transcript, ())
+        self.assertTrue(
+            any(
+                "post_transcript_update" in msg and "has no effect and is ignored" in msg
+                for msg in captured.output
+            )
         )
 
     def test_code_node_preserves_explicit_terminal_outcome(self) -> None:

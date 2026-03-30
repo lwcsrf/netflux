@@ -586,6 +586,7 @@ This refined example shows:
     * `post_exception(exception: Exception)`: mark the current node as failed with given exception. If direct children are still running, the call blocks and the node remains in Running state until they are terminal.
     * `post_cancel()`: mark the current node as terminally canceled. If direct children are still running, the call blocks and the node remains in Running state until they are terminal.
     * `cancel_requested() -> bool`: helper to check whether the associated cancellation token has been triggered. This does not mean that the `Node` is already canceled and in canceled state -- it means there is active signaled *intention* to cancel.
+    * Thread-affinity rule: for a live node, only the main thread that entered the `CodeFunction` callable or the provider's `AgentNode.run()` may call `RunContext.invoke()` or any `RunContext.post_*()` method. Helper threads may do ordinary work, but must not touch those APIs and should be joined before the main thread returns, raises, or posts a terminal outcome.
 * Narrow Scope: `RunContext` is just a mechanism to pass on `Function` invocation directives to the `Runtime` to act on them.
 
 ## `Node`

@@ -137,8 +137,14 @@ class GeminiAgentNode(AgentNode):
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
 
     def _close_client(self) -> None:
-        self.client.close()
-        self.client = None  # type: ignore[assignment]
+        if self.client is None:
+            return
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        finally:
+            self.client = None  # type: ignore[assignment]
 
     def run(self) -> None:
         config = types.GenerateContentConfig(

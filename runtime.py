@@ -214,7 +214,11 @@ class Runtime:
            
             self._publish_viewtree_update(node)
 
-        node.start()
+        try:
+            node.start()
+        except Exception as ex:
+            node.thread = None
+            self.post_exception(node, ex)
         return node
 
     def _build_session_bags(self, node: Node) -> Dict[SessionScope, SessionBag]:
@@ -450,6 +454,7 @@ class Runtime:
 
     def post_success(self, node: Node, outputs: Any) -> None:
         self.wait_for_children_finished(node)
+        node.on_terminal_cleanup()
 
         with self._lock:
             if node.state in TerminalNodeStates:
@@ -470,6 +475,7 @@ class Runtime:
 
     def post_exception(self, node: Node, exception: Exception) -> None:
         self.wait_for_children_finished(node)
+        node.on_terminal_cleanup()
         
         with self._lock:
             if node.state in TerminalNodeStates:
@@ -501,6 +507,7 @@ class Runtime:
         otherwise the Node is assigned a no-reason CancellationException.
         """
         self.wait_for_children_finished(node)
+        node.on_terminal_cleanup()
 
         with self._lock:
             if node.state in TerminalNodeStates:
@@ -522,5 +529,12 @@ class Runtime:
     def post_transcript_update(self, node: Node) -> None:
         """Called by a Node when its transcript changed and a new NodeView snapshot should be published."""
         with self._lock:
+            if node.state in TerminalNodeStates:
+                logger.error(
+                    "Ignoring post_transcript_update for terminal node %s (%s); "
+                    "it has no effect and is ignored.",
+                    node.id, node.fn.name,
+                )
+                return
             self._global_seqno += 1
             self._publish_viewtree_update(node)

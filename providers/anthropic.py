@@ -168,8 +168,14 @@ class AnthropicAgentNode(AgentNode):
         return Provider.Anthropic
 
     def _close_client(self) -> None:
-        self.client.close()
-        self.client = None  # type: ignore[assignment]
+        if self.client is None:
+            return
+        try:
+            self.client.close()
+        except Exception:
+            pass
+        finally:
+            self.client = None  # type: ignore[assignment]
 
     def run(self) -> None:
         # Agent loop.
