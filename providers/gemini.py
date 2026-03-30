@@ -2,7 +2,6 @@ from typing import Any, Callable, Dict, List, Optional, Union
 from types import MappingProxyType
 import copy
 import base64
-import logging
 import time
 import random
 from threading import Event
@@ -19,9 +18,6 @@ from . import ModelNames, Provider
 import google.genai as genai
 from google.genai import types
 from google.genai import errors as genai_errors
-
-
-logger = logging.getLogger(__name__)
 
 """
 ## Misc Research Notes.
@@ -140,6 +136,10 @@ class GeminiAgentNode(AgentNode):
         self._tool_call_counter += 1
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
 
+    def _close_client(self) -> None:
+        self.client.close()
+        self.client = None  # type: ignore[assignment]
+
     def run(self) -> None:
         config = types.GenerateContentConfig(
             system_instruction=self.agent_fn.system_prompt,
@@ -163,6 +163,7 @@ class GeminiAgentNode(AgentNode):
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
 
             # One thinking-tool turn.
@@ -238,10 +239,12 @@ class GeminiAgentNode(AgentNode):
                         is_retriable = True
 
                     if not is_retriable or attempt >= max_attempts:
+                        self._close_client()
                         raise
 
                     if self.is_cancel_requested():
                         self.ctx.post_cancel()
+                        self._close_client()
                         return
 
                     delay = base_delay * (2 ** (attempt - 1))
@@ -253,13 +256,14 @@ class GeminiAgentNode(AgentNode):
                     if self.cancel_event:
                         if self.cancel_event.wait(delay):
                             self.ctx.post_cancel()
+                            self._close_client()
                             return
                     else:
                         time.sleep(delay)
 
                     # Rebuild client on transport errors to reset broken sessions/sockets.
                     if is_connection:
-                        self.client.close()
+                        self._close_client()
                         self.client = self.client_factory()
 
                     attempt += 1
@@ -267,6 +271,7 @@ class GeminiAgentNode(AgentNode):
             
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
 
             # Incremental token accounting.
@@ -284,6 +289,7 @@ class GeminiAgentNode(AgentNode):
                 # No new content and we are done.
                 # Finalize with whatever is in the transcript.
                 self.ctx.post_success(self._final_text())
+                self._close_client()
                 return
             
             # Thoughts are supposed to be empty (hidden) or we want to know of API change.
@@ -325,6 +331,7 @@ class GeminiAgentNode(AgentNode):
                 assert candidate.finish_reason == types.FinishReason.STOP, (
                     "Expected finish_reason=STOP when no function calls")
                 self.ctx.post_success(self._final_text())
+                self._close_client()
                 return
 
             # At this point, there are function calls to process. First, sanity check:
@@ -335,6 +342,7 @@ class GeminiAgentNode(AgentNode):
             # lengthy sub-tasks.
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
 
             # Execute requested tools in parallel and aggregate all function responses.
@@ -422,15 +430,18 @@ class GeminiAgentNode(AgentNode):
             # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
+                self._close_client()
                 return
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
             
             # Per protocol: next user message contains only function results.
             # Aggregated function results to single Content message.
             self._history.append(types.Content(role="tool", parts=result_parts))
 
+        self._close_client()
         raise RuntimeError(f"Gemini agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
                            "without producing a final response.")
 
@@ -527,12 +538,3 @@ class GeminiAgentNode(AgentNode):
         if py_t is float: return types.Type.NUMBER
         if py_t is bool:  return types.Type.BOOLEAN
         return types.Type.STRING
-
-    @override
-    def on_terminal_cleanup(self) -> None:
-        try:
-            self.client.close()
-        except Exception:
-            logger.exception("Gemini client cleanup failed for node %s", self.id)
-        self.client = None  # type: ignore[assignment]
-        super().on_terminal_cleanup()

@@ -1,10 +1,9 @@
 from types import SimpleNamespace, MappingProxyType
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
-import logging
+from threading import Event
 import time
 import random
-from threading import Event
 from overrides import override
 
 from ..core import (
@@ -31,9 +30,6 @@ from anthropic.types import (
 
 )
 from anthropic.types.tool_param import InputSchemaTyped
-
-
-logger = logging.getLogger(__name__)
 
 """
 ## Misc Research Notes (applicable to Claude 4 models)
@@ -171,11 +167,16 @@ class AnthropicAgentNode(AgentNode):
     def provider(self) -> Provider:
         return Provider.Anthropic
 
+    def _close_client(self) -> None:
+        self.client.close()
+        self.client = None  # type: ignore[assignment]
+
     def run(self) -> None:
         # Agent loop.
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
 
             # Apply watermark to *latest* user message only (just-in-time).
@@ -243,10 +244,12 @@ class AnthropicAgentNode(AgentNode):
                         is_connection = True
                     
                     if not is_retriable or attempt >= max_attempts:
+                        self._close_client()
                         raise
 
                     if self.is_cancel_requested():
                         self.ctx.post_cancel()
+                        self._close_client()
                         return
 
                     delay = base_delay * (2 ** (attempt - 1))
@@ -258,13 +261,14 @@ class AnthropicAgentNode(AgentNode):
                     if self.cancel_event:
                         if self.cancel_event.wait(delay):
                             self.ctx.post_cancel()
+                            self._close_client()
                             return
                     else:
                         time.sleep(delay)
 
                     # Rebuild client on transport errors to reset broken sessions/sockets.
                     if is_connection:
-                        self.client.close()
+                        self._close_client()
                         self.client = self.client_factory()
 
                     attempt += 1
@@ -272,6 +276,7 @@ class AnthropicAgentNode(AgentNode):
 
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
 
             # Incremental token accounting.
@@ -335,6 +340,7 @@ class AnthropicAgentNode(AgentNode):
                 # Assert expectation that the protocol is the way we think:
                 # model is finishing the turn with final text completion.
                 if resp.stop_reason != "end_turn":
+                    self._close_client()
                     raise ModelProviderException(
                         message=f"Expected stop_reason 'end_turn' for final text, got "
                                 f"'{resp.stop_reason!r}'; debug protocol adherence.",
@@ -347,16 +353,19 @@ class AnthropicAgentNode(AgentNode):
                 self.transcript.append(ModelTextPart(text=final_text))
                 self.ctx.post_transcript_update()
                 self.ctx.post_success(final_text)
+                self._close_client()
                 return
 
             # Make sure we check for cancellation right before commencing possibly
             # lengthy sub-tasks.
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
 
             # Assert expectation: model requested tool use in this turn.
             if resp.stop_reason != "tool_use":
+                self._close_client()
                 raise ModelProviderException(
                     message=f"Expected stop_reason 'tool_use' before tool execution, got "
                             f"'{resp.stop_reason!r}'; debug protocol adherence.",
@@ -433,14 +442,17 @@ class AnthropicAgentNode(AgentNode):
             # order of priority.
             if pending_agent_ex:
                 self.ctx.post_exception(pending_agent_ex)
+                self._close_client()
                 return
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
+                self._close_client()
                 return
             
             # Per protocol: next user message contains only tool_result blocks
             self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
 
+        self._close_client()
         raise RuntimeError(f"Anthropic agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
                            "without producing a final response.")
 
@@ -553,12 +565,3 @@ class AnthropicAgentNode(AgentNode):
         if py_t is float: return "number"
         if py_t is bool:  return "boolean"
         return "string"  # fallback
-
-    @override
-    def on_terminal_cleanup(self) -> None:
-        try:
-            self.client.close()
-        except Exception:
-            logger.exception("Anthropic client cleanup failed for node %s", self.id)
-        self.client = None  # type: ignore[assignment]
-        super().on_terminal_cleanup()
