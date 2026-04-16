@@ -372,7 +372,7 @@ class TUI(SessionController):
         if key.isdigit():
             idx = int(key)
             if idx < len(self.invocable_functions):
-                self._open_launch_form(idx)
+                self._activate_function(idx)
             return False
         if key == "c":
             renderer = self._selected_renderer()
@@ -451,6 +451,15 @@ class TUI(SessionController):
         fields.extend(_LaunchField(label=arg.name, arg=arg) for arg in fn.args)
         self._form_state = _LaunchFormState(fn_index=fn_index, fields=fields)
         self._sync_visible_run()
+
+    def _activate_function(self, fn_index: int) -> None:
+        """Dispatch a function activation (keyboard digit or mouse click).
+
+        Override this in subclasses to customize launch behavior for
+        specific functions.  The default implementation opens the
+        standard launch form.
+        """
+        self._open_launch_form(fn_index)
 
     def _launch_form_history(self) -> list[_LaunchHistoryEntry]:
         assert self._form_state is not None
@@ -1370,7 +1379,7 @@ class TUI(SessionController):
         if not (0 <= local_x < clickable_cols):
             return
 
-        self._open_launch_form(fn_index)
+        self._activate_function(fn_index)
 
     @staticmethod
     def _pad_visible(text: str, width: int) -> str:
