@@ -22,6 +22,7 @@ from .core import (
     SessionScope,
     SessionBag,
     CancellationException,
+    MaxAgentLevelExceededException,
     TerminalNodeStates,
     TokenUsage,
     ToolUsePart,
@@ -31,6 +32,9 @@ from .providers import Provider, get_AgentNode_impl
 
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_AGENT_LEVELS: int = 2
+UPPER_MAX_AGENT_LEVELS: int = 5  # Largest allowed max_agent_levels for a tree.
 
 
 @dataclass
@@ -74,6 +78,7 @@ class Runtime:
         self._lock = Lock()
         self._next_node_id: int = 0
         self._roots: List[Node] = []
+        self._max_agent_levels: Dict[Node, int] = {}  # Keyed by root Node of the tree.
         self._nodes_by_id: Dict[int, Node] = {}
         self._providers: Dict[Provider, type[AgentNode]] = {}
         self._node_observables: Dict[int, NodeObservable] = {}
@@ -128,6 +133,7 @@ class Runtime:
         provider: Optional[Provider] = None,
         cancel_event: Optional[Event] = None,
         tool_use_id: Optional[str] = None,
+        max_agent_levels: Optional[int] = None,
     ) -> Node:
         """
         Create and start a Node for `fn` with `inputs`, recording parent/child relationships.
@@ -141,6 +147,9 @@ class Runtime:
 
         If `tool_use_id` is provided, it is stored on the created Node to correlate it
         with the AgentNode function call that triggered the invocation.
+
+        A top-level invocation may provide `max_agent_levels`; otherwise it defaults to
+        `DEFAULT_MAX_AGENT_LEVELS`. Descendants inherit it and must not provide it.
         """
         # Ensure the function is registered.
         reg_fn = self._fn_by_name.get(fn.name)
@@ -152,14 +161,41 @@ class Runtime:
                 f"even though it shares a name with another Function that is registered."
             )
 
+        is_root: bool = caller is None
+        if is_root:
+            if max_agent_levels is None:
+                max_agent_levels = DEFAULT_MAX_AGENT_LEVELS
+            assert type(max_agent_levels) is int, "max_agent_levels must be an integer"
+            assert 0 <= max_agent_levels <= UPPER_MAX_AGENT_LEVELS, (
+                f"max_agent_levels must be in the inclusive range 0..{UPPER_MAX_AGENT_LEVELS}"
+            )
+        else:
+            assert max_agent_levels is None, (
+                "Descendant invocations inherit max_agent_levels and cannot override it"
+            )
+
         inputs = fn.validate_coerce_args(inputs)
 
         with self._lock:
-            if caller is not None and caller.state in TerminalNodeStates:
+            if not is_root:
+                max_agent_levels = self._max_agent_levels[caller.root_ancestor]
+
+            if not is_root and caller.state in TerminalNodeStates:
                 raise RuntimeError(
                     f"Cannot invoke child function '{fn.name}' from terminal node "
                     f"{caller.id} ({caller.fn.name})."
                 )
+
+            if isinstance(fn, AgentFunction):
+                attempted_level = 1 if is_root else caller.agent_lineage_level + 1
+                assert max_agent_levels is not None
+                if attempted_level > max_agent_levels:
+                    raise MaxAgentLevelExceededException(
+                        fn.name,
+                        max_agent_levels,
+                        attempted_level,
+                    )
+
             node_id = self._next_node_id
             self._next_node_id += 1
 
@@ -207,7 +243,9 @@ class Runtime:
                 view=self._build_node_view(node),
             )
 
-            if caller is None:
+            if is_root:
+                assert max_agent_levels is not None
+                self._max_agent_levels[node] = max_agent_levels
                 self._roots.append(node)
             else:
                 caller.children.append(node)
@@ -221,11 +259,14 @@ class Runtime:
             self.post_exception(node, ex)
         return node
 
+    def max_agent_levels(self, root: Node) -> int:
+        """Return the configured maximum for a tree root."""
+        assert root.parent is None, "max_agent_levels requires a root Node"
+        with self._lock:
+            return self._max_agent_levels[root]
+
     def _build_session_bags(self, node: Node) -> Dict[SessionScope, SessionBag]:
-        current: Node = node
-        while current.parent is not None:
-            current = current.parent
-        top_level_bag: SessionBag = current.session_bag
+        top_level_bag: SessionBag = node.root_ancestor.session_bag
 
         bags: Dict[SessionScope, SessionBag] = {
             SessionScope.TopLevel: top_level_bag,

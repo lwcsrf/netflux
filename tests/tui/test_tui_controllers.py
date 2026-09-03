@@ -1623,9 +1623,9 @@ class TestTUIState(unittest.TestCase):
         tui._open_launch_form(0)
         assert tui._form_state is not None
         tui._form_state.fields[0].value = "typed run"
-        tui._form_state.fields[1].value = "7"
-        tui._form_state.fields[2].value = "false"
-        tui._form_state.fields[3].value = "1.5"
+        tui._form_state.fields[2].value = "7"
+        tui._form_state.fields[3].value = "false"
+        tui._form_state.fields[4].value = "1.5"
 
         tui._submit_form()
 
@@ -1635,6 +1635,34 @@ class TestTUIState(unittest.TestCase):
             tui._runs[0].node.result(),
             "7|False|1.5|int|bool|float",
         )
+
+    def test_launch_form_validates_max_agent_levels_inline_then_submits(self) -> None:
+        fn = _make_code_function("max_levels")
+        runtime = Runtime([fn], client_factories={})
+        tui = TUI(runtime)
+        tui._open_launch_form(0)
+        form = tui._form_state
+        assert form is not None
+
+        with patch.object(runtime, "invoke") as invoke_mock:
+            for raw in ("", "not-an-int", "-1", "5"):
+                with self.subTest(raw=raw):
+                    form.fields[1].value = raw
+                    tui._submit_form()
+
+                    self.assertIs(tui._form_state, form)
+                    self.assertEqual(len(tui._runs), 0)
+                    self.assertIn("integer from 0 to 4", form.error)
+            invoke_mock.assert_not_called()
+
+        form.fields[1].value = "4"
+
+        tui._submit_form()
+
+        self.assertIsNone(tui._form_state)
+        self.assertEqual(len(tui._runs), 1)
+        self.assertEqual(tui._runs[0].max_agent_levels, 4)
+        self.assertEqual(runtime.max_agent_levels(tui._runs[0].node), 4)
 
     def test_launch_form_strips_blank_optional_fields(self) -> None:
         fn = CodeFunction(
@@ -1648,7 +1676,7 @@ class TestTUIState(unittest.TestCase):
         tui = TUI(runtime)
         tui._open_launch_form(0)
         assert tui._form_state is not None
-        tui._form_state.fields[1].value = "   "
+        tui._form_state.fields[2].value = "   "
 
         tui._submit_form()
 
@@ -1707,7 +1735,7 @@ class TestTUIState(unittest.TestCase):
         tui._open_launch_form(0)
         assert tui._form_state is not None
         tui._form_state.fields[0].value = "typed run"
-        tui._form_state.fields[2].value = "true"
+        tui._form_state.fields[3].value = "true"
 
         tui._submit_form()
 
@@ -2150,21 +2178,23 @@ class TestTUIState(unittest.TestCase):
                     update_seqnum=1,
                     inputs={"count": 7, "flag": False, "label": None},
                 ),
+                max_agent_levels=4,
             )
         ]
         tui._open_launch_form(0)
         assert tui._form_state is not None
         tui._form_state.fields[0].value = "keep name"
-        tui._form_state.fields[1].value = "999"
+        tui._form_state.fields[2].value = "999"
         tui._form_state.error = "bad input"
         tui._form_state.cursor = tui._launch_form_history_start_index()
 
         tui.handle_key("\n")
 
         self.assertEqual(tui._form_state.fields[0].value, "recent run (1)")
-        self.assertEqual(tui._form_state.fields[1].value, "7")
-        self.assertEqual(tui._form_state.fields[2].value, "false")
-        self.assertEqual(tui._form_state.fields[3].value, "")
+        self.assertEqual(tui._form_state.fields[1].value, "4")
+        self.assertEqual(tui._form_state.fields[2].value, "7")
+        self.assertEqual(tui._form_state.fields[3].value, "false")
+        self.assertEqual(tui._form_state.fields[4].value, "")
         self.assertEqual(tui._form_state.cursor, 1)
         self.assertEqual(tui._form_state.error, "")
 
@@ -2195,14 +2225,14 @@ class TestTUIState(unittest.TestCase):
         ]
         tui._open_launch_form(0)
         assert tui._form_state is not None
-        tui._form_state.fields[1].value = "typed"
-        tui._form_state.cursor = 1
+        tui._form_state.fields[2].value = "typed"
+        tui._form_state.cursor = 2
 
         tui.handle_key("\n")
 
         assert tui._form_state is not None
         self.assertEqual(tui._form_state.cursor, len(tui._form_state.fields))
-        self.assertEqual(tui._form_state.fields[1].value, "typed")
+        self.assertEqual(tui._form_state.fields[2].value, "typed")
 
         tui.handle_key("\n")
 
@@ -2245,7 +2275,7 @@ class TestTUIState(unittest.TestCase):
 
         assert tui._form_state is not None
         self.assertEqual(tui._form_state.fields[0].value, "recent click (1)")
-        self.assertEqual(tui._form_state.fields[1].value, "from history")
+        self.assertEqual(tui._form_state.fields[2].value, "from history")
         self.assertEqual(tui._form_state.cursor, 1)
 
     def test_launch_form_recent_history_increments_existing_suffix_in_name(self) -> None:
@@ -2280,7 +2310,7 @@ class TestTUIState(unittest.TestCase):
         tui.handle_key("\n")
 
         self.assertEqual(tui._form_state.fields[0].value, "recent click (8)")
-        self.assertEqual(tui._form_state.fields[1].value, "from history")
+        self.assertEqual(tui._form_state.fields[2].value, "from history")
 
     def test_launch_form_agent_provider_field_starts_from_default_model(self) -> None:
         fn = AgentFunction(
@@ -2305,10 +2335,13 @@ class TestTUIState(unittest.TestCase):
 
         assert tui._form_state is not None
         self.assertEqual(tui._form_state.fields[0].label, "run_name")
-        self.assertEqual(tui._form_state.fields[1].label, "provider")
-        self.assertTrue(tui._form_state.fields[2].is_provider_options)
-        self.assertEqual(tui._form_state.fields[1].value, Provider.Anthropic.value)
-        self.assertEqual(tui._form_state.fields[3].label, "prompt")
+        self.assertEqual(tui._form_state.fields[1].label, "max_agent_levels")
+        self.assertEqual(tui._form_state.fields[1].value, "2")
+        self.assertTrue(tui._form_state.fields[1].is_runtime_setting)
+        self.assertEqual(tui._form_state.fields[2].label, "provider")
+        self.assertTrue(tui._form_state.fields[3].is_provider_options)
+        self.assertEqual(tui._form_state.fields[2].value, Provider.Anthropic.value)
+        self.assertEqual(tui._form_state.fields[4].label, "prompt")
 
     def test_launch_form_agent_default_provider_submits_without_override(self) -> None:
         fn = AgentFunction(
@@ -2331,7 +2364,7 @@ class TestTUIState(unittest.TestCase):
         tui._open_launch_form(0)
         assert tui._form_state is not None
         tui._form_state.fields[0].value = "agent run"
-        tui._form_state.fields[3].value = "hello"
+        tui._form_state.fields[4].value = "hello"
         terminal_view = _make_agent_view(
             fn,
             state=NodeState.Success,
@@ -2351,6 +2384,7 @@ class TestTUIState(unittest.TestCase):
             None,
             fn,
             {"prompt": "hello"},
+            max_agent_levels=2,
             provider=None,
             cancel_event=unittest.mock.ANY,
         )
@@ -2380,8 +2414,8 @@ class TestTUIState(unittest.TestCase):
         tui._open_launch_form(0)
         assert tui._form_state is not None
         tui._form_state.fields[0].value = "agent run"
-        tui._form_state.fields[1].value = "gemini"
-        tui._form_state.fields[3].value = "hello"
+        tui._form_state.fields[2].value = "gemini"
+        tui._form_state.fields[4].value = "hello"
         terminal_view = _make_agent_view(
             fn,
             state=NodeState.Success,
@@ -2401,6 +2435,7 @@ class TestTUIState(unittest.TestCase):
             None,
             fn,
             {"prompt": "hello"},
+            max_agent_levels=2,
             provider=Provider.Gemini,
             cancel_event=unittest.mock.ANY,
         )
@@ -2425,8 +2460,8 @@ class TestTUIState(unittest.TestCase):
         tui = TUI(runtime)
         tui._open_launch_form(0)
         assert tui._form_state is not None
-        tui._form_state.fields[1].value = "not-a-provider"
-        tui._form_state.fields[3].value = "hello"
+        tui._form_state.fields[2].value = "not-a-provider"
+        tui._form_state.fields[4].value = "hello"
 
         tui._submit_form()
 
@@ -2465,21 +2500,24 @@ class TestTUIState(unittest.TestCase):
                     update_seqnum=1,
                     provider=Provider.Gemini,
                 ),
+                max_agent_levels=3,
             )
         ]
         tui._open_launch_form(0)
         assert tui._form_state is not None
         tui._form_state.fields[0].value = "keep name"
-        tui._form_state.fields[1].value = Provider.Anthropic.value
-        tui._form_state.fields[3].value = "stale"
+        tui._form_state.fields[1].value = "1"
+        tui._form_state.fields[2].value = Provider.Anthropic.value
+        tui._form_state.fields[4].value = "stale"
         tui._form_state.cursor = tui._launch_form_history_start_index()
 
         tui.handle_key("\n")
 
         assert tui._form_state is not None
         self.assertEqual(tui._form_state.fields[0].value, "recent agent (1)")
-        self.assertEqual(tui._form_state.fields[1].value, Provider.Gemini.value)
-        self.assertEqual(tui._form_state.fields[3].value, "")
+        self.assertEqual(tui._form_state.fields[1].value, "3")
+        self.assertEqual(tui._form_state.fields[2].value, Provider.Gemini.value)
+        self.assertEqual(tui._form_state.fields[4].value, "")
         self.assertEqual(tui._form_state.cursor, 1)
 
     def test_launch_form_provider_row_renders_enum_and_highlights_selected_option(self) -> None:
@@ -2534,11 +2572,11 @@ class TestTUIState(unittest.TestCase):
         tui = TUI(runtime)
         tui._open_launch_form(0)
         assert tui._form_state is not None
-        tui._form_state.cursor = 1
+        tui._form_state.cursor = 2
 
         tui.handle_key(" ")
 
-        self.assertEqual(tui._form_state.fields[1].value, Provider.Gemini.value)
+        self.assertEqual(tui._form_state.fields[2].value, Provider.Gemini.value)
 
     def test_launch_form_space_still_inserts_literal_space_for_text_fields(self) -> None:
         fn = CodeFunction(
@@ -2552,11 +2590,11 @@ class TestTUIState(unittest.TestCase):
         tui = TUI(runtime)
         tui._open_launch_form(0)
         assert tui._form_state is not None
-        tui._form_state.cursor = 1
+        tui._form_state.cursor = 2
 
         tui.handle_key(" ")
 
-        self.assertEqual(tui._form_state.fields[1].value, " ")
+        self.assertEqual(tui._form_state.fields[2].value, " ")
 
     def test_launch_form_clicking_provider_options_row_selects_provider_field(self) -> None:
         fn = AgentFunction(
@@ -2587,7 +2625,7 @@ class TestTUIState(unittest.TestCase):
         tui.handle_mouse(SimpleNamespace(x=2, y=provider_options_row, button="left"))
 
         assert tui._form_state is not None
-        self.assertEqual(tui._form_state.cursor, 1)
+        self.assertEqual(tui._form_state.cursor, 2)
 
     def test_launch_form_keeps_fields_visible_when_description_exceeds_viewport(self) -> None:
         fn = CodeFunction(

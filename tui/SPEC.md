@@ -378,7 +378,8 @@ While the launch form is open:
 
 Form content:
 - first field is a UI-only run name,
-- `AgentFunction` launch forms include a provider field immediately after the run name; it is initialized from that function's `default_model`,
+- every form includes a `max_agent_levels` tree setting immediately after the run name, initialized to the fixed value `2`,
+- `AgentFunction` launch forms include a provider field immediately after the tree setting; it is initialized from that function's `default_model`,
 - directly under that provider field, the form renders the `Provider` enum choices and visually highlights the currently selected provider,
 - remaining fields correspond to the selected function's declared `FunctionArg`s,
 - below the function description, the header also shows each arg's declared type, description, and `[optional]` marker when applicable,
@@ -400,12 +401,14 @@ Current form editing behavior:
 
 Recent-run template behavior:
 - selecting a recent-run row by keyboard or left-click does not launch immediately,
-- instead it copies that run's provider selection and args back into the editable fields,
+- instead it copies that run's maximum Agent levels, provider selection, and args back into the editable fields,
 - it also prepopulates the run-name field from that history entry, appending ` (1)` or incrementing an existing trailing ` (N)` suffix,
 - optional args that were omitted or submitted as `None` repopulate as blank fields,
 - after applying a recent-run template, the cursor returns to the first editable non-name field (or the run-name field when there are no other fields).
 
 Submission/parsing rules:
+- maximum Agent levels must parse as an integer in the inclusive range `0..4`,
+- every top-level invocation explicitly receives the parsed maximum, including the default value `2`,
 - provider text is parsed case-insensitively against `Provider` names/values before `Runtime.invoke(...)`,
 - a blank provider field, or one matching the function's `default_model`, means no top-level provider override is passed,
 - a selected provider override applies only to the launched root; descendant invokes still use whatever provider/default each caller chooses normally,

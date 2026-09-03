@@ -13,7 +13,7 @@ from typing import Callable, Mapping
 
 from ..core import AgentFunction, Function, FunctionArg, Node, NodeState, NodeView, TerminalNodeStates, TokenBill
 from ..providers import Provider
-from ..runtime import Runtime
+from ..runtime import DEFAULT_MAX_AGENT_LEVELS, Runtime
 from ._contracts import RightPaneInteractionContext, SelectedTreeStatus, SessionController, TerminalSize
 from ._controller_helpers import (
     compose_bottom_bar,
@@ -68,6 +68,8 @@ TerminalCallback = Callable[[TokenBills], None]
 
 logger = logging.getLogger(__name__)
 
+_TUI_MAX_AGENT_LEVELS = 4
+
 
 @dataclass
 class _RunRecord:
@@ -76,6 +78,7 @@ class _RunRecord:
     node: Node
     renderer: ConsoleRender
     cancel_event: threading.Event
+    max_agent_levels: int = DEFAULT_MAX_AGENT_LEVELS
     latest_view: NodeView | None = None
     terminal_callback_invoked: bool = False
     terminal_browse_applied: bool = False
@@ -123,9 +126,15 @@ class _LaunchField:
         return self.kind == "provider_options"
 
     @property
+    def is_runtime_setting(self) -> bool:
+        return self.kind == "runtime_setting"
+
+    @property
     def type_label(self) -> str:
         if self.is_name:
             return "str"
+        if self.is_runtime_setting:
+            return "int"
         if self.is_provider:
             return "Provider"
         if self.is_provider_options:
@@ -154,6 +163,7 @@ class _LaunchFormState:
 class _LaunchHistoryEntry:
     name: str
     inputs: Mapping[str, object]
+    max_agent_levels: int
     provider: Provider | None = None
 
 
@@ -444,7 +454,14 @@ class TUI(SessionController):
 
     def _open_launch_form(self, fn_index: int) -> None:
         fn = self.invocable_functions[fn_index]
-        fields = [_LaunchField(label="run_name", kind="name")]
+        fields = [
+            _LaunchField(label="run_name", kind="name"),
+            _LaunchField(
+                label="max_agent_levels",
+                value=str(DEFAULT_MAX_AGENT_LEVELS),
+                kind="runtime_setting",
+            ),
+        ]
         if isinstance(fn, AgentFunction):
             fields.append(_LaunchField(label="provider", value=fn.default_model.value, kind="provider"))
             fields.append(_LaunchField(label="provider_options", kind="provider_options"))
@@ -483,7 +500,14 @@ class TUI(SessionController):
                     raw_provider = getattr(run.node, "provider", None)
                     if isinstance(raw_provider, Provider):
                         provider = raw_provider
-            history.append(_LaunchHistoryEntry(name=run.name, inputs=dict(inputs), provider=provider))
+            history.append(
+                _LaunchHistoryEntry(
+                    name=run.name,
+                    inputs=dict(inputs),
+                    max_agent_levels=run.max_agent_levels,
+                    provider=provider,
+                )
+            )
             if len(history) >= 20:
                 break
         return history
@@ -575,6 +599,9 @@ class TUI(SessionController):
         self._form_state.fields[0].value = self._history_restore_name(entry.name)
         for field in self._form_state.fields[1:]:
             field.value = ""
+            if field.is_runtime_setting:
+                field.value = str(entry.max_agent_levels)
+                continue
             if field.is_provider:
                 assert isinstance(fn, AgentFunction)
                 provider = entry.provider or fn.default_model
@@ -691,9 +718,13 @@ class TUI(SessionController):
         assert self._form_state is not None
         fn = self.invocable_functions[self._form_state.fn_index]
         parsed_args: dict[str, object] = {}
+        max_agent_levels: int | None = None
         provider_override: Provider | None = None
         try:
             for field in self._form_state.fields[1:]:
+                if field.is_runtime_setting:
+                    max_agent_levels = self._parse_max_agent_levels(field.value)
+                    continue
                 if field.is_provider:
                     assert isinstance(fn, AgentFunction)
                     raw_provider = field.value.strip()
@@ -714,6 +745,7 @@ class TUI(SessionController):
         except ValueError as exc:
             self._form_state.error = str(exc)
             return
+        assert max_agent_levels is not None
 
         cancel_event = threading.Event()
         try:
@@ -721,6 +753,7 @@ class TUI(SessionController):
                 None,
                 fn,
                 parsed_args,
+                max_agent_levels=max_agent_levels,
                 provider=provider_override,
                 cancel_event=cancel_event,
             )
@@ -742,6 +775,7 @@ class TUI(SessionController):
                 node=node,
                 renderer=renderer,
                 cancel_event=cancel_event,
+                max_agent_levels=max_agent_levels,
                 latest_view=self.runtime.get_view(node.id),
             )
             watcher_index = len(self._runs)
@@ -809,6 +843,17 @@ class TUI(SessionController):
         print(f"TUI log file: {self.log_path}", flush=True)
         logging.shutdown()
         os._exit(1)
+
+    @staticmethod
+    def _parse_max_agent_levels(raw: str) -> int:
+        error = f"max_agent_levels must be an integer from 0 to {_TUI_MAX_AGENT_LEVELS}."
+        try:
+            value = int(raw.strip())
+        except ValueError:
+            raise ValueError(error) from None
+        if not 0 <= value <= _TUI_MAX_AGENT_LEVELS:
+            raise ValueError(error)
+        return value
 
     @staticmethod
     def _parse_arg(arg: FunctionArg, raw: str) -> object:
@@ -1098,11 +1143,18 @@ class TUI(SessionController):
                             option_tokens.append(_color(provider.value, fg="gray", dim=True))
                     rendered = self._pad_visible(f"  {'  '.join(option_tokens)}", size.columns)
                 else:
-                    label_color = "orange" if field.is_name else "cyan"
+                    if field.is_name:
+                        label_color = "orange"
+                    elif field.is_runtime_setting:
+                        label_color = "yellow"
+                    else:
+                        label_color = "cyan"
                     label = _color(field.label, fg=label_color, bold=True)
                     meta_parts: list[str] = []
                     if not field.is_name:
                         meta_parts.append(_color(f"({field.type_label})", fg="gray"))
+                        if field.is_runtime_setting:
+                            meta_parts.append(_color("[tree setting]", fg="yellow", bold=True))
                         if field.optional:
                             meta_parts.append(_color("[optional]", fg="yellow", bold=True))
                     meta = f" {' '.join(meta_parts)}" if meta_parts else ""

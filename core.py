@@ -17,11 +17,6 @@ AllowedArgTypeTuple: tuple[type, ...] = tuple(
 
 logger = logging.getLogger(__name__)
 
-class CancellationException(Exception):
-    """Raised when a node cooperatively acknowledges a cancellation request."""
-
-    def __init__(self, message: str = "Operation was canceled (no reason provided)"):
-        super().__init__(message)
 
 class NodeState(Enum):
     Waiting = "Waiting"
@@ -115,9 +110,9 @@ class SessionBag:
 
         # Get all the unique object references in the bag with de-dup in case the same object was
         # under multiple keys/namespaces (uncommon).
-        unique_objs: List[Any] = {
-            id(value): value for ns in values.values() for value in ns.values()
-        }.values()
+        unique_objs: List[Any] = list(
+            {id(value): value for ns in values.values() for value in ns.values()}.values()
+        )
 
         # The assumption remains that the SessionBag is the sole parent container of these objects
         # and owns their lifecycle, so should transitively close() all such owned objects.
@@ -428,6 +423,7 @@ class RunContext:
         provider: Optional[Provider] = None,
         cancel_event: Optional[Event] = None,
         tool_use_id: Optional[str] = None,
+        max_agent_levels: Optional[int] = None,
     ) -> 'Node':
         """
         Proxy to the Runtime to invoke a Function and create associated Node + edges.
@@ -443,6 +439,9 @@ class RunContext:
         Provide `tool_use_id` to associate this invocation with a specific model tool call.
         This is used to correlate AgentNode's transcript ToolUsePart/ToolResultPart
         entries with child Nodes. When None, no tool_use_id is set on the child Node.
+
+        Top-level invocations may provide `max_agent_levels`; otherwise the Runtime's
+        default is used. Descendant invocations inherit it and must not provide it.
         """
         return self.runtime.invoke(
             self.node,
@@ -451,6 +450,7 @@ class RunContext:
             provider=provider,
             cancel_event=cancel_event,
             tool_use_id=tool_use_id,
+            max_agent_levels=max_agent_levels,
         )
 
     def post_running(self) -> None:
@@ -480,7 +480,7 @@ class RunContext:
             raise RuntimeError("post_exception may only be called from within a Node execution context")
         self.runtime.post_exception(self.node, exception)
 
-    def post_cancel(self, exception: Optional[CancellationException] = None) -> None:
+    def post_cancel(self, exception: Optional['CancellationException'] = None) -> None:
         """
         Inform the Runtime that the current Node is being cooperatively canceled.
         The `exception` may be provided to indicate the reason for cancellation,
@@ -636,6 +636,25 @@ class Node(ABC):
     @property
     def is_done(self) -> bool:
         return self.done.is_set()
+
+    @property
+    def agent_lineage_level(self) -> int:
+        """Count AgentNodes in this node's immutable, inclusive lineage."""
+        level = 0
+        current: Optional[Node] = self
+        while current is not None:
+            if isinstance(current, AgentNode):
+                level += 1
+            current = current.parent
+        return level
+
+    @property
+    def root_ancestor(self) -> 'Node':
+        """Return this node's root ancestor through immutable parent links."""
+        current: Node = self
+        while current.parent is not None:
+            current = current.parent
+        return current
 
     def wait(self):
         return self.done.wait()
@@ -807,6 +826,26 @@ class AgentNode(Node):
         # This will raise on any invalid substitutions (todo: dedicated exception).
         return self.agent_fn.user_prompt_template.format(**self.inputs)
 
+    def system_prompt(self) -> str:
+        """
+        Compose this invocation's system text.
+        Any invocation-specific injection is done here, e.g. lineage-level warnings.
+        """
+        level = self.agent_lineage_level
+        max_levels = self.ctx.runtime.max_agent_levels(self.root_ancestor)
+        if level != max_levels:
+            return self.agent_fn.system_prompt
+
+        warning = (
+            f"WARNING: You are at Agent level {level} of {max_levels} in this call tree, "
+            "the deepest permitted level. Any direct or indirect attempt to create another sub-agent on this "
+            "lineage will fail. Non-agentic functions remain available, but any agent they "
+            "invoke will also be rejected."
+        )
+        if not self.agent_fn.system_prompt:
+            return warning
+        return f"{self.agent_fn.system_prompt}\n\n{warning}"
+
     def invoke_tool_function(
         self, tool_name: str, tool_args: Dict[str, Any], tool_use_id: str,
     ) -> Node:
@@ -892,3 +931,23 @@ class ModelProviderException(Exception):
         if self.inner_exception:
             base_msg += f" (caused by: {AgentNode.stringify_exception(self.inner_exception)})"
         return base_msg
+
+class MaxAgentLevelExceededException(Exception):
+    """Raised when an AgentFunction would exceed its tree's lineage limit."""
+
+    def __init__(self, fn_name: str, max_agent_levels: int, attempted_level: int):
+        self.fn_name = fn_name
+        self.max_agent_levels = max_agent_levels
+        self.attempted_level = attempted_level
+        super().__init__(
+            f"Cannot invoke {fn_name}. Caller is already on the deepest allowed agent "
+            f"level in the tree (level {max_agent_levels}). Do not attempt to invoke "
+            "more agentic functions, or code functions that invoke agent functions, in your session."
+        )
+
+class CancellationException(Exception):
+    """Raised when a node cooperatively acknowledges a cancellation request."""
+
+    def __init__(self, message: str = "Operation was canceled (no reason provided)"):
+        super().__init__(message)
+
