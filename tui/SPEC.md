@@ -385,7 +385,7 @@ Form content:
 - below the function description, the header also shows each arg's declared type, description, and `[optional]` marker when applicable,
 - the launch form uses its own color/bold treatment for the title, field labels, submit/cancel actions, and recent-run rows; this styling change is intentionally scoped to the launch form only,
 - `[Submit]` and `[Cancel]` appear immediately after the editable arg fields,
-- below `[Submit]` / `[Cancel]`, the form may show up to 20 recent top-level runs of that same function from this `TUI` session, ordered newest first,
+- below `[Submit]` / `[Cancel]`, the form may show up to 80 recent top-level runs of that same function from this `TUI` session, ordered newest first,
 - each recent-run row shows the run name and a truncated inline args preview,
 - function descriptions may span multiple wrapped lines,
 - form layout, scrolling, and mouse hit-testing derive from the rendered header height rather than from a fixed header-row constant.

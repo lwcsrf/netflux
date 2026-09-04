@@ -2104,7 +2104,7 @@ class TestTUIState(unittest.TestCase):
         self.assertTrue(any("count (int): How many items to process." in line for line in plain_lines))
         self.assertTrue(any("ratio (float) [optional]: Blend ratio for the run." in line for line in plain_lines))
 
-    def test_launch_form_history_uses_most_recent_20_runs_for_same_function(self) -> None:
+    def test_launch_form_history_uses_most_recent_80_runs_for_same_function(self) -> None:
         fn = CodeFunction(
             name="history_target",
             desc="history target",
@@ -2116,7 +2116,7 @@ class TestTUIState(unittest.TestCase):
         runtime = Runtime([fn, other], client_factories={})
         tui = TUI(runtime)
 
-        for idx in range(22):
+        for idx in range(82):
             tui._runs.append(
                 _RunRecord(
                     name=f"run{idx}",
@@ -2146,9 +2146,9 @@ class TestTUIState(unittest.TestCase):
 
         history = tui._launch_form_history()
 
-        self.assertEqual(len(history), 20)
-        self.assertEqual(history[0].name, "run21")
-        self.assertEqual(history[0].inputs["value"], 21)
+        self.assertEqual(len(history), 80)
+        self.assertEqual(history[0].name, "run81")
+        self.assertEqual(history[0].inputs["value"], 81)
         self.assertEqual(history[-1].name, "run2")
 
     def test_launch_form_recent_history_enter_repopulates_args(self) -> None:

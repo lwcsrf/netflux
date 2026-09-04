@@ -508,7 +508,7 @@ class TUI(SessionController):
                     provider=provider,
                 )
             )
-            if len(history) >= 20:
+            if len(history) >= 80:
                 break
         return history
 
