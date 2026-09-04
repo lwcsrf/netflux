@@ -5,7 +5,7 @@ import base64
 import time
 import random
 from threading import Event
-import httpx
+import httpx2
 from overrides import override
 
 from ..core import (
@@ -194,6 +194,9 @@ class GeminiAgentNode(AgentNode):
                         raise RuntimeError("Gemini returned no candidates.")
                     candidate = resp.candidates[0]
 
+                    if candidate.finish_reason == types.FinishReason.TOO_MANY_TOOL_CALLS:
+                        raise RuntimeError(f"Unexpected finish_reason: {candidate.finish_reason}.")
+
                     # False positive for safety block or SDK proactively detecting malformed
                     # function call.
                     if candidate.finish_reason and candidate.finish_reason in (
@@ -220,21 +223,21 @@ class GeminiAgentNode(AgentNode):
                 except (
                     genai_errors.APIError,
                     genai_errors.UnknownApiResponseError,
-                    httpx.HTTPStatusError,
-                    httpx.TransportError,
+                    httpx2.HTTPStatusError,
+                    httpx2.TransportError,
                     RuntimeError,
                 ) as e:
                     # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
                     is_retriable: bool = force_retry
                     is_connection: bool = False
 
-                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
+                    if isinstance(e, httpx2.TransportError) and not isinstance(e, httpx2.ProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, httpx.RemoteProtocolError):
+                    if isinstance(e, httpx2.RemoteProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, httpx.HTTPStatusError):
+                    if isinstance(e, httpx2.HTTPStatusError):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True

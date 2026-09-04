@@ -1,6 +1,8 @@
 # llm provider keys (dev api keys)
 demos/gemini.key
 demos/anthropic.key
+demos/openai.key
+demos/xai.key
 
 # pycache
 __pycache__/

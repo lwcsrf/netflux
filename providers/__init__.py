@@ -14,10 +14,10 @@ class Provider(Enum):
 
 # Framework assumes only using single best LLM from each provider for now.
 ModelNames: Dict[Provider, str] = {
-    Provider.OpenAI: "gpt-5-4",
-    Provider.Anthropic: "claude-opus-4-6",
-    Provider.Gemini: "gemini-3.1-pro-preview",
-    Provider.xAI: "grok-4",
+    Provider.OpenAI: "gpt-6-astra",
+    Provider.Anthropic: "claude-fable-5.1",
+    Provider.Gemini: "gemini-3.8-flash",
+    Provider.xAI: "grok-4.6",
 }
 
 def get_AgentNode_impl(provider: Provider) -> type:
@@ -32,6 +32,6 @@ def get_AgentNode_impl(provider: Provider) -> type:
     elif provider == Provider.OpenAI:
         raise NotImplementedError("todo: develop the OpenAIAgentNode subtype.")
     elif provider == Provider.xAI:
-        raise NotImplementedError("todo: develop the xAIAgentNode subtype.")
+        raise NotImplementedError("todo: develop the XAIAgentNode subtype.")
     else:
         raise ValueError(f"Unknown provider: {provider}")
