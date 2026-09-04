@@ -364,7 +364,10 @@ class GeminiAgentNode(AgentNode):
                 assert fc.name
                 name: str = fc.name
                 tool_args: Dict[str, Any] = fc.args or {}
-                tool_use_id = fc.id or self._new_tool_use_id(name)
+
+                # `fc.id` lacks uniqueness across sessions, so netflux transcripts will use `tool_use_id`
+                # for call/response as the Runtime-unique key, while gemini response will use `fc.id`.
+                tool_use_id = self._new_tool_use_id(name)
                 tool_use_ids.append(tool_use_id)
 
                 args_ro = MappingProxyType(copy.deepcopy(tool_args))
@@ -428,7 +431,7 @@ class GeminiAgentNode(AgentNode):
                 # Transcript result in gemini sdk types.
                 result_parts.append(types.Part(
                     function_response=types.FunctionResponse(
-                        id=tool_use_id,
+                        id=fc.id,
                         name=fc.name,
                         response=response,
                     )
