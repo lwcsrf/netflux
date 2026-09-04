@@ -78,7 +78,7 @@ THINKING_CFG = types.ThinkingConfig(
     include_thoughts=False,
 )
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
-MAX_STEPS = 64
+MAX_STEPS = 256
 
 class GeminiAgentNode(AgentNode):
     """

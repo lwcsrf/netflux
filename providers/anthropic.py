@@ -112,7 +112,7 @@ OUTPUT_CFG = OutputConfigParam(effort="max")
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
-MAX_STEPS = 256
+MAX_STEPS = 768
 
 
 class AnthropicAgentNode(AgentNode):
