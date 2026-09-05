@@ -557,7 +557,7 @@ class BashSession:
 
         block = (
             "builtin set +e\n"
-            f"builtin source {shlex.quote(bash_script_path)} </dev/null\n"
+            f"builtin source {shlex.quote(bash_script_path)} </dev/null 254>&-\n"
             f"{ec_var}=$?\n"
             "builtin printf '\\n" + sentinel + " %d\\n' \"${" + ec_var + "}\" >&254\n"
             "builtin unset -v " + ec_var + " 2>/dev/null || builtin true\n"
