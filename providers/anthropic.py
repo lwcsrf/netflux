@@ -315,7 +315,7 @@ class AnthropicAgentNode(AgentNode):
                 TextBlockParam, ToolUseBlockParam, ThinkingBlockParam, RedactedThinkingBlockParam
             ]] = []
             tool_uses: List[ToolUseBlock] = []
-            final_text_chunks: List[str] = []
+            text_chunks: List[str] = []
 
             for blk in resp.content:
                 if isinstance(blk, ThinkingBlock):
@@ -353,7 +353,7 @@ class AnthropicAgentNode(AgentNode):
 
                 elif isinstance(blk, TextBlock):
                     if blk.text and blk.text.strip():
-                        final_text_chunks.append(blk.text)
+                        text_chunks.append(blk.text)
                         # Non-final interleaved text should also be replayed
                         assistant_params.append(TextBlockParam(text=blk.text, type="text"))
 
@@ -361,6 +361,12 @@ class AnthropicAgentNode(AgentNode):
             self._history.append(
                 MessageParam(role="assistant", content=assistant_params)
             )
+
+            # Combine this iteration's text into one framework transcript part.
+            # This may be intermediate or final assistant text.
+            text = "\n".join(text_chunks).strip()
+            self.transcript.append(ModelTextPart(text=text))
+            self.ctx.post_transcript_update()
 
             # If no tool uses -> finalize with the accumulated text.
             if not tool_uses:
@@ -376,10 +382,7 @@ class AnthropicAgentNode(AgentNode):
                         node_id=self.id,
                     )
                 
-                final_text = "\n".join(t for t in final_text_chunks if t).strip()
-                self.transcript.append(ModelTextPart(text=final_text))
-                self.ctx.post_transcript_update()
-                self.ctx.post_success(final_text)
+                self.ctx.post_success(text)
                 self._close_client()
                 return
 
