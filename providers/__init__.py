@@ -11,6 +11,7 @@ class Provider(Enum):
     Anthropic = "Anthropic"
     Gemini = "Gemini"
     xAI = "xAI"
+    Copilot = "Copilot"
 
 # Framework assumes only using single best LLM from each provider for now.
 ModelNames: Dict[Provider, str] = {
@@ -18,6 +19,8 @@ ModelNames: Dict[Provider, str] = {
     Provider.Anthropic: "claude-opus-4-6",
     Provider.Gemini: "gemini-3.1-pro-preview",
     Provider.xAI: "grok-4",
+    # Consumed through the GitHub Copilot API surface (same subscription as VS Code).
+    Provider.Copilot: "claude-opus-4.8",
 }
 
 def get_AgentNode_impl(provider: Provider) -> type:
@@ -29,6 +32,9 @@ def get_AgentNode_impl(provider: Provider) -> type:
     elif provider == Provider.Gemini:
         from .gemini import GeminiAgentNode
         return GeminiAgentNode
+    elif provider == Provider.Copilot:
+        from .copilot import CopilotAgentNode
+        return CopilotAgentNode
     elif provider == Provider.OpenAI:
         raise NotImplementedError("todo: develop the OpenAIAgentNode subtype.")
     elif provider == Provider.xAI:

@@ -1,20 +1,24 @@
-"""Client factories used by the demos, which rely on simple api key."""
+"""Client factories that construct provider SDK clients from credentials.
+
+Key-file based factories (Anthropic, Gemini) read their API key from this
+`demos/` directory. The Copilot factory reuses the GitHub Copilot subscription
+via the token machinery in `copilot_auth`.
+"""
 
 from pathlib import Path
 from typing import Any, Callable, Dict
 
 import httpx
-import anthropic
-import google.genai as genai
-from google.genai import types
 
 from ..providers import Provider
+from .copilot_auth import get_copilot_bearer, copilot_default_headers
 
-DEMO_DIR = Path(__file__).resolve().parent
+# API key files (anthropic.key, gemini.key) are read from this demos directory.
+KEY_DIR = Path(__file__).resolve().parent
 
 
 def _read_key(filename: str) -> str:
-    path = DEMO_DIR / filename
+    path = KEY_DIR / filename
     try:
         key = path.read_text(encoding="utf-8").strip()
     except FileNotFoundError as exc:
@@ -34,7 +38,8 @@ def _read_key(filename: str) -> str:
     return key
 
 
-def anthropic_client_factory() -> anthropic.Anthropic:
+def anthropic_client_factory() -> "anthropic.Anthropic":
+    import anthropic
     key = _read_key("anthropic.key")
     # Use Anthropic's DefaultHttpxClient to retain their socket keepalive tuning, and
     # right-size connection limits/timeouts for single-agent long reasoning streams.
@@ -61,7 +66,9 @@ def anthropic_client_factory() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=key, http_client=http_client, max_retries=max_retries)
 
 
-def gemini_client_factory() -> genai.Client:
+def gemini_client_factory() -> "genai.Client":
+    import google.genai as genai
+    from google.genai import types
     key = _read_key("gemini.key")
 
     # We have our own retry layer, but Gemini SDK may have different
@@ -102,7 +109,41 @@ def gemini_client_factory() -> genai.Client:
     return genai.Client(api_key=key, http_options=http_options)
 
 
+def copilot_client_factory() -> Any:
+    """OpenAI-compatible client pointed at the GitHub Copilot API surface.
+
+    Reuses the same GitHub Copilot subscription entitlement as VS Code. A fresh
+    short-lived Copilot bearer token is minted on each factory call (and thus on
+    each client rebuild after a 401), so token refresh is handled transparently.
+    """
+    from openai import OpenAI
+
+    bearer = get_copilot_bearer()
+    http_client = httpx.Client(
+        http2=True,
+        limits=httpx.Limits(
+            max_connections=4,
+            max_keepalive_connections=2,
+            keepalive_expiry=20.0,
+        ),
+        timeout=httpx.Timeout(
+            connect=10.0,
+            read=900.0,
+            write=120.0,
+            pool=10.0,
+        ),
+    )
+    return OpenAI(
+        base_url="https://api.githubcopilot.com",
+        api_key=bearer,
+        default_headers=copilot_default_headers(),
+        http_client=http_client,
+        max_retries=1,
+    )
+
+
 CLIENT_FACTORIES: Dict[Provider, Callable[[], Any]] = {
     Provider.Anthropic: anthropic_client_factory,
     Provider.Gemini: gemini_client_factory,
+    Provider.Copilot: copilot_client_factory,
 }
