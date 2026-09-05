@@ -5,17 +5,17 @@ from threading import Event
 import time
 import random
 from overrides import override
+import httpx2
 
 from ..core import (
-    Node, RunContext, Function, AgentNode, AgentException, ModelProviderException,
+    Node, RunContext, Function, CodeFunction, AgentNode, AgentException, ModelProviderException,
     UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
+from ..func_lib.raise_exception import raise_exception
 from . import ModelNames, Provider
 
-
 import anthropic
-import httpx2
 from anthropic.types import (
     Message, MessageParam,
     RefusalStopDetails,
@@ -436,12 +436,16 @@ class AnthropicAgentNode(AgentNode):
                         result: Any = child.result()
                         out_text = "" if result is None else str(result)
                         is_error = False
-                    except AgentException as ex:
-                        # Agent decided to raise an exception. Keep processing the rest of the batch
-                        # per spec before propagating the exception outside the loop.
-                        pending_agent_ex = ex
-                        continue
                     except Exception as ex:
+                        if (
+                            isinstance(ex, AgentException)
+                            and isinstance(child.fn, CodeFunction)
+                            and (child.fn is raise_exception or child.fn.name == "raise_exception")
+                        ):
+                            # This agent decided to raise an exception. Keep processing the rest of the batch
+                            # per spec before propagating the exception outside the loop.
+                            pending_agent_ex = ex
+                            continue
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
 

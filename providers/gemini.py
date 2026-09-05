@@ -9,10 +9,11 @@ import httpx2
 from overrides import override
 
 from ..core import (
-    Node, RunContext, Function, AgentNode, AgentException,
+    Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
     UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
+from ..func_lib.raise_exception import raise_exception
 from . import ModelNames, Provider
 
 import google.genai as genai
@@ -407,12 +408,16 @@ class GeminiAgentNode(AgentNode):
                         out_text = "" if result is None else str(result)
                         is_error = False
                         response["output"] = out_text
-                    except AgentException as ex:
-                        # Agent decided to raise an exception. Keep processing the rest of the batch
-                        # per spec before propagating the exception outside the loop.
-                        pending_agent_ex = ex
-                        continue
                     except Exception as ex:
+                        if (
+                            isinstance(ex, AgentException)
+                            and isinstance(child.fn, CodeFunction)
+                            and (child.fn is raise_exception or child.fn.name == "raise_exception")
+                        ):
+                            # This agent decided to raise an exception. Keep processing the rest of the batch
+                            # per spec before propagating the exception outside the loop.
+                            pending_agent_ex = ex
+                            continue
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
                         response["error"] = out_text
