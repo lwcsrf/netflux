@@ -1205,8 +1205,8 @@ class TestRuntimeInvocation(unittest.TestCase):
                         with self.assertRaisesRegex(RuntimeError, "early boom"):
                             parent_node.result()
 
-                assert parent_node.thread is not None
-                parent_node.thread.join(timeout=1)
+                    assert parent_node.thread is not None
+                    parent_node.thread.join(timeout=1)
                 self.assertEqual(parent_node.state, expected_state)
                 self.assertEqual(parent_node.children, [])
                 self.assertTrue(any("has no effect and is ignored" in msg for msg in captured.output))
