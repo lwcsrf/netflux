@@ -668,7 +668,7 @@ class TestRuntimeInvocation(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "notes.txt"
-            target.write_text("before\n", encoding="utf-8")
+            target.write_bytes(b"before\n")
 
             def grandchild_callable(ctx: RunContext) -> str:
                 editor_node = ctx.invoke(
@@ -721,7 +721,7 @@ class TestRuntimeInvocation(unittest.TestCase):
             assert root_node.thread is not None
             root_node.thread.join(timeout=1)
 
-            self.assertEqual(target.read_text(encoding="utf-8"), "after\n")
+            self.assertEqual(target.read_bytes(), b"after\n")
             self.assertEqual(captured["top_level_bag_id"], id(root_node.session_bag))
             self.assertTrue(captured["lock_keys_before_cleanup"])
             self.assertTrue(root_node.session_bag._closed)
