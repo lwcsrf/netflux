@@ -85,6 +85,7 @@ THINKING = "➰"
 AGENT_GLYPH = "✨"
 CODE_GLYPH = "⚙️ "
 RESULT_GLYPH = "📤"
+TEXT_GLYPH = "🗣️"
 ARGS_GLYPH = "📋"
 USER_GLYPH = "👤"
 FUNCTION_GLYPH = "🧰"
@@ -1530,13 +1531,20 @@ class ConsoleRender:
         infos: list[LineInfo],
         fg: str | None = None,
         dim: bool = False,
+        title_bold: bool = False,
+        content_fg: str | None = None,
+        content_dim: bool = True,
+        show_char_count: bool = True,
         rendered_lines: list[_RenderedBlockLine] | None = None,
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
-        n_chars = len(text)
-        header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
-        label = f"{detail_prefix}{_color(header_plain, fg=fg, dim=dim)}"
+        char_count = f" ({len(text):,} chars)" if show_char_count else ""
+        header_plain = f"{indicator} {glyph} {title}{char_count}"
+        label = (
+            f"{detail_prefix}{_color(f'{indicator} {glyph} ', fg=fg, dim=dim)}"
+            f"{_color(f'{title}{char_count}', fg=fg, dim=dim, bold=title_bold)}"
+        )
         if collapsed:
             preview = (
                 self._preview_for_rendered_lines(
@@ -1548,7 +1556,7 @@ class ConsoleRender:
                 else self._preview_for_header(text, detail_prefix, header_plain)
             )
             if preview:
-                label += f" {_color(preview, dim=True)}"
+                label += f" {_color(preview, fg=content_fg, dim=content_dim)}"
         lines.append(label)
         infos.append(
             LineInfo(
@@ -1568,7 +1576,8 @@ class ConsoleRender:
                     lines,
                     infos,
                     max_lines=None,
-                    dim=True,
+                    fg=content_fg,
+                    dim=content_dim,
                     anchors=(key,),
                 )
             else:
@@ -1759,6 +1768,8 @@ class ConsoleRender:
             if isinstance(part, UserTextPart):
                 render_entries.append(("user", tx_idx, part))
             elif isinstance(part, ModelTextPart):
+                # Keep every text part, including text before later reasoning,
+                # tool calls, or additional model text; each has its own row.
                 render_entries.append(("model", tx_idx, part))
             elif isinstance(part, ThinkingBlockPart):
                 render_entries.append(("thinking", tx_idx, part))
@@ -1779,7 +1790,11 @@ class ConsoleRender:
                 continue
             render_entries.append(("child_only", len(nv.transcript), child))
 
-        has_model_text = any(isinstance(p, ModelTextPart) for p in nv.transcript)
+        last_model_text_idx = next(
+            (tx_idx for kind, tx_idx, _ in reversed(render_entries) if kind == "model"),
+            None,
+        )
+        has_model_text = last_model_text_idx is not None
         has_error_outcome = _has_error(nv) or (
             nv.state is NodeState.Canceled and nv.exception is not None
         )
@@ -1808,16 +1823,23 @@ class ConsoleRender:
                 part = payload
                 assert isinstance(part, ModelTextPart)
                 model_key = f"tp:{nv.id}:{tx_idx}:model"
+                # Match final-result selection: only the last text of a successful
+                # node is labeled as its result; live and intermediate text is text.
+                is_final_text = nv.state is NodeState.Success and tx_idx == last_model_text_idx
                 self._emit_text_part(
                     key=model_key,
-                    title="result",
-                    glyph=RESULT_GLYPH,
+                    title="result" if is_final_text else "text",
+                    glyph=RESULT_GLYPH if is_final_text else TEXT_GLYPH,
                     text=part.text,
                     detail_prefix=detail_prefix,
                     content_prefix=content_prefix,
                     lines=lines,
                     infos=infos,
-                    fg="green",
+                    fg="green" if is_final_text else "magenta",
+                    title_bold=not is_final_text,
+                    content_fg=None if is_final_text else "magenta",
+                    content_dim=is_final_text,
+                    show_char_count=is_final_text,
                     rendered_lines=self._rendered_root_result_lines_locked(
                         model_key,
                         part.text,
