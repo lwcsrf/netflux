@@ -208,6 +208,16 @@ class AnthropicAgentNode(AgentNode):
                         max_tokens=MAX_TOKENS,
                         thinking=THINKING_CFG,
                         output_config=OUTPUT_CFG,
+
+                        # Explicitly enforce replay prefix checks, to ensure reasoning continuity.
+                        # This beta field is not in the stable SDK thinking type yet.
+                        extra_body={
+                            "thinking": {
+                                **THINKING_CFG,
+                                "block_binding": {"prefix_mismatch_behavior": "error"},
+                            },
+                        },
+                        extra_headers={"anthropic-beta": "thinking-binding-controls-2026-08-01"},
                     ) as stream:
                         resp = stream.get_final_message()
 
