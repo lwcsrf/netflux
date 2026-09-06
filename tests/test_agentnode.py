@@ -7,6 +7,7 @@ from ..core import (
     RunContext,
     AgentNode,
     TokenUsage,
+    ModelTextPart,
     ModelProviderException,
 )
 from ..providers import Provider
@@ -38,7 +39,8 @@ class _FakeAgentNode(AgentNode):
 
     def run(self) -> None:  # pragma: no cover - behavior overridden per test when needed
         # By default, succeed immediately with a placeholder result
-        self.ctx.post_success({"ok": True})
+        self.transcript.append(ModelTextPart(text="ok"))
+        self.ctx.post_success("ok")
 
 class TestAgentNodeUtilities(unittest.TestCase):
     def test_build_user_text_formats_inputs(self):

@@ -133,6 +133,18 @@ class GeminiAgentNode(AgentNode):
     def provider(self) -> Provider:
         return Provider.Gemini
 
+    def append_model_text(self, text: str) -> None:
+        """Coalesce adjacent nonblank text."""
+        if not text.strip():
+            return
+        if self.transcript and isinstance(self.transcript[-1], ModelTextPart):
+            text = self.transcript[-1].text + "\n" + text
+            # Published snapshots share frozen parts, so replace rather than mutate.
+            self.transcript[-1] = ModelTextPart(text=text)
+        else:
+            self.transcript.append(ModelTextPart(text=text))
+        self.ctx.post_transcript_update()
+
     def _new_tool_use_id(self, tool_name: str) -> str:
         self._tool_call_counter += 1
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
@@ -310,6 +322,7 @@ class GeminiAgentNode(AgentNode):
 
             part: types.Part
             calls: List[types.FunctionCall] = []
+            text_chunks: List[str] = []
             for part in candidate.content.parts:  # pyright: ignore[reportOptionalIterable]
                 thought_sig: Optional[bytes] = part.thought_signature
                 if thought_sig:
@@ -331,10 +344,12 @@ class GeminiAgentNode(AgentNode):
 
                 text: Optional[str] = part.text
                 if text:
-                    self.transcript.append(ModelTextPart(text=text))
-                    self.ctx.post_transcript_update()
+                    text_chunks.append(text)
                     # Ensure our understanding of the protocol is correct that function calls come last.
                     assert not calls, "Gemini text parts should precede function_call parts."
+
+            for text in text_chunks:
+                self.append_model_text(text)
 
             # No function calls → finalize with assistant text.
             if not calls:
@@ -530,23 +545,18 @@ class GeminiAgentNode(AgentNode):
                     assert p.text is None or p.text.strip() == "", "Gemini thought text is supposed to be empty."
 
     def _final_text(self) -> str:
-        """
-        Extract final text from transcript: concatenate all ModelTextPart text
-        that comes after the last function call found (ToolResultPart).
-        """
-        last_func_idx = -1
-        for i, part in enumerate(self.transcript):
-            if isinstance(part, ToolResultPart):
-                last_func_idx = i
-
-        final_text_chunks: List[str] = []
-        for i in range(last_func_idx + 1, len(self.transcript)):
-            part = self.transcript[i]
+        """Return the final answer exactly as recorded after the last tool."""
+        for part in reversed(self.transcript):
             if isinstance(part, ModelTextPart):
-                if part.text.strip():
-                    final_text_chunks.append(part.text)
-       
-        return "\n".join(final_text_chunks)
+                return part.text
+            if isinstance(part, (ToolUsePart, ToolResultPart)):
+                break
+
+        # Gemini can successfully stop without text. Record that empty result
+        # explicitly so even these successes have a matching final text part.
+        self.transcript.append(ModelTextPart(text=""))
+        self.ctx.post_transcript_update()
+        return ""
 
     @staticmethod
     def _gemini_type_for_arg(py_t: type) -> types.Type:
