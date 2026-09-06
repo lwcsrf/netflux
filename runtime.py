@@ -25,6 +25,7 @@ from .core import (
     MaxAgentLevelExceededException,
     TerminalNodeStates,
     TokenUsage,
+    ModelTextPart,
     ToolUsePart,
     ToolResultPart,
 )
@@ -505,7 +506,19 @@ class Runtime:
                     node.id, node.fn.name, node.state.value, NodeState.Success.value,
                 )
                 return
-        
+
+            if isinstance(node, AgentNode):
+                # This may be relaxed in the future if we introduce a dedicated
+                # return() function and its own transcript type.
+                assert node.transcript and isinstance(node.transcript[-1], ModelTextPart), (
+                    f"Agent node {node.id} ({node.fn.name}) must end its transcript "
+                    "with a ModelTextPart before posting success."
+                )
+                assert outputs == node.transcript[-1].text, (
+                    f"Agent node {node.id} ({node.fn.name}) result must equal "
+                    "its final ModelTextPart text."
+                )
+
             self._global_seqno += 1
             node.outputs = outputs
             node.state = NodeState.Success
