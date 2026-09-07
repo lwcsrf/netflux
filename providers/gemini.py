@@ -10,10 +10,10 @@ from overrides import override
 
 from ..core import (
     Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
-    UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
+    UserTextPart, ModelTextPart, ModelStatusPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
-from ..func_lib.raise_exception import raise_exception
+from ..func_lib import raise_exception, status_update
 from . import ModelNames, Provider
 
 import google.genai as genai
@@ -148,6 +148,15 @@ class GeminiAgentNode(AgentNode):
     def _new_tool_use_id(self, tool_name: str) -> str:
         self._tool_call_counter += 1
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
+
+    def is_valid_status_update(self, fc: types.FunctionCall) -> bool:
+        if not fc.name or self.func_map.get(fc.name) is not status_update:
+            return False
+        try:
+            status_update.validate_coerce_args(fc.args or {})
+        except ValueError:
+            return False
+        return True
 
     def _close_client(self) -> None:
         if self.client is None:
@@ -387,9 +396,14 @@ class GeminiAgentNode(AgentNode):
                 tool_use_ids.append(tool_use_id)
 
                 args_ro = MappingProxyType(copy.deepcopy(tool_args))
-                self.transcript.append(
-                    ToolUsePart(tool_use_id=tool_use_id, tool_name=name, args=args_ro)
-                )
+                if self.is_valid_status_update(fc):
+                    self.transcript.append(
+                        ModelStatusPart(text=args_ro["msg"], tool_use_id=tool_use_id)
+                    )
+                else:
+                    self.transcript.append(
+                        ToolUsePart(tool_use_id=tool_use_id, tool_name=name, args=args_ro)
+                    )
                 self.ctx.post_transcript_update()
 
                 try:
@@ -438,15 +452,16 @@ class GeminiAgentNode(AgentNode):
                         response["error"] = out_text
 
                 # Transcript result in common framework types.
-                self.transcript.append(
-                    ToolResultPart(
-                        tool_use_id=tool_use_id,
-                        tool_name=fc.name,
-                        outputs=out_text,
-                        is_error=is_error,
+                if not self.is_valid_status_update(fc):
+                    self.transcript.append(
+                        ToolResultPart(
+                            tool_use_id=tool_use_id,
+                            tool_name=fc.name,
+                            outputs=out_text,
+                            is_error=is_error,
+                        )
                     )
-                )
-                self.ctx.post_transcript_update()
+                    self.ctx.post_transcript_update()
 
                 # Transcript result in gemini sdk types.
                 result_parts.append(types.Part(
@@ -549,7 +564,7 @@ class GeminiAgentNode(AgentNode):
         for part in reversed(self.transcript):
             if isinstance(part, ModelTextPart):
                 return part.text
-            if isinstance(part, (ToolUsePart, ToolResultPart)):
+            if isinstance(part, (ToolUsePart, ToolResultPart, ModelStatusPart)):
                 break
 
         # Gemini can successfully stop without text. Record that empty result

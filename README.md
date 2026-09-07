@@ -100,7 +100,8 @@ Every `AgentFunction` specifies:
 * **How to inject specifics**—typically string substitution, but any deterministic transform is fine as long as args ⇒ concrete prompt is well‑defined.
 * **Allowed `Function`s** it may call (task decomposition, sub‑agents, actuators i.e. leaf tools).
 * Optional `uses_recursion` to allow self-invocation as a tool.
-* Opt-in to the built‑in **`RaiseException`** function so the agent can proactively signal failure by raising an `AgentException`.
+* Opt-in to built‑in `raise_exception` function so the agent can proactively signal failure by raising an `AgentException`.
+* Opt-in to built-in `status_update` function for progress messages; some models may use non-final assistant text otherwise or if requested (prefer the built-in).
 
 > **Design note:** *The agent’s logical reasoning replaces a function’s fixed code body. Otherwise, we treat agents and code functions uniformly—which is the foundation of netflux.*
 
@@ -636,12 +637,14 @@ This refined example shows:
 
 * `UserTextPart`
 * `ModelTextPart`
+* `ModelStatusPart`
 * `ToolUsePart`
 * `ToolResultPart`
 * `ThinkingBlockPart`
     * including both redacted and non-redacted
     * includes `signature` field for thinking block signatures
-* On every follow-up call, replay the full history in original order.
+
+On every follow-up request, we replay the full provider-native transcript in original order, not the internal representation types above. We always maintain both the original provider-native transcript plus the netflux representation.
 
 ## `Ensemble`
 
@@ -734,10 +737,11 @@ This refined example shows:
     * When collecting `Function` invocation results from `ctx.invoke(..).result()`, expect the possibility of an `Exception` being raised and always catch it.
         * Pass on a string representation of the `Exception`'s type and message (with details but never too verbose and never with stacktrace) back to the LLM in the regular follow-up tool cycle, and flag the fault if the provider's SDK has an explicit field for that. Some LLMs are fine-tuned to pay attention to the error flag but most will understand the `Exception` string properly anyway especially if the detail is present.
         * Includes `ValueError` for built-in argument type checking (LLM can respond by re-trying).
-    * For every model function call, the provider must keep one exact `tool_use_id` across all three artifacts it produces:
+    * For ordinary model function calls, the provider must keep one exact `tool_use_id` across all three artifacts it produces:
         * `ToolUsePart.tool_use_id` in the transcript.
         * `ToolResultPart.tool_use_id` in the transcript for that same tool call.
         * The child `Node` created for that function call (pass the same id to `AgentNode.invoke_tool_function(...)`).
+    * Providers publish accepted `status_update` calls before other batch tool calls as `ModelStatusPart`, omitting their raw func call and successful result parts from the netflux transcript. The native replay transcript retains regular tool call/response.
     * `AgentNode.invoke_tool_function(...)` propagates the id to `RunContext.invoke(...)`; provider code must call it with the exact id from the function call (or the provider-synthesized id when the SDK omits one).
     * Do not create function-call children with missing or mismatched `tool_use_id`.
     * Do not reuse a `tool_use_id` among siblings under the same parent `AgentNode`.

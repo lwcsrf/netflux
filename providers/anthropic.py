@@ -9,10 +9,10 @@ import httpx2
 
 from ..core import (
     Node, RunContext, Function, CodeFunction, AgentNode, AgentException, ModelProviderException,
-    UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
+    UserTextPart, ModelTextPart, ModelStatusPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
-from ..func_lib.raise_exception import raise_exception
+from ..func_lib import raise_exception, status_update
 from . import ModelNames, Provider
 
 import anthropic
@@ -167,6 +167,15 @@ class AnthropicAgentNode(AgentNode):
     @override
     def provider(self) -> Provider:
         return Provider.Anthropic
+
+    def is_valid_status_update(self, tu: ToolUseBlock) -> bool:
+        if not tu.name or self.func_map.get(tu.name) is not status_update:
+            return False
+        try:
+            status_update.validate_coerce_args(cast(Dict[str, Any], tu.input or {}))
+        except ValueError:
+            return False
+        return True
 
     def _close_client(self) -> None:
         if self.client is None:
@@ -352,9 +361,14 @@ class AnthropicAgentNode(AgentNode):
                     args = cast(Dict[str, Any], blk.input or {})
                     # Make args mapping immutable for transcript snapshot
                     args_ro = MappingProxyType(copy.deepcopy(args))
-                    self.transcript.append(
-                        ToolUsePart(tool_use_id=blk.id, tool_name=blk.name, args=args_ro)
-                    )
+                    if self.is_valid_status_update(blk):
+                        self.transcript.append(ModelStatusPart(
+                            text=args_ro["msg"], tool_use_id=blk.id,
+                        ))
+                    else:
+                        self.transcript.append(
+                            ToolUsePart(tool_use_id=blk.id, tool_name=blk.name, args=args_ro)
+                        )
                     self.ctx.post_transcript_update()
                     tool_uses.append(blk)
                     assistant_params.append(
@@ -462,15 +476,16 @@ class AnthropicAgentNode(AgentNode):
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
 
-                self.transcript.append(
-                    ToolResultPart(
-                        tool_use_id=tu.id,
-                        tool_name=tu.name,
-                        outputs=out_text,
-                        is_error=is_error,
+                if not self.is_valid_status_update(tu):
+                    self.transcript.append(
+                        ToolResultPart(
+                            tool_use_id=tu.id,
+                            tool_name=tu.name,
+                            outputs=out_text,
+                            is_error=is_error,
+                        )
                     )
-                )
-                self.ctx.post_transcript_update()
+                    self.ctx.post_transcript_update()
 
                 result_blocks.append(
                     ToolResultBlockParam(
