@@ -466,6 +466,7 @@ class AnthropicAgentNode(AgentNode):
                     except Exception as ex:
                         if (
                             isinstance(ex, AgentException)
+                            and ex.node_id == self.id
                             and isinstance(child.fn, CodeFunction)
                             and (child.fn is raise_exception or child.fn.name == "raise_exception")
                         ):
