@@ -5,9 +5,13 @@ By default it reads API keys from the following files in this directory:
 
 - `anthropic.key`
 - `gemini.key`
+- `openai.key`
 
 Create each file and paste your API key as the only line of text. If you use a different
 authentication flow, update the callables in `client_factory.py` before running the demos.
+
+OpenAI, Anthropic, and Gemini have built-in providers, and the client factories are for demo purposes. These can be re-used as real client factories in your app.
+Only the selected provider's SDK and key are needed.
 
 ### Interactive console viewer
 
@@ -22,7 +26,7 @@ No limits in how many guesses it gets per stage, but it needs to get the correct
 
 The `puzzle` demo also serves the purpose of proving that the provider is capable of a single continuous reasoning chain that envelopes the multi cycles of tool use.
 
-`python3 -m netflux.demos.puzzle --provider={gemini,anthropic}`
+`python3 -m netflux.demos.puzzle --provider={openai,anthropic,gemini}`
 
 ### Performance Optimizer (`perf_opt.py`)
 
@@ -30,7 +34,7 @@ Profiles, critically analyzes, and iteratively optimizes a Python code target.
 Uses a combination of cProfile and critical reasoning. Produces intermediate profiling and analysis
 reports, and a final report summarizing changes and measured performance gains.
 
-`python3 -m netflux.demos.perf_opt --provider={gemini,anthropic}`
+`python3 -m netflux.demos.perf_opt --provider={openai,anthropic,gemini}`
 
 ### Apply Diff (`apply_diff.py`)
 
@@ -39,7 +43,7 @@ The script prints the workspace path, streams a live view of the agent’s work,
 
 Run:
 
-`python3 -m netflux.demos.apply_diff --provider={gemini,anthropic} [--fail-first]`
+`python3 -m netflux.demos.apply_diff --provider={openai,anthropic,gemini} [--fail-first]`
 
 ### Bash Stress (`bash_stress.py`)
 
@@ -49,7 +53,7 @@ The script creates a disposable workspace, changes into it before invoking the a
 
 Run:
 
-`python3 -m netflux.demos.bash_stress --provider={gemini,anthropic} [--custom-instruction "..."]`
+`python3 -m netflux.demos.bash_stress --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
 
 ## TUI (`tui.py`)
 

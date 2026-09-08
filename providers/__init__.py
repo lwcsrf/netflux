@@ -30,7 +30,8 @@ def get_AgentNode_impl(provider: Provider) -> type:
         from .gemini import GeminiAgentNode
         return GeminiAgentNode
     elif provider == Provider.OpenAI:
-        raise NotImplementedError("todo: develop the OpenAIAgentNode subtype.")
+        from .openai import OaiAgentNode
+        return OaiAgentNode
     elif provider == Provider.xAI:
         raise NotImplementedError("todo: develop the XAIAgentNode subtype.")
     else:
