@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable, Dict
+from typing import Any, Callable, Dict
 import httpx2
-
-if TYPE_CHECKING:
-    import anthropic
-    import google.genai as genai
-    import openai
 
 from ..providers import Provider
 
 DEMO_DIR = Path(__file__).resolve().parent
+
+httpx_limits = httpx2.Limits(
+    max_connections=4,
+    max_keepalive_connections=2,
+    keepalive_expiry=20.0,
+)
+httpx_timeout = httpx2.Timeout(
+    connect=10.0,
+    read=900.0,  # allow long synchronous reasoning responses
+    write=120.0,
+    pool=10.0,
+)
 
 
 def _read_key(filename: str) -> str:
@@ -37,7 +44,7 @@ def _read_key(filename: str) -> str:
     return key
 
 
-def anthropic_client_factory() -> anthropic.Anthropic:
+def anthropic_client_factory(): # -> anthropic.Anthropic
     import anthropic
 
     key = _read_key("anthropic.key")
@@ -45,17 +52,8 @@ def anthropic_client_factory() -> anthropic.Anthropic:
     # right-size connection limits/timeouts for single-agent long reasoning streams.
     http_client = anthropic.DefaultHttpxClient(
         http2=True,
-        limits=httpx2.Limits(
-            max_connections=4,
-            max_keepalive_connections=2,
-            keepalive_expiry=20.0,
-        ),
-        timeout=httpx2.Timeout(
-            connect=10.0,
-            read=900.0,   # tolerate very long gaps between streamed chunks
-            write=120.0,
-            pool=10.0,
-        ),
+        limits=httpx_limits,
+        timeout=httpx_timeout,
         # default in httpx2; leave unless you need to disable env proxies:
         # trust_env=False,
     )
@@ -66,7 +64,7 @@ def anthropic_client_factory() -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=key, http_client=http_client, max_retries=max_retries)
 
 
-def gemini_client_factory() -> genai.Client:
+def gemini_client_factory(): # -> genai.Client
     import google.genai as genai
     from google.genai import types
 
@@ -81,17 +79,6 @@ def gemini_client_factory() -> genai.Client:
         exp_base=2.0,
         jitter=1.0,
     )
-    httpx_limits = httpx2.Limits(
-        max_connections=4,
-        max_keepalive_connections=2,
-        keepalive_expiry=20.0,
-    )
-    httpx_timeout = httpx2.Timeout(
-        connect=10.0,
-        read=900.0,  # tolerate very long gaps between streamed chunks
-        write=120.0,
-        pool=10.0,
-    )
     http_client = httpx2.Client(http2=True, limits=httpx_limits, timeout=httpx_timeout)
     http_options = types.HttpOptions(
         # Choose api_version if you want only GA endpoints; by default SDK uses v1beta for preview features.
@@ -105,23 +92,14 @@ def gemini_client_factory() -> genai.Client:
     return genai.Client(api_key=key, http_options=http_options)
 
 
-def openai_client_factory() -> openai.OpenAI:
+def openai_client_factory(): # -> openai.OpenAI
     import openai
 
     key = _read_key("openai.key")
     http_client = openai.DefaultHttpx2Client(
         http2=True,
-        limits=httpx2.Limits(
-            max_connections=4,
-            max_keepalive_connections=2,
-            keepalive_expiry=20.0,
-        ),
-        timeout=httpx2.Timeout(
-            connect=10.0,
-            read=900.0,  # allow long synchronous reasoning responses
-            write=120.0,
-            pool=10.0,
-        ),
+        limits=httpx_limits,
+        timeout=httpx_timeout,
     )
     # The provider owns the retry budget and cancellation-aware backoff.
     return openai.OpenAI(api_key=key, http_client=http_client, max_retries=0)
