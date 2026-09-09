@@ -49,7 +49,7 @@ from ..core import (
     ToolUsePart,
     UserTextPart,
 )
-from ..func_lib import status_update
+from ..func_lib import ImageResult, status_update
 from ..providers import ModelNames, Provider
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -321,6 +321,8 @@ def _strip_ansi(text: str) -> str:
 
 def _short_repr(value: Any, max_len: int = 40) -> str:
     """Short string representation, truncated if needed."""
+    if isinstance(value, ImageResult):
+        return _preview_text(value.status, max_len)
     try:
         s = repr(value)
     except Exception:
@@ -328,6 +330,13 @@ def _short_repr(value: Any, max_len: int = 40) -> str:
     if len(s) > max_len:
         return s[: max_len - 3] + "..."
     return s
+
+
+def _output_text(value: Any) -> str:
+    """Render image results without accessing or stringifying their media bytes."""
+    if isinstance(value, ImageResult):
+        return f"{value.status}\n[image content]"
+    return str(value)
 
 
 def _format_args(
@@ -622,7 +631,7 @@ class ConsoleRender:
             for idx in range(len(view.transcript) - 1, -1, -1):
                 part = view.transcript[idx]
                 if isinstance(part, ModelTextPart):
-                    copy_text = str(view.outputs) if view.outputs is not None else part.text
+                    copy_text = _output_text(view.outputs) if view.outputs is not None else part.text
                     return _RootResultTarget(
                         key=f"tp:{view.id}:{idx}:model",
                         display_text=part.text,
@@ -630,7 +639,7 @@ class ConsoleRender:
                     )
             if view.outputs is None:
                 return None
-            rendered = str(view.outputs)
+            rendered = _output_text(view.outputs)
             return _RootResultTarget(
                 key=f"ao:{view.id}",
                 display_text=rendered,
@@ -640,7 +649,7 @@ class ConsoleRender:
         if view.outputs is None:
             return None
 
-        rendered = str(view.outputs)
+        rendered = _output_text(view.outputs)
         return _RootResultTarget(
             key=f"cr:{view.id}",
             display_text=rendered,
@@ -655,6 +664,13 @@ class ConsoleRender:
     ) -> list[_RenderedBlockLine] | None:
         target = self._terminal_root_result_target_locked()
         if target is None or target.key != key:
+            return None
+        if (
+            self._last_view is not None
+            and isinstance(self._last_view.outputs, ImageResult)
+            and key in (f"ao:{self._last_view.id}", f"cr:{self._last_view.id}")
+        ):
+            # Use plain result rows for images; final assistant text still uses Markdown.
             return None
         width = max(1, self._cols - _visible_len(content_prefix))
         return _render_markdown_lines(text, width=width)
@@ -1736,7 +1752,7 @@ class ConsoleRender:
         lines.append(f"{content_prefix}{_color(f'{RESULT_GLYPH} {label}:', fg=color)}")
         infos.append(LineInfo(anchors=(key,)))
         self._emit_content_block(
-            str(result_part.outputs).splitlines() or [""],
+            _output_text(result_part.outputs).splitlines() or [""],
             content_prefix + "  ",
             lines,
             infos,
@@ -1970,7 +1986,7 @@ class ConsoleRender:
                 key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
-                text=str(nv.outputs),
+                text=_output_text(nv.outputs),
                 detail_prefix=detail_prefix,
                 content_prefix=content_prefix,
                 lines=lines,
@@ -1978,7 +1994,7 @@ class ConsoleRender:
                 fg="green",
                 rendered_lines=self._rendered_root_result_lines_locked(
                     result_key,
-                    str(nv.outputs),
+                    _output_text(nv.outputs),
                     content_prefix,
                 ),
             )
@@ -2021,7 +2037,7 @@ class ConsoleRender:
                 key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
-                text=str(nv.outputs),
+                text=_output_text(nv.outputs),
                 detail_prefix=detail_prefix,
                 content_prefix=content_prefix,
                 lines=lines,
@@ -2029,7 +2045,7 @@ class ConsoleRender:
                 fg="green",
                 rendered_lines=self._rendered_root_result_lines_locked(
                     result_key,
-                    str(nv.outputs),
+                    _output_text(nv.outputs),
                     content_prefix,
                 ),
             )

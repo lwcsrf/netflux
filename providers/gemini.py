@@ -1,4 +1,4 @@
-from typing import Any, Callable, Dict, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Union, cast
 from types import MappingProxyType
 import copy
 import base64
@@ -13,7 +13,7 @@ from ..core import (
     UserTextPart, ModelTextPart, ModelStatusPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
-from ..func_lib import raise_exception, status_update
+from ..func_lib import ImageResult, raise_exception, status_update
 from . import ModelNames, Provider
 
 import google.genai as genai
@@ -45,7 +45,6 @@ from google.genai import errors as genai_errors
             - all the session messages thus far, and:
             - append the previous response model content (containing the last “thinking”
               thought signatures and the last function call(s)),
-            - append your functionResponse parts (role can be `tool` or `user`).
         5. Repeat until the model returns a non-thinking text answer and no follow-up function
            calls.
     * Interleaved reasoning with tools — Gemini 3.1 Pro behaves like Opus 4.1 (strong evidence
@@ -86,7 +85,7 @@ class GeminiAgentNode(AgentNode):
     AgentNode impl for Gemini using `google-genai` SDK typed objects exclusively.
 
     - History is List[types.Content]; Parts are types.Part (text, thought, thought_signature, function_call).
-    - Parallel tool execution; aggregate results into a single role="tool" message per cycle including parallel tool calls.
+    - Parallel function execution; result aggregation.
     - Thought summaries are never stored; signatures are preserved in history and also recorded into Transcript as ThinkingBlockPart.
     - Final assistant content is appended to history even on the last turn.
     - No caching (handled by Gemini service transparently).
@@ -103,11 +102,9 @@ class GeminiAgentNode(AgentNode):
         tool_use_id: Optional[str] = None,
     ):
         super().__init__(ctx, id, fn, inputs, parent, cancel_event, client_factory, tool_use_id)
-        client: Any = client_factory()
-        if not isinstance(client, genai.Client):
-            raise TypeError(
-                "GeminiAgentNode expected client_factory to return google.genai.Client"
-            )
+        client: genai.Client = cast(genai.Client, client_factory())
+        assert isinstance(client, genai.Client), \
+            "GeminiAgentNode expected client_factory to return `google.genai.Client`"
         self.client: genai.Client = client
         self.model = ModelNames[Provider.Gemini]
         self._history: List[types.Content] = []   # Typed conversation history we replay every turn
@@ -206,7 +203,7 @@ class GeminiAgentNode(AgentNode):
                 try:
                     resp = self.client.models.generate_content(
                         model=self.model,
-                        contents=self._history,
+                        contents=cast(types.ContentListUnionDict, self._history),
                         config=config,
                     )
 
@@ -418,25 +415,29 @@ class GeminiAgentNode(AgentNode):
             # WaitAll + transcribe results.
             for fc, child, invoke_ex, tool_use_id in zip(calls, children, invoke_exceptions, tool_use_ids):
                 assert fc.name
-                response: dict[str, Any] = {}  # for gemini `FunctionResponse.response` field.
+                result: Any
                 out_text: str
                 is_error: bool
 
                 # Did the invocation itself fail-fast? (e.g. bad args)
-                if invoke_ex:
+                if invoke_ex is not None:
+                    result = invoke_ex
                     out_text = AgentNode.stringify_exception(invoke_ex)
                     is_error = True
-                    response["error"] = out_text
 
                 # Check if the child Node is success / error.
                 else:
                     assert child
                     try:
                         # This will re-raise any exception that happened inside the tool function.
-                        result: Any = child.result()
-                        out_text = "" if result is None else str(result)
+                        result = child.result()
+                        if result is None:
+                            out_text = ""
+                        elif isinstance(result, ImageResult):
+                            out_text = result.status
+                        else:
+                            out_text = str(result)
                         is_error = False
-                        response["output"] = out_text
                     except Exception as ex:
                         if (
                             isinstance(ex, AgentException)
@@ -448,9 +449,9 @@ class GeminiAgentNode(AgentNode):
                             # per spec before propagating the exception outside the loop.
                             pending_agent_ex = ex
                             continue
+                        result = ex
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
-                        response["error"] = out_text
 
                 # Transcript result in common framework types.
                 if not self.is_valid_status_update(fc):
@@ -458,18 +459,24 @@ class GeminiAgentNode(AgentNode):
                         ToolResultPart(
                             tool_use_id=tool_use_id,
                             tool_name=fc.name,
-                            outputs=out_text,
+                            outputs=result if isinstance(result, ImageResult) else out_text,
                             is_error=is_error,
                         )
                     )
                     self.ctx.post_transcript_update()
 
-                # Transcript result in gemini sdk types.
+                # Nest media beside the text response; SDK faults stay outside the tool handler.
+                image_parts: Optional[list[types.FunctionResponsePart]] = None
+                if isinstance(result, ImageResult):
+                    image_parts = [types.FunctionResponsePart.from_bytes(
+                        data=result.data, mime_type=result.mime_type,
+                    )]
                 result_parts.append(types.Part(
                     function_response=types.FunctionResponse(
                         id=fc.id,
                         name=fc.name,
-                        response=response,
+                        response={"error" if is_error else "output": out_text},
+                        parts=image_parts,
                     )
                 ))
 
@@ -487,7 +494,7 @@ class GeminiAgentNode(AgentNode):
             
             # Per protocol: next user message contains only function results.
             # Aggregated function results to single Content message.
-            self._history.append(types.Content(role="tool", parts=result_parts))
+            self._history.append(types.Content(role="user", parts=result_parts))
 
         self._close_client()
         raise RuntimeError(f"Gemini agent loop exceeded MAX_STEPS ({MAX_STEPS}) "

@@ -102,6 +102,7 @@ Every `AgentFunction` specifies:
 * Optional `uses_recursion` to allow self-invocation as a tool.
 * Opt-in to built‑in `raise_exception` function so the agent can proactively signal failure by raising an `AgentException`.
 * Opt-in to built-in `status_update` function for progress messages; some models may use non-final assistant text otherwise or if requested (prefer the built-in).
+* Opt-in to built-in `view_image` function to give the agent image vision. See `func_lib/view_image.py` for design spec.
 
 > **Design note:** *The agent’s logical reasoning replaces a function’s fixed code body. Otherwise, we treat agents and code functions uniformly—which is the foundation of netflux.*
 

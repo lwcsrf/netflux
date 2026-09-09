@@ -12,7 +12,7 @@ from ..core import (
     UserTextPart, ModelTextPart, ModelStatusPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
-from ..func_lib import raise_exception, status_update
+from ..func_lib import ImageResult, raise_exception, status_update
 from . import ModelNames, Provider
 
 import anthropic
@@ -20,7 +20,7 @@ from anthropic.types import (
     Message, MessageParam,
     RefusalStopDetails,
     Usage,
-    TextBlock, TextBlockParam,
+    TextBlock, TextBlockParam, ImageBlockParam,
     ThinkingBlock, ThinkingBlockParam,
     RedactedThinkingBlock, RedactedThinkingBlockParam,
     ToolUseBlock, ToolUseBlockParam,
@@ -447,11 +447,13 @@ class AnthropicAgentNode(AgentNode):
 
             # WaitAll + transcribe results.
             for tu, child, invoke_ex in zip(tool_uses, children, invoke_exceptions):
+                result: Any
                 out_text: str
                 is_error: bool
 
                 # Did the invocation itself fail-fast? (e.g. bad args)
-                if invoke_ex:
+                if invoke_ex is not None:
+                    result = invoke_ex
                     out_text = AgentNode.stringify_exception(invoke_ex)
                     is_error = True
 
@@ -459,9 +461,14 @@ class AnthropicAgentNode(AgentNode):
                 else:
                     assert child
                     try:
-                        # This will re-raise any exception that happened inside the tool function.
-                        result: Any = child.result()
-                        out_text = "" if result is None else str(result)
+                        # This will re-raise any exception that happened inside the function.
+                        result = child.result()
+                        if result is None:
+                            out_text = ""
+                        elif isinstance(result, ImageResult):
+                            out_text = result.status
+                        else:
+                            out_text = str(result)
                         is_error = False
                     except Exception as ex:
                         if (
@@ -474,28 +481,42 @@ class AnthropicAgentNode(AgentNode):
                             # per spec before propagating the exception outside the loop.
                             pending_agent_ex = ex
                             continue
+                        result = ex
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
 
+                # Add func response to netflux transcript.
+                # Status updates only get single `ModelStatusPart`, already injected.
                 if not self.is_valid_status_update(tu):
                     self.transcript.append(
                         ToolResultPart(
                             tool_use_id=tu.id,
                             tool_name=tu.name,
-                            outputs=out_text,
+                            outputs=result if isinstance(result, ImageResult) else out_text,
                             is_error=is_error,
                         )
                     )
                     self.ctx.post_transcript_update()
 
-                result_blocks.append(
-                    ToolResultBlockParam(
-                        tool_use_id=tu.id,
-                        type="tool_result",
-                        content=[TextBlockParam(text=out_text, type="text")],
-                        is_error=is_error,
-                    )
-                )
+                # Add func response to native anthropic transcript.
+                content: List[Union[TextBlockParam, ImageBlockParam]] = [
+                    TextBlockParam(text=out_text, type="text")
+                ]
+                if isinstance(result, ImageResult):
+                    content.append(ImageBlockParam(
+                        type="image",
+                        source={
+                            "type": "base64",
+                            "media_type": result.mime_type,
+                            "data": result.base64_data,
+                        },
+                    ))
+                result_blocks.append(ToolResultBlockParam(
+                    tool_use_id=tu.id,
+                    type="tool_result",
+                    content=content,
+                    is_error=is_error,
+                ))
 
             # Now that we finished collecting + transcribing children, it's a good time to react
             # to agent wanting to raise exception, or cancellation request, in that
@@ -508,7 +529,7 @@ class AnthropicAgentNode(AgentNode):
                 self.ctx.post_cancel()
                 self._close_client()
                 return
-            
+
             # Per protocol: next user message contains only tool_result blocks
             self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
 
