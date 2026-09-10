@@ -181,6 +181,19 @@ IMAGE_STRESS_SYSTEM_PROMPT = STRESS_RULES + (
     "at least three additional corner cases motivated by that implementation. Explain expected "
     "versus observed results, distinguishing clean rejections from tool malfunctions. Finish with "
     "a concise report of visual findings, revision count, conversion evidence, extra probes and artifact paths.\n"
+    "Additional instructions:\n"
+    "- Provide a final verdict on how each stage went (e.g. SUCCESS or FAIL). Mark a stage as a "
+    "failure if, for example, there was no way to carry out a feedback loop of viewing, updating "
+    "the drawing and re-rasterizing.\n"
+    "- Provide a final verdict on the successful integration of the view_image built-in function "
+    "by reflecting on the context window and how seamlessly iterations were carried out. "
+    "Did the media appear exactly as intended?\n"
+    "- Work in your own /tmp directory. You may see other agents concurrently working on this "
+    "problem. Make sure you don't spoil the integrity of the task by looking at other agents' "
+    "work — stick to your own /tmp directory.\n"
+    "- Once done, put the final SVG series of improvements into a final directory under your "
+    "tmp directory and give its clear, absolute path in your response.\n"
+    "- Report any problems whatsoever with view_image efficacy: we want to know about it!\n"
 )
 
 TREE_STRESS_SYSTEM_PROMPT = STRESS_RULES + (
