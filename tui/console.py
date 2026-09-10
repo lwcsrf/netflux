@@ -2109,7 +2109,7 @@ class ConsoleRender:
         indicator = FOLD if collapsed else UNFOLD
 
         if part.redacted:
-            text = f"{indicator} {THINKING} thinking [redacted]"
+            text = f"{indicator} {THINKING} thinking"
         else:
             preview_part = ""
             if collapsed:
