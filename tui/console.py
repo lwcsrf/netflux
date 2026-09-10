@@ -70,6 +70,7 @@ FG: dict[str, str] = {
     "white": "\x1b[37m",
     "gray": "\x1b[38;5;250m",
     "orange": "\x1b[38;5;208m",
+    "steel_blue": "\x1b[38;5;110m",
 }
 
 BG_CURSOR = "\x1b[48;5;237m"
@@ -87,7 +88,7 @@ THINKING = "➰"
 AGENT_GLYPH = "✨"
 CODE_GLYPH = "⚙️ "
 RESULT_GLYPH = "📤"
-TEXT_GLYPH = "🗣️"
+TEXT_GLYPH = "✒️ "
 ARGS_GLYPH = "📋"
 USER_GLYPH = "👤"
 FUNCTION_GLYPH = "🧰"
@@ -1558,6 +1559,7 @@ class ConsoleRender:
         fg: str | None = None,
         dim: bool = False,
         title_bold: bool = False,
+        neutral_indicator: bool = False,
         content_fg: str | None = None,
         content_dim: bool = True,
         show_char_count: bool = True,
@@ -1567,8 +1569,13 @@ class ConsoleRender:
         indicator = FOLD if collapsed else UNFOLD
         char_count = f" ({len(text):,} chars)" if show_char_count else ""
         header_plain = f"{indicator} {glyph} {title}{char_count}"
+        styled_indicator = _color(
+            indicator,
+            fg=None if neutral_indicator else fg,
+            dim=True if neutral_indicator else dim,
+        )
         label = (
-            f"{detail_prefix}{_color(f'{indicator} {glyph} ', fg=fg, dim=dim)}"
+            f"{detail_prefix}{styled_indicator} {_color(f'{glyph} ', fg=fg, dim=dim)}"
             f"{_color(f'{title}{char_count}', fg=fg, dim=dim, bold=title_bold)}"
         )
         if collapsed:
@@ -1874,10 +1881,11 @@ class ConsoleRender:
                     content_prefix=content_prefix,
                     lines=lines,
                     infos=infos,
-                    fg="green" if is_final_text else "magenta",
+                    fg="green" if is_final_text else "steel_blue",
                     title_bold=not is_final_text,
-                    content_fg=None if is_final_text else "magenta",
-                    content_dim=is_final_text,
+                    neutral_indicator=not is_final_text,
+                    content_fg=None if is_final_text else "steel_blue",
+                    content_dim=True,
                     show_char_count=is_final_text,
                     rendered_lines=self._rendered_root_result_lines_locked(
                         model_key,

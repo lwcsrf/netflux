@@ -160,7 +160,9 @@ image result copies the status and placeholder. `view_image` uses the same styli
 as other tools.
 
 `ModelStatusPart` entries render in transcript order like intermediate assistant text,
-with the same glyph, magenta color, and collapse behavior, but a bold `status` label.
+with the same glyph, muted steel blue color, dim content, and collapse behavior,
+but a bold, undimmed `status` label (intermediate text uses `text`).
+Both use dim, neutral expand/collapse arrows matching thinking rows.
 
 Successful terminal root results behave as follows:
 - the renderer identifies one top-level result target for the selected root tree,
