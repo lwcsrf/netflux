@@ -829,8 +829,13 @@ class AgentNode(Node):
 
     def build_user_text(self) -> str:
         # Templated user prompt injection.
+        # Default omitted optional arguments locally; keep the invocation inputs unchanged.
+        prompt_inputs = dict(self.inputs)  # copy
+        for arg in self.agent_fn.args:
+            if arg.optional:
+                prompt_inputs.setdefault(arg.name, None)
         # This will raise on any invalid substitutions (todo: dedicated exception).
-        return self.agent_fn.user_prompt_template.format(**self.inputs)
+        return self.agent_fn.user_prompt_template.format(**prompt_inputs)
 
     def system_prompt(self) -> str:
         """
