@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from ..core import AgentFunction, FunctionArg, NodeState, Provider
-from ..func_lib import bash, raise_exception, view_image
+from ..func_lib import bash, raise_exception, status_update, view_image
 from ..runtime import Runtime
 from ..tui import ConsoleRender
 
@@ -143,7 +143,7 @@ bash_stress_agent = AgentFunction(
         f"Stop immediately and call `{raise_exception.name}` if you find a clear bash-tool malfunction or unreasonable behavior.\n"
         "If all goes well, end with normal summary text describing the breadth and depth of what you tried.\n"
     ),
-    uses=[bash, raise_exception],
+    uses=[bash, raise_exception, status_update],
     default_model=Provider.Anthropic,
 )
 SOURCE_ROOT = Path(__file__).resolve().parents[1]
@@ -223,7 +223,7 @@ image_stress_agent = AgentFunction(
     args=CUSTOM_INSTRUCTION_ARGS,
     system_prompt=IMAGE_STRESS_SYSTEM_PROMPT,
     user_prompt_template="Run the image stress test.\nCustom instruction: {custom_instruction}\n",
-    uses=[bash, view_image, raise_exception],
+    uses=[bash, view_image, raise_exception, status_update],
 )
 
 tree_stress_agent = AgentFunction(
@@ -232,7 +232,7 @@ tree_stress_agent = AgentFunction(
     args=CUSTOM_INSTRUCTION_ARGS,
     system_prompt=TREE_STRESS_SYSTEM_PROMPT,
     user_prompt_template="Run the agent tree stress test.\nCustom instruction: {custom_instruction}\n",
-    uses=[bash, raise_exception],
+    uses=[bash, raise_exception, status_update],
     uses_recursion=True,
 )
 
