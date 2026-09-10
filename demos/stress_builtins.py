@@ -70,7 +70,7 @@ BASH_STRESS_SYSTEM_PROMPT = (
     "   - child-shell `set -e` / `set -o errexit` usage (for example via `bash script.sh`) should behave like an ordinary command failure\n"
     "   - `set -x` / `set -o xtrace` behavior — verify commands still complete and follow-up calls still work; "
     "it is acceptable if xtrace output exposes some internal transport/delimiter text\n"
-    "   - stdout redirection resilience: `exec 1>/dev/null`, then run another command and verify the tool still returns output\n"
+    "   - fd redirection: persistent `exec 1>/dev/null`, and explicit restoration after saving; command-scoped `cmd 1>/x/y`; restart session also back to normal FDs\n"
     "   - process substitution (`<(...)`, `>(...)`)\n"
     "   - traps (`trap '...' EXIT`) — verify they don't break the tool's own sentinel mechanism\n"
     "   - symlinks: create, follow, resolve with `readlink`\n"
