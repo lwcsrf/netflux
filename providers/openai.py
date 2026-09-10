@@ -60,7 +60,7 @@ TRANSIENT_RESPONSE_ERRORS: Final = frozenset({
 
 
 # OpenAI and Pydantic expose JSON Schema as a generic dict; these TypedDicts
-# check the strict object/property subset we generate before the SDK cast,
+# check the object/property subset we generate before the SDK cast,
 # so that it's like using strong types.
 JsonScalarType = Literal["string", "integer", "number", "boolean"]
 JsonTypeName = Literal["string", "integer", "number", "boolean", "null"]
@@ -854,23 +854,24 @@ class OaiAgentNode(AgentNode):
             if arg.argtype is str and arg.enum is not None:
                 enum_values: List[Optional[str]] = list(sorted(arg.enum))
                 if arg.optional:
-                    # Netflux already accepts None for optional args. Strict
-                    # schemas must allow null in both the type and the enum.
+                    # Netflux accepts both omission and explicit None for optional args, so allow null in
+                    # both the type and the enum for the explicit None case.
                     enum_values.append(None)
                 property_schema["enum"] = enum_values
 
             properties[arg.name] = property_schema
 
-        # In OpenAI strict mode every property is listed in required. Netflux
-        # optional args remain optional semantically by being nullable.
         schema = ObjectParametersSchema(
             type="object", properties=properties,
-            required=[arg.name for arg in fn.args], additionalProperties=False,
+            required=[arg.name for arg in fn.args if not arg.optional], additionalProperties=False,
         )
 
         tool = FunctionToolParam(
             type="function", name=fn.name, description=fn.desc,
-            parameters=cast(FunctionParameters, schema), strict=True,
+            parameters=cast(FunctionParameters, schema),
+            # Framework validation and coercion return actionable exceptions so the model can correct follow-up calls.
+            # `strict` would have the API service do this, but we don't need that, and it results in more token-verbose function calls
+            strict=False,
             allowed_callers=["direct"], defer_loading=False,
         )
         tool["async"] = False  # Reserved Python keyword in the SDK's TypedDict.
