@@ -1800,6 +1800,12 @@ class ConsoleRender:
             elif isinstance(part, ModelStatusPart):
                 render_entries.append(("status", tx_idx, part))
             elif isinstance(part, ThinkingBlockPart):
+                # Collapse adjacent empty thinking rows, keeping any available content.
+                if tx_idx > 0 and isinstance(nv.transcript[tx_idx - 1], ThinkingBlockPart):
+                    if not part.content:
+                        continue
+                    if not render_entries[-1][2].content:
+                        render_entries.pop()
                 render_entries.append(("thinking", tx_idx, part))
             elif isinstance(part, ToolUsePart):
                 if part.tool_use_id in seen_invocation_ids:
