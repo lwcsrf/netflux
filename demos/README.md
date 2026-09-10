@@ -45,15 +45,21 @@ Run:
 
 `python3 -m netflux.demos.apply_diff --provider={openai,anthropic,gemini} [--fail-first]`
 
-### Bash Stress (`bash_stress.py`)
+### Built-in Stress Tests (`stress_builtins.py`)
 
-Runs a relatively bare `AgentFunction` whose job is to stress-test the built-in `bash` tool the way an agent would actually use it. By default it performs a broad progression of shell workflows, starting simple and becoming more sophisticated. Optionally, pass `--custom-instruction` to steer the run toward a narrower behavior or failure mode you want to probe.
+Choose one of three test modes: `bash`, `image`, or `tree`.
 
-The script creates a disposable workspace, changes into it before invoking the agent, streams a live tree view, and leaves the workspace on disk so you can inspect what the agent did afterward.
+- `bash`: runs a relatively bare `AgentFunction` whose role is to stress-test the built-in `bash` tool that covers a superset of how any agent might use the function.
+- `image`: inspect an existing asset, refine an SVG through at least ten visual revisions that require using `view_image` of the rasterized SVG, exercise downsizing and re-encoding of a large image, then derive more probes after looking at the `view_image` source and try them.
+- `tree`: recursively delegate with a three-agent-level limit and relay evidence of the deepest-level warning and rejected fourth level invocation attempt.
+
+Optionally, pass `--custom-instruction` to steer the run toward a narrower behavior or failure mode you want to probe. Only `tree` exposes an agent as a function, and does so recursively, and its delegates use the selected provider too.
+
+The script creates a disposable workspace, changes into it before invoking the agent, streams a live tree view, and leaves the workspace on a tmp volume for inspectability.
 
 Run:
 
-`python3 -m netflux.demos.bash_stress --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
+`python3 -m netflux.demos.stress_builtins {bash,image,tree} --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
 
 ## TUI (`tui.py`)
 
