@@ -376,10 +376,10 @@ class AnthropicAgentNode(AgentNode):
                     )
 
                 elif isinstance(blk, TextBlock):
+                    # Replay every received text block, including empty/whitespace-only blocks.
+                    assistant_params.append(TextBlockParam(text=blk.text, type="text"))
                     if blk.text and blk.text.strip():
                         text_chunks.append(blk.text)
-                        # Non-final interleaved text should also be replayed
-                        assistant_params.append(TextBlockParam(text=blk.text, type="text"))
 
             # Append assistant turn to history for strict session replay.
             self._history.append(
@@ -389,8 +389,10 @@ class AnthropicAgentNode(AgentNode):
             # Combine this iteration's text into one framework transcript part.
             # This may be intermediate or final assistant text.
             text = "\n".join(text_chunks).strip()
-            self.transcript.append(ModelTextPart(text=text))
-            self.ctx.post_transcript_update()
+            # Successful completion requires a final ModelTextPart, even if empty.
+            if text or not tool_uses:
+                self.transcript.append(ModelTextPart(text=text))
+                self.ctx.post_transcript_update()
 
             # If no tool uses -> finalize with the accumulated text.
             if not tool_uses:
