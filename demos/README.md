@@ -26,7 +26,7 @@ No limits in how many guesses it gets per stage, but it needs to get the correct
 
 The `puzzle` demo also serves the purpose of proving that the provider is capable of a single continuous reasoning chain that envelopes the multi cycles of tool use.
 
-`python3 -m netflux.demos.puzzle --provider={openai,anthropic,gemini}`
+`python -m netflux.demos.puzzle --provider={openai,anthropic,gemini}`
 
 ### Performance Optimizer (`perf_opt.py`)
 
@@ -34,7 +34,7 @@ Profiles, critically analyzes, and iteratively optimizes a Python code target.
 Uses a combination of cProfile and critical reasoning. Produces intermediate profiling and analysis
 reports, and a final report summarizing changes and measured performance gains.
 
-`python3 -m netflux.demos.perf_opt --provider={openai,anthropic,gemini}`
+`python -m netflux.demos.perf_opt --provider={openai,anthropic,gemini}`
 
 ### Apply Diff (`apply_diff.py`)
 
@@ -43,7 +43,7 @@ The script prints the workspace path, streams a live view of the agent’s work,
 
 Run:
 
-`python3 -m netflux.demos.apply_diff --provider={openai,anthropic,gemini} [--fail-first]`
+`python -m netflux.demos.apply_diff --provider={openai,anthropic,gemini} [--fail-first]`
 
 ### Built-in Stress Tests (`stress_builtins.py`)
 
@@ -59,7 +59,7 @@ The script creates a disposable workspace, changes into it before invoking the a
 
 Run:
 
-`python3 -m netflux.demos.stress_builtins {bash,image,tree} --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
+`python -m netflux.demos.stress_builtins {bash,image,tree} --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
 
 ## TUI (`tui.py`)
 
@@ -68,6 +68,6 @@ It lets you launch multiple tree roots from one terminal session and switch betw
 
 Run:
 
-`python3 -m netflux.demos.tui`
+`python -m netflux.demos.tui`
 
 Each tree launch chooses its provider in the TUI launch form. For `AgentFunction` roots, the provider field defaults to that `AgentFunction`'s `default_model`; changing it overrides only that top-level invoke.
