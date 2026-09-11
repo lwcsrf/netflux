@@ -189,6 +189,12 @@ class AnthropicAgentNode(AgentNode):
             self.client = None  # type: ignore[assignment]
 
     def run(self) -> None:
+        try:
+            self.run_agent_loop()
+        finally:
+            self._close_client()
+
+    def run_agent_loop(self) -> None:
         # Agent loop.
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
