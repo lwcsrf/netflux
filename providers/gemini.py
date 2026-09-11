@@ -148,7 +148,7 @@ class GeminiAgentNode(AgentNode):
 
     def run(self) -> None:
         config = types.GenerateContentConfig(
-            system_instruction=self.agent_fn.system_prompt,
+            system_instruction=self.system_prompt(),
             tools=self._tools,
             tool_config=types.ToolConfig(
                 function_calling_config=types.FunctionCallingConfig(

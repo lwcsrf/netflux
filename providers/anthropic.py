@@ -200,7 +200,7 @@ class AnthropicAgentNode(AgentNode):
                 try:
                     with self.client.messages.stream(
                         model=self.model,
-                        system=self.agent_fn.system_prompt,
+                        system=self.system_prompt(),
                         messages=msgs,
                         tools=self._tools,
                         tool_choice=ToolChoiceAutoParam(type="auto"),

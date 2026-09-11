@@ -560,7 +560,7 @@ This refined example shows:
     1. top-level task invocation; called by an app that is consuming the framework and a collection of `Function`s (the app or someone else may define these); access via `Runtime.get_ctx()`.
     2. python code for user-defined or framework-builtin `CodeFunction`s that invoke other `Function`s.
     3. when some framework component needs to handle agents doing tool calls, that component delegates invocation to the `RunContext`.
-    * e.g. they all use: `ctx.invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None) -> Node`
+    * e.g. they all use `ctx.invoke(...)`.
 * every `Function` invocation has a `RunContext` given to it, providing the interface, but also tracking the particular `Function` using it.
     * when a `Function` invokes another `Function` (including when framework handles `AgentFunction` invoking any `Function` via tool call), the `RunContext` knows its associated invoking `Node` (identity of the caller) and causes creation of the invoked `Node`.
         * this information is used to construct the directed edges relationships of the `Node` tree. A single top-level task invocation is the parent `Node` of a tree.
@@ -574,7 +574,10 @@ This refined example shows:
     * `object_bags: Dict[SessionScope, SessionBag]`: references to session bags accessible at different scopes.
     * `cancel_event: Optional[Event]`: cooperative cancellation token inherited from the caller unless explicitly overridden by the caller.
 * Methods:
-    * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None) -> Node`: invoke a `Function`, optionally overriding the cancellation scope, and return the created `Node`.
+    * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None, max_agent_levels: Optional[int] = None) -> Node`: invoke a `Function` and return the created `Node`.
+        * On a top-level invocation, `max_agent_levels` limits the number of `AgentNode`s along any lineage that will be realized in the tree. Descendant invocations inherit the tree's value and do not pass this argument.
+            * Only Agent depth is limited: `CodeNode`s do not increase the agent level, and Agent siblings do not share a quota. An Agent invocation beyond the limit raises `MaxAgentLevelExceededException` without creating a `Node`; `CodeFunction` calls remain legal at the boundary. In a multi-tool-call batch, each call is handled independently, so an over-depth Agent call does not prevent a legal Code call in the same batch from succeeding.
+            * An Agent exactly at the limit receives a runtime warning in its effective system prompt. Its declared tools remain unchanged.
         * Child invocations may be launched asynchronously and awaited later, but the Runtime will not allow the caller to enter a terminal state until its direct children are terminal. If the caller returns, raises, or posts any terminal outcome early, terminalization blocks while the node remains in Running state.
         * Therefore, once a node is terminal, its descendant subtree is terminal too.
         * Once the caller has actually entered a terminal state, further child invocations from it are rejected.
@@ -623,7 +626,8 @@ This refined example shows:
     * `exception: Optional[Exception]`: the exception, if there was an exception.
     * `state: NodeState`: (Waiting, Running, Success, Error, Canceled) enum
     * `children: List[Node]`: ordered list of child `Function` invocations made by this `Node`.
-    * **Note**: External consumers should access this information through `NodeView` instead of `Node` directly to avoid race conditions.
+    * `agent_lineage_level: int`: read-only, computed count of `AgentNode`s in the inclusive lineage from the tree root to this node; `CodeNode`s do not increase or reset it.
+    * External consumers should generally access execution state through `NodeView`
     * For agents, `NodeView.usage` is a deep-copied snapshot and `NodeView.transcript` is an immutable tuple (empty tuple for `CodeNode`).
 
 ## `TranscriptPart`
@@ -711,6 +715,7 @@ This refined example shows:
         * No alternatives worked? Very briefly describe what was tried.
         * Missing information or context, don't know how to solve, etc? Describe this very briefly for the caller in case a follow-up attempt could address this.
     * Implementation of the `RaiseException` callable is a one-liner: raise the `AgentException`. (Assume `CodeFunction` never invokes it).
+* `MaxAgentLevelExceededException`: raised synchronously when an `AgentFunction` would exceed its tree's configured maximum. The rejected call creates no `Node`; model-originated calls are returned to the model as ordinary tool errors, similar to invoking a bad function name or bad args, so it can recover.
 * Differentiation of agent vs. service/infra faults:
     * `AgentException`: used when an agent decides to invoke `raise_exception(msg)` by its own volition, for any reason.
         * includes: faulting agent's name and instance id (`Node.id`).

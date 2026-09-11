@@ -14,7 +14,12 @@ from unittest.mock import patch
 import multiprocessing as mp
 from multiprocessing.synchronize import Event
 
-from ..runtime import Runtime, NodeObservable
+from ..runtime import (
+    DEFAULT_MAX_AGENT_LEVELS,
+    UPPER_MAX_AGENT_LEVELS,
+    Runtime,
+    NodeObservable,
+)
 from ..core import (
     AgentFunction,
     AgentNode,
@@ -30,6 +35,7 @@ from ..core import (
     TokenUsage,
     ModelTextPart,
     CancellationException,
+    MaxAgentLevelExceededException,
 )
 from ..func_lib.bash_func import Bash, BashSession
 from ..func_lib.text_editor_func import TextEditor
@@ -1680,6 +1686,223 @@ class TestNodeViewStructure(unittest.TestCase):
                 ),
             },
         )
+
+
+class TestRuntimeMaxAgentLevels(unittest.TestCase):
+    def test_configuration_and_zero_level_admission(self) -> None:
+        blocked_fn = _make_agent_function("blocked")
+        code_levels: list[int] = []
+        descendant_rejections: list[MaxAgentLevelExceededException] = []
+
+        def child_callable(ctx: RunContext) -> str:
+            assert ctx.node is not None
+            code_levels.append(ctx.node.agent_lineage_level)
+            try:
+                ctx.invoke(blocked_fn, {})
+            except MaxAgentLevelExceededException as ex:
+                descendant_rejections.append(ex)
+            return "code-result"
+
+        child_fn = _make_code_function(
+            "max_level_child",
+            callable=child_callable,
+            uses=[blocked_fn],
+        )
+
+        def root_callable(ctx: RunContext) -> Any:
+            assert ctx.node is not None
+            code_levels.append(ctx.node.agent_lineage_level)
+            with self.assertRaises(AssertionError):
+                ctx.invoke(child_fn, {}, max_agent_levels=1)
+            return ctx.invoke(child_fn, {}).result()
+
+        root_fn = _make_code_function(
+            "max_level_root",
+            callable=root_callable,
+            uses=[child_fn],
+        )
+        plain_fn = _make_code_function(
+            "max_level_plain",
+            callable=_make_code_callable("plain"),
+        )
+        client_creations: list[object] = []
+
+        def client_factory() -> object:
+            client = object()
+            client_creations.append(client)
+            return client
+
+        runtime = Runtime(
+            [plain_fn, root_fn],
+            client_factories={Provider.Anthropic: client_factory},
+        )
+
+        with patch("netflux.runtime.get_AgentNode_impl") as resolver:
+            with self.assertRaises(MaxAgentLevelExceededException) as raised:
+                runtime.invoke(None, blocked_fn, {}, max_agent_levels=0)
+            self.assertEqual(runtime.list_toplevel_views(), [])
+
+            defaulted = runtime.invoke(None, plain_fn, {})
+            upper = runtime.invoke(
+                None,
+                plain_fn,
+                {},
+                max_agent_levels=UPPER_MAX_AGENT_LEVELS,
+            )
+            zero = runtime.invoke(None, root_fn, {}, max_agent_levels=0)
+            self.assertEqual(
+                [defaulted.result(), upper.result(), zero.result()],
+                ["plain", "plain", "code-result"],
+            )
+
+            root_ids = [view.id for view in runtime.list_toplevel_views()]
+            for invalid in (True, -1, UPPER_MAX_AGENT_LEVELS + 1, 1.0, "2"):
+                with self.subTest(invalid=invalid), self.assertRaises(AssertionError):
+                    runtime.invoke(None, plain_fn, {}, max_agent_levels=invalid)  # type: ignore[arg-type]
+            self.assertEqual(
+                [view.id for view in runtime.list_toplevel_views()],
+                root_ids,
+            )
+
+        ex = raised.exception
+        self.assertEqual(type(ex).__bases__, (Exception,))
+        self.assertEqual(
+            (ex.fn_name, ex.max_agent_levels, ex.attempted_level),
+            ("blocked", 0, 1),
+        )
+        self.assertEqual(
+            str(ex),
+            "Cannot invoke blocked. Caller is already on the deepest allowed agent level "
+            "in the tree (level 0). Do not attempt to invoke more agentic functions, or "
+            "code functions that invoke agent functions, in your session.",
+        )
+        self.assertEqual(
+            [runtime.max_agent_levels(node) for node in (defaulted, upper, zero)],
+            [DEFAULT_MAX_AGENT_LEVELS, UPPER_MAX_AGENT_LEVELS, 0],
+        )
+        self.assertEqual(code_levels, [0, 0])
+        self.assertEqual(
+            [ex.attempted_level for ex in descendant_rejections],
+            [1],
+        )
+        resolver.assert_not_called()
+        self.assertEqual(client_creations, [])
+
+    def test_tree_local_limit_warns_and_continues_non_agent_calls(self) -> None:
+        third_fn = _make_agent_function("max_level_third")
+        rendezvous = threading.Barrier(2)
+        root_rejections: list[MaxAgentLevelExceededException] = []
+        third_rejections: list[MaxAgentLevelExceededException] = []
+        second_nodes: list[AgentNode] = []
+        code_nodes: list[Node] = []
+
+        def legal_code_callable(ctx: RunContext) -> str:
+            assert ctx.node is not None
+            code_nodes.append(ctx.node)
+            try:
+                ctx.invoke(third_fn, {})
+            except MaxAgentLevelExceededException as ex:
+                third_rejections.append(ex)
+            return "code-result"
+
+        legal_code_fn = _make_code_function(
+            "max_level_legal_code",
+            callable=legal_code_callable,
+            uses=[third_fn],
+        )
+        second_fn = _make_agent_function(
+            "max_level_second",
+            uses=[third_fn, legal_code_fn],
+        )
+        shared_fn = _make_agent_function(
+            "max_level_shared",
+            uses=[second_fn],
+        )
+        prompt = shared_fn.system_prompt
+
+        def second_behavior(node: AgentNode) -> str:
+            second_nodes.append(node)
+            result = ""
+            for tool_name in (third_fn.name, legal_code_fn.name):
+                try:
+                    child = node.invoke_tool_function(
+                        tool_name,
+                        {},
+                        tool_use_id=f"{tool_name}-use",
+                    )
+                except MaxAgentLevelExceededException as ex:
+                    third_rejections.append(ex)
+                else:
+                    result = child.result()
+            return result
+
+        def shared_behavior(node: AgentNode) -> Any:
+            rendezvous.wait(timeout=15)
+            if node.ctx.runtime.max_agent_levels(node.root_ancestor) == 1:
+                try:
+                    node.ctx.invoke(second_fn, {})
+                except MaxAgentLevelExceededException as ex:
+                    root_rejections.append(ex)
+                return "blocked"
+            return [
+                node.ctx.invoke(second_fn, {}).result()
+                for _ in range(2)
+            ]
+
+        class FakeAgentNode(AgentNode):
+            @property
+            def token_usage(self) -> TokenUsage:
+                return TokenUsage()
+
+            @property
+            def provider(self) -> Provider:
+                return Provider.Anthropic
+
+            def run(self) -> None:
+                if self.agent_fn is shared_fn:
+                    result = shared_behavior(self)
+                elif self.agent_fn is second_fn:
+                    result = second_behavior(self)
+                else:
+                    result = self.agent_fn.name
+                self.ctx.post_success(result)
+
+        runtime = Runtime(
+            [shared_fn],
+            client_factories={Provider.Anthropic: lambda: object()},
+        )
+
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
+            boundary = runtime.invoke(None, shared_fn, {}, max_agent_levels=1)
+            below = runtime.invoke(None, shared_fn, {}, max_agent_levels=2)
+            self.assertEqual(boundary.result(), "blocked")
+            self.assertEqual(below.result(), ["code-result", "code-result"])
+
+        warning = (
+            "WARNING: You are at Agent level 1 of 1 in this call tree, the deepest "
+            "permitted level. Any direct or indirect attempt to create another sub-agent "
+            "on this lineage will fail. Non-agentic functions remain available, but any "
+            "agent they invoke will also be rejected."
+        )
+        self.assertEqual(boundary.system_prompt(), f"{prompt}\n\n{warning}")
+        self.assertEqual(below.system_prompt(), prompt)
+        self.assertEqual(shared_fn.system_prompt, prompt)
+        self.assertEqual(tuple(boundary.func_map), (second_fn.name,))
+        self.assertEqual(
+            [(ex.fn_name, ex.max_agent_levels, ex.attempted_level) for ex in root_rejections],
+            [(second_fn.name, 1, 2)],
+        )
+        self.assertEqual(
+            [(ex.fn_name, ex.max_agent_levels, ex.attempted_level) for ex in third_rejections],
+            [(third_fn.name, 2, 3)] * 4,
+        )
+        self.assertEqual((len(second_nodes), len(code_nodes)), (2, 2))
+        for second, code in zip(second_nodes, code_nodes):
+            self.assertEqual(second.agent_lineage_level, 2)
+            self.assertEqual(second.children, [code])
+            self.assertEqual(code.agent_lineage_level, 2)
+            self.assertIs(code.root_ancestor, below)
+            self.assertEqual(code.tool_use_id, f"{legal_code_fn.name}-use")
 
 
 if __name__ == "__main__":  # pragma: no cover
