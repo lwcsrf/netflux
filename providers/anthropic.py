@@ -16,6 +16,7 @@ from ..func_lib import ImageResult, raise_exception, status_update
 from . import ModelNames, Provider
 
 import anthropic
+from anthropic.lib.streaming import ParsedMessageStreamEvent
 from anthropic.types import (
     Message, MessageParam,
     RefusalStopDetails,
@@ -219,7 +220,7 @@ class AnthropicAgentNode(AgentNode):
                         output_config=OUTPUT_CFG,
 
                         # Explicitly enforce replay prefix checks, to ensure reasoning continuity.
-                        # This beta field is not in the stable SDK thinking type yet.
+                        # todo: switch to static types later. This beta field is not in the stable SDK thinking type yet.
                         extra_body={
                             "thinking": {
                                 **THINKING_CFG,
@@ -228,6 +229,9 @@ class AnthropicAgentNode(AgentNode):
                         },
                         extra_headers={"anthropic-beta": "thinking-binding-controls-2026-08-01"},
                     ) as stream:
+                        # Additional detection of unexpected reasoning discontinuity.
+                        for event in stream:
+                            self.assert_no_input_transformations(event)
                         resp = stream.get_final_message()
 
                         # Observed rare corner case: SDK may return a partial streamed Message snapshot with
@@ -538,6 +542,22 @@ class AnthropicAgentNode(AgentNode):
         self._close_client()
         raise RuntimeError(f"Anthropic agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
                            "without producing a final response.")
+
+    def assert_no_input_transformations(self, event: ParsedMessageStreamEvent) -> None:
+        """
+        Require empty input transformation reports to detect reasoning discontinuity.
+        The initial report is required; final delta reports are checked when present.
+        """
+        # TODO: switch to strong SDK types once this moves out of beta.
+        if event.type == "message_start":
+            metadata = event.message.model_extra or {}
+        elif event.type == "message_delta" and "input_transformations" in (event.model_extra or {}):
+            metadata = event.model_extra or {}
+        else:
+            return
+        if metadata.get("input_transformations") != []:
+            raise AssertionError("Anthropic input_transformations must be empty; "
+                                 f"received: {metadata.get('input_transformations')!r}.")
 
     def _accumulate_usage(self, usage: Usage) -> None:
         cache_read = usage.cache_read_input_tokens or 0
