@@ -289,6 +289,12 @@ class OaiAgentNode(AgentNode):
                 # their partial output or dispatch their tools when retrying.
                 if response.usage is not None:
                     self.accumulate_usage(response.usage)
+                if response.model != self.model:
+                    raise self.provider_error(
+                        f"OpenAI response {response.id!r} changed the model: "
+                        f"expected={self.model!r}, actual={response.model!r}; "
+                        "reasoning continuity cannot be guaranteed."
+                    )
                 delay = (
                     self.retry_delay(response.error, attempt)
                     if response.status == "failed" and response.error is not None else None
