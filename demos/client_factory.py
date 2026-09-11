@@ -1,12 +1,15 @@
 """Client factories used by the demos, which rely on simple api key."""
 
+from __future__ import annotations
+
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import TYPE_CHECKING, Any, Callable, Dict
 import httpx2
 
-import anthropic
-import google.genai as genai
-from google.genai import types
+if TYPE_CHECKING:
+    import anthropic
+    import google.genai as genai
+    import openai
 
 from ..providers import Provider
 
@@ -35,6 +38,8 @@ def _read_key(filename: str) -> str:
 
 
 def anthropic_client_factory() -> anthropic.Anthropic:
+    import anthropic
+
     key = _read_key("anthropic.key")
     # Use Anthropic's DefaultHttpxClient to retain their socket keepalive tuning, and
     # right-size connection limits/timeouts for single-agent long reasoning streams.
@@ -62,6 +67,9 @@ def anthropic_client_factory() -> anthropic.Anthropic:
 
 
 def gemini_client_factory() -> genai.Client:
+    import google.genai as genai
+    from google.genai import types
+
     key = _read_key("gemini.key")
 
     # We have our own retry layer, but Gemini SDK may have different
@@ -96,7 +104,31 @@ def gemini_client_factory() -> genai.Client:
 
     return genai.Client(api_key=key, http_options=http_options)
 
+
+def openai_client_factory() -> openai.OpenAI:
+    import openai
+
+    key = _read_key("openai.key")
+    http_client = openai.DefaultHttpx2Client(
+        http2=True,
+        limits=httpx2.Limits(
+            max_connections=4,
+            max_keepalive_connections=2,
+            keepalive_expiry=20.0,
+        ),
+        timeout=httpx2.Timeout(
+            connect=10.0,
+            read=900.0,  # allow long synchronous reasoning responses
+            write=120.0,
+            pool=10.0,
+        ),
+    )
+    # The provider owns the retry budget and cancellation-aware backoff.
+    return openai.OpenAI(api_key=key, http_client=http_client, max_retries=0)
+
+
 CLIENT_FACTORIES: Dict[Provider, Callable[[], Any]] = {
     Provider.Anthropic: anthropic_client_factory,
     Provider.Gemini: gemini_client_factory,
+    Provider.OpenAI: openai_client_factory,
 }
