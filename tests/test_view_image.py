@@ -558,7 +558,8 @@ def test_reencoding_failure_is_a_failed_node(tmp_path):
     path = tmp_path / "convert.bmp"
     Image.new("RGB", (12, 8), "red").save(path)
     source_data = path.read_bytes()
-    with patch("netflux.func_lib.view_image._encode_image", side_effect=OSError("encoder failed")):
+    # Python 3.10 resolves dotted patches through the exported CodeFunction.
+    with patch.object(image_impl, "_encode_image", side_effect=OSError("encoder failed")):
         runtime = Runtime([view_image], client_factories={})
         node = runtime.invoke(None, view_image, {"path": str(path)})
         assert node.done.wait(5)
