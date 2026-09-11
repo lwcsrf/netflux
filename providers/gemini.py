@@ -9,10 +9,11 @@ import httpx2
 from overrides import override
 
 from ..core import (
-    Node, RunContext, Function, AgentNode, AgentException,
-    UserTextPart, ModelTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
+    Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
+    UserTextPart, ModelTextPart, ModelStatusPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
+from ..func_lib import raise_exception, status_update
 from . import ModelNames, Provider
 
 import google.genai as genai
@@ -132,9 +133,30 @@ class GeminiAgentNode(AgentNode):
     def provider(self) -> Provider:
         return Provider.Gemini
 
+    def append_model_text(self, text: str) -> None:
+        """Coalesce adjacent nonblank text."""
+        if not text.strip():
+            return
+        if self.transcript and isinstance(self.transcript[-1], ModelTextPart):
+            text = self.transcript[-1].text + "\n" + text
+            # Published snapshots share frozen parts, so replace rather than mutate.
+            self.transcript[-1] = ModelTextPart(text=text)
+        else:
+            self.transcript.append(ModelTextPart(text=text))
+        self.ctx.post_transcript_update()
+
     def _new_tool_use_id(self, tool_name: str) -> str:
         self._tool_call_counter += 1
         return f"gemini-{self.id}-{self._tool_call_counter}-{tool_name}"
+
+    def is_valid_status_update(self, fc: types.FunctionCall) -> bool:
+        if not fc.name or self.func_map.get(fc.name) is not status_update:
+            return False
+        try:
+            status_update.validate_coerce_args(fc.args or {})
+        except ValueError:
+            return False
+        return True
 
     def _close_client(self) -> None:
         if self.client is None:
@@ -309,6 +331,7 @@ class GeminiAgentNode(AgentNode):
 
             part: types.Part
             calls: List[types.FunctionCall] = []
+            text_chunks: List[str] = []
             for part in candidate.content.parts:  # pyright: ignore[reportOptionalIterable]
                 thought_sig: Optional[bytes] = part.thought_signature
                 if thought_sig:
@@ -330,10 +353,12 @@ class GeminiAgentNode(AgentNode):
 
                 text: Optional[str] = part.text
                 if text:
-                    self.transcript.append(ModelTextPart(text=text))
-                    self.ctx.post_transcript_update()
+                    text_chunks.append(text)
                     # Ensure our understanding of the protocol is correct that function calls come last.
                     assert not calls, "Gemini text parts should precede function_call parts."
+
+            for text in text_chunks:
+                self.append_model_text(text)
 
             # No function calls → finalize with assistant text.
             if not calls:
@@ -371,9 +396,14 @@ class GeminiAgentNode(AgentNode):
                 tool_use_ids.append(tool_use_id)
 
                 args_ro = MappingProxyType(copy.deepcopy(tool_args))
-                self.transcript.append(
-                    ToolUsePart(tool_use_id=tool_use_id, tool_name=name, args=args_ro)
-                )
+                if self.is_valid_status_update(fc):
+                    self.transcript.append(
+                        ModelStatusPart(text=args_ro["msg"], tool_use_id=tool_use_id)
+                    )
+                else:
+                    self.transcript.append(
+                        ToolUsePart(tool_use_id=tool_use_id, tool_name=name, args=args_ro)
+                    )
                 self.ctx.post_transcript_update()
 
                 try:
@@ -407,26 +437,31 @@ class GeminiAgentNode(AgentNode):
                         out_text = "" if result is None else str(result)
                         is_error = False
                         response["output"] = out_text
-                    except AgentException as ex:
-                        # Agent decided to raise an exception. Keep processing the rest of the batch
-                        # per spec before propagating the exception outside the loop.
-                        pending_agent_ex = ex
-                        continue
                     except Exception as ex:
+                        if (
+                            isinstance(ex, AgentException)
+                            and isinstance(child.fn, CodeFunction)
+                            and (child.fn is raise_exception or child.fn.name == "raise_exception")
+                        ):
+                            # This agent decided to raise an exception. Keep processing the rest of the batch
+                            # per spec before propagating the exception outside the loop.
+                            pending_agent_ex = ex
+                            continue
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
                         response["error"] = out_text
 
                 # Transcript result in common framework types.
-                self.transcript.append(
-                    ToolResultPart(
-                        tool_use_id=tool_use_id,
-                        tool_name=fc.name,
-                        outputs=out_text,
-                        is_error=is_error,
+                if not self.is_valid_status_update(fc):
+                    self.transcript.append(
+                        ToolResultPart(
+                            tool_use_id=tool_use_id,
+                            tool_name=fc.name,
+                            outputs=out_text,
+                            is_error=is_error,
+                        )
                     )
-                )
-                self.ctx.post_transcript_update()
+                    self.ctx.post_transcript_update()
 
                 # Transcript result in gemini sdk types.
                 result_parts.append(types.Part(
@@ -525,23 +560,18 @@ class GeminiAgentNode(AgentNode):
                     assert p.text is None or p.text.strip() == "", "Gemini thought text is supposed to be empty."
 
     def _final_text(self) -> str:
-        """
-        Extract final text from transcript: concatenate all ModelTextPart text
-        that comes after the last function call found (ToolResultPart).
-        """
-        last_func_idx = -1
-        for i, part in enumerate(self.transcript):
-            if isinstance(part, ToolResultPart):
-                last_func_idx = i
-
-        final_text_chunks: List[str] = []
-        for i in range(last_func_idx + 1, len(self.transcript)):
-            part = self.transcript[i]
+        """Return the final answer exactly as recorded after the last tool."""
+        for part in reversed(self.transcript):
             if isinstance(part, ModelTextPart):
-                if part.text.strip():
-                    final_text_chunks.append(part.text)
-       
-        return "\n".join(final_text_chunks)
+                return part.text
+            if isinstance(part, (ToolUsePart, ToolResultPart, ModelStatusPart)):
+                break
+
+        # Gemini can successfully stop without text. Record that empty result
+        # explicitly so even these successes have a matching final text part.
+        self.transcript.append(ModelTextPart(text=""))
+        self.ctx.post_transcript_update()
+        return ""
 
     @staticmethod
     def _gemini_type_for_arg(py_t: type) -> types.Type:

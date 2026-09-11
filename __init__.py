@@ -21,6 +21,7 @@ from .core import (
     TranscriptPart,
     UserTextPart,
     ModelTextPart,
+    ModelStatusPart,
 )
 from .providers import Provider
 from .runtime import Runtime
@@ -50,4 +51,5 @@ __all__ = [
     "TranscriptPart",
     "UserTextPart",
     "ModelTextPart",
+    "ModelStatusPart",
 ]

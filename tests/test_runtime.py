@@ -236,6 +236,7 @@ class TestRuntimeInvocation(unittest.TestCase):
 
             def run(self) -> None:
                 type(self).last_client = self.client_factory()
+                self.transcript.append(ModelTextPart(text="agent-output"))
                 self.ctx.post_success("agent-output")
 
             @property
@@ -628,6 +629,7 @@ class TestRuntimeInvocation(unittest.TestCase):
                     captured["linux_proc_identity_before_cleanup"] = linux_proc_identity(proc.pid)
                 captured["parent_bag_populated_before_cleanup"] = bool(self.session_bag._values)
                 captured["child_bag_empty"] = child.session_bag._values == {}
+                self.transcript.append(ModelTextPart(text=result))
                 self.ctx.post_success(result)
 
         with patch("netflux.runtime.get_AgentNode_impl", return_value=FakeAgentNode):
@@ -1040,6 +1042,7 @@ class TestRuntimeInvocation(unittest.TestCase):
 
         class FakeAgentNode(AgentNode):
             def run(self) -> None:
+                self.transcript.append(ModelTextPart(text="early"))
                 self.ctx.post_success("early")
                 raise RuntimeError("late boom")
 
@@ -1071,6 +1074,7 @@ class TestRuntimeInvocation(unittest.TestCase):
 
         class FakeAgentNode(AgentNode):
             def run(self) -> None:
+                self.transcript.append(ModelTextPart(text="early"))
                 self.ctx.post_success("early")
                 self.transcript.append(ModelTextPart(text="late"))
                 self.ctx.post_transcript_update()
@@ -1094,7 +1098,7 @@ class TestRuntimeInvocation(unittest.TestCase):
 
         view = runtime.get_view(node.id)
         self.assertEqual(view.state, NodeState.Success)
-        self.assertEqual(view.transcript, ())
+        self.assertEqual(view.transcript, (ModelTextPart(text="early"),))
         self.assertTrue(
             any(
                 "post_transcript_update" in msg and "has no effect and is ignored" in msg
@@ -1205,8 +1209,8 @@ class TestRuntimeInvocation(unittest.TestCase):
                         with self.assertRaisesRegex(RuntimeError, "early boom"):
                             parent_node.result()
 
-                assert parent_node.thread is not None
-                parent_node.thread.join(timeout=1)
+                    assert parent_node.thread is not None
+                    parent_node.thread.join(timeout=1)
                 self.assertEqual(parent_node.state, expected_state)
                 self.assertEqual(parent_node.children, [])
                 self.assertTrue(any("has no effect and is ignored" in msg for msg in captured.output))
@@ -1233,6 +1237,7 @@ class TestRuntimeInvocation(unittest.TestCase):
                 self.client = client_factory()
 
             def run(self) -> None:
+                self.transcript.append(ModelTextPart(text="agent-output"))
                 self.ctx.post_success("agent-output")
 
             @property
@@ -1622,6 +1627,7 @@ class TestNodeViewStructure(unittest.TestCase):
                 return Provider.Anthropic
 
             def run(self) -> None:
+                self.transcript.append(ModelTextPart(text="anthropic"))
                 self.ctx.post_success("anthropic")
 
         class FakeGeminiAgentNode(AgentNode):
@@ -1638,6 +1644,7 @@ class TestNodeViewStructure(unittest.TestCase):
                 return Provider.Gemini
 
             def run(self) -> None:
+                self.transcript.append(ModelTextPart(text="gemini"))
                 self.ctx.post_success("gemini")
 
         def fake_impl(provider: Provider) -> type[AgentNode]:
@@ -1836,7 +1843,7 @@ class TestRuntimeMaxAgentLevels(unittest.TestCase):
                     result = child.result()
             return result
 
-        def shared_behavior(node: AgentNode) -> Any:
+        def shared_behavior(node: AgentNode) -> str:
             rendezvous.wait(timeout=15)
             if node.ctx.runtime.max_agent_levels(node.root_ancestor) == 1:
                 try:
@@ -1844,10 +1851,10 @@ class TestRuntimeMaxAgentLevels(unittest.TestCase):
                 except MaxAgentLevelExceededException as ex:
                     root_rejections.append(ex)
                 return "blocked"
-            return [
+            return ", ".join(
                 node.ctx.invoke(second_fn, {}).result()
                 for _ in range(2)
-            ]
+            )
 
         class FakeAgentNode(AgentNode):
             @property
@@ -1865,6 +1872,7 @@ class TestRuntimeMaxAgentLevels(unittest.TestCase):
                     result = second_behavior(self)
                 else:
                     result = self.agent_fn.name
+                self.transcript.append(ModelTextPart(text=result))
                 self.ctx.post_success(result)
 
         runtime = Runtime(
@@ -1876,7 +1884,7 @@ class TestRuntimeMaxAgentLevels(unittest.TestCase):
             boundary = runtime.invoke(None, shared_fn, {}, max_agent_levels=1)
             below = runtime.invoke(None, shared_fn, {}, max_agent_levels=2)
             self.assertEqual(boundary.result(), "blocked")
-            self.assertEqual(below.result(), ["code-result", "code-result"])
+            self.assertEqual(below.result(), "code-result, code-result")
 
         warning = (
             "WARNING: You are at Agent level 1 of 1 in this call tree, the deepest "

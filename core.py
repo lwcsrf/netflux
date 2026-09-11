@@ -391,6 +391,12 @@ class ModelTextPart(TranscriptPart):
     text: str
 
 @dataclass(frozen=True)
+class ModelStatusPart(TranscriptPart):
+    """Primitive for specially representing status updates provided by the model via function call."""
+    text: str
+    tool_use_id: Optional[str] = None
+
+@dataclass(frozen=True)
 class ToolUsePart(TranscriptPart):
     tool_use_id: str
     tool_name: str
@@ -741,7 +747,7 @@ class AgentNode(Node):
     """
     Base class for LLM-backed agent invocations. Handles:
       - Templating the initial user prompt from the agent's template + inputs
-      - Holding a normalized transcript (UserTextPart, ThinkingBlockPart, ToolUsePart, ToolResultPart, ModelTextPart)
+      - Holding a normalized transcript (user text, thinking, tools, status, and model text)
       - Serializing tool invocations even if the model requests them in parallel
 
     Subclasses must implement `run()` to drive a provider-specific tool loop, and therein

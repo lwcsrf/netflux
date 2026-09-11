@@ -38,6 +38,7 @@ from rich.markdown import Markdown
 from ._contracts import RightPaneInteractionContext, SelectedTreeStatus
 from ..core import (
     Function,
+    ModelStatusPart,
     ModelTextPart,
     Node,
     NodeState,
@@ -48,6 +49,7 @@ from ..core import (
     ToolUsePart,
     UserTextPart,
 )
+from ..func_lib import status_update
 from ..providers import ModelNames, Provider
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -85,6 +87,7 @@ THINKING = "➰"
 AGENT_GLYPH = "✨"
 CODE_GLYPH = "⚙️ "
 RESULT_GLYPH = "📤"
+TEXT_GLYPH = "🗣️"
 ARGS_GLYPH = "📋"
 USER_GLYPH = "👤"
 FUNCTION_GLYPH = "🧰"
@@ -716,9 +719,14 @@ class ConsoleRender:
             self._selected_anchor = None
             self._selected_anchor_occurrence = 0
 
+    @staticmethod
+    def _visible_children(nv: NodeView) -> tuple[NodeView, ...]:
+        """Exclude status-update invocations from the displayed tree."""
+        return tuple(child for child in nv.children if child.fn is not status_update)
+
     def _iter_node_keys(self, nv: NodeView) -> list[str]:
         keys = [f"n:{nv.id}"]
-        for child in nv.children:
+        for child in self._visible_children(nv):
             keys.extend(self._iter_node_keys(child))
         return keys
 
@@ -1144,7 +1152,8 @@ class ConsoleRender:
         is_agent = nv.fn.is_agent()
 
         # Determine expandability
-        has_children = bool(nv.children)
+        visible_children = self._visible_children(nv)
+        has_children = bool(visible_children)
         has_transcript_rows = any(
             isinstance(
                 p,
@@ -1152,6 +1161,7 @@ class ConsoleRender:
                     ThinkingBlockPart,
                     UserTextPart,
                     ModelTextPart,
+                    ModelStatusPart,
                     ToolUsePart,
                     ToolResultPart,
                 ),
@@ -1263,8 +1273,8 @@ class ConsoleRender:
                 lines,
                 infos,
             )
-            n_children = len(nv.children)
-            for idx, child in enumerate(nv.children):
+            n_children = len(visible_children)
+            for idx, child in enumerate(visible_children):
                 self._build_node(
                     child,
                     child_prefix,
@@ -1329,8 +1339,9 @@ class ConsoleRender:
             if args:
                 parts.append(args)
         if has_children:
-            n_agent_fns = sum(1 for c in nv.children if c.fn.is_agent())
-            n_code_fns = len(nv.children) - n_agent_fns
+            visible_children = self._visible_children(nv)
+            n_agent_fns = sum(1 for c in visible_children if c.fn.is_agent())
+            n_code_fns = len(visible_children) - n_agent_fns
             if n_code_fns:
                 parts.append(f"{n_code_fns} CodeFn")
             if n_agent_fns:
@@ -1530,13 +1541,20 @@ class ConsoleRender:
         infos: list[LineInfo],
         fg: str | None = None,
         dim: bool = False,
+        title_bold: bool = False,
+        content_fg: str | None = None,
+        content_dim: bool = True,
+        show_char_count: bool = True,
         rendered_lines: list[_RenderedBlockLine] | None = None,
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
-        n_chars = len(text)
-        header_plain = f"{indicator} {glyph} {title} ({n_chars:,} chars)"
-        label = f"{detail_prefix}{_color(header_plain, fg=fg, dim=dim)}"
+        char_count = f" ({len(text):,} chars)" if show_char_count else ""
+        header_plain = f"{indicator} {glyph} {title}{char_count}"
+        label = (
+            f"{detail_prefix}{_color(f'{indicator} {glyph} ', fg=fg, dim=dim)}"
+            f"{_color(f'{title}{char_count}', fg=fg, dim=dim, bold=title_bold)}"
+        )
         if collapsed:
             preview = (
                 self._preview_for_rendered_lines(
@@ -1548,7 +1566,7 @@ class ConsoleRender:
                 else self._preview_for_header(text, detail_prefix, header_plain)
             )
             if preview:
-                label += f" {_color(preview, dim=True)}"
+                label += f" {_color(preview, fg=content_fg, dim=content_dim)}"
         lines.append(label)
         infos.append(
             LineInfo(
@@ -1568,7 +1586,8 @@ class ConsoleRender:
                     lines,
                     infos,
                     max_lines=None,
-                    dim=True,
+                    fg=content_fg,
+                    dim=content_dim,
                     anchors=(key,),
                 )
             else:
@@ -1759,7 +1778,11 @@ class ConsoleRender:
             if isinstance(part, UserTextPart):
                 render_entries.append(("user", tx_idx, part))
             elif isinstance(part, ModelTextPart):
+                # Keep every text part, including text before later reasoning,
+                # tool calls, or additional model text; each has its own row.
                 render_entries.append(("model", tx_idx, part))
+            elif isinstance(part, ModelStatusPart):
+                render_entries.append(("status", tx_idx, part))
             elif isinstance(part, ThinkingBlockPart):
                 render_entries.append(("thinking", tx_idx, part))
             elif isinstance(part, ToolUsePart):
@@ -1773,13 +1796,18 @@ class ConsoleRender:
                 seen_invocation_ids.add(part.tool_use_id)
                 render_entries.append(("call_result_only", tx_idx, part))
 
+        visible_children = self._visible_children(nv)
         rendered_child_ids: set[int] = set()
-        for child in nv.children:
+        for child in visible_children:
             if child.tool_use_id and child.tool_use_id in seen_invocation_ids:
                 continue
             render_entries.append(("child_only", len(nv.transcript), child))
 
-        has_model_text = any(isinstance(p, ModelTextPart) for p in nv.transcript)
+        last_model_text_idx = next(
+            (tx_idx for kind, tx_idx, _ in reversed(render_entries) if kind == "model"),
+            None,
+        )
+        has_model_text = last_model_text_idx is not None
         has_error_outcome = _has_error(nv) or (
             nv.state is NodeState.Canceled and nv.exception is not None
         )
@@ -1804,20 +1832,31 @@ class ConsoleRender:
                 )
                 continue
 
-            if kind == "model":
+            if kind in ("model", "status"):
                 part = payload
-                assert isinstance(part, ModelTextPart)
-                model_key = f"tp:{nv.id}:{tx_idx}:model"
+                assert isinstance(part, (ModelTextPart, ModelStatusPart))
+                model_key = f"tp:{nv.id}:{tx_idx}:{kind}"
+                # Match final-result selection: only the last text of a successful
+                # node is labeled as its result; status updates remain statuses.
+                is_final_text = (
+                    kind == "model"
+                    and nv.state is NodeState.Success
+                    and tx_idx == last_model_text_idx
+                )
                 self._emit_text_part(
                     key=model_key,
-                    title="result",
-                    glyph=RESULT_GLYPH,
+                    title="status" if kind == "status" else ("result" if is_final_text else "text"),
+                    glyph=RESULT_GLYPH if is_final_text else TEXT_GLYPH,
                     text=part.text,
                     detail_prefix=detail_prefix,
                     content_prefix=content_prefix,
                     lines=lines,
                     infos=infos,
-                    fg="green",
+                    fg="green" if is_final_text else "magenta",
+                    title_bold=not is_final_text,
+                    content_fg=None if is_final_text else "magenta",
+                    content_dim=is_final_text,
+                    show_char_count=is_final_text,
                     rendered_lines=self._rendered_root_result_lines_locked(
                         model_key,
                         part.text,
@@ -1912,7 +1951,7 @@ class ConsoleRender:
                 infos=infos,
             )
 
-        orphan_children = [child for child in nv.children if child.id not in rendered_child_ids]
+        orphan_children = [child for child in visible_children if child.id not in rendered_child_ids]
         for orphan_idx, child in enumerate(orphan_children):
             self._build_node(
                 child,

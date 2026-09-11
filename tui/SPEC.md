@@ -151,6 +151,9 @@ Tool calls behave as follows:
 - if a `ToolUsePart` maps to a real child node, that child subtree is rendered inline at the matching transcript position,
 - if no child node exists, the tool call remains visible as a synthetic expandable function row.
 
+`ModelStatusPart` entries render in transcript order like intermediate assistant text,
+with the same glyph, magenta color, and collapse behavior, but a bold `status` label.
+
 Successful terminal root results behave as follows:
 - the renderer identifies one top-level result target for the selected root tree,
 - for agent roots, this is the last `ModelTextPart` when present, otherwise the terminal `outputs` block,
