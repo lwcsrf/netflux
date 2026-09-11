@@ -166,6 +166,12 @@ class GeminiAgentNode(AgentNode):
             self.client = None  # type: ignore[assignment]
 
     def run(self) -> None:
+        try:
+            self.run_agent_loop()
+        finally:
+            self._close_client()
+
+    def run_agent_loop(self) -> None:
         config = types.GenerateContentConfig(
             system_instruction=self.system_prompt(),
             tools=self._tools,
@@ -212,6 +218,13 @@ class GeminiAgentNode(AgentNode):
                         # Will be converted by wrapper to ModelProviderException with more context.
                         raise RuntimeError("Gemini returned no candidates.")
                     candidate = resp.candidates[0]
+
+                    # Todo: Use SDK enum once it's added.
+                    if candidate.finish_reason == "MISSING_THOUGHT_SIGNATURE":
+                        raise AssertionError(
+                            f"Gemini reported {candidate.finish_reason}; "
+                            "our reasoning-continuity protocol assumptions need investigation. "
+                            f"Details: {candidate.finish_message!r}.")
 
                     if candidate.finish_reason == types.FinishReason.TOO_MANY_TOOL_CALLS:
                         raise RuntimeError(f"Unexpected finish_reason: {candidate.finish_reason}.")
@@ -491,6 +504,8 @@ class GeminiAgentNode(AgentNode):
                 self.ctx.post_cancel()
                 self._close_client()
                 return
+
+            assert len(result_parts) == len(calls)
             
             # Per protocol: next user message contains only function results.
             # Aggregated function results to single Content message.
