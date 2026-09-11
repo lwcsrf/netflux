@@ -63,7 +63,7 @@ class TestConsoleRender(unittest.TestCase):
             }
         )
 
-        self.assertEqual(rendered, "g31pp[CR:91k Reg:131k Out:6.5k]")
+        self.assertEqual(rendered, "g38f[CR:91k Reg:131k Out:6.5k]")
 
     def test_cache_write_uses_thousand_rounding(self) -> None:
         rendered = ConsoleRender._format_token_bill_fields(

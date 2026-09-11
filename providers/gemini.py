@@ -5,7 +5,7 @@ import base64
 import time
 import random
 from threading import Event
-import httpx
+import httpx2
 from overrides import override
 
 from ..core import (
@@ -78,7 +78,7 @@ THINKING_CFG = types.ThinkingConfig(
     include_thoughts=False,
 )
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
-MAX_STEPS = 64
+MAX_STEPS = 256
 
 class GeminiAgentNode(AgentNode):
     """
@@ -194,6 +194,9 @@ class GeminiAgentNode(AgentNode):
                         raise RuntimeError("Gemini returned no candidates.")
                     candidate = resp.candidates[0]
 
+                    if candidate.finish_reason == types.FinishReason.TOO_MANY_TOOL_CALLS:
+                        raise RuntimeError(f"Unexpected finish_reason: {candidate.finish_reason}.")
+
                     # False positive for safety block or SDK proactively detecting malformed
                     # function call.
                     if candidate.finish_reason and candidate.finish_reason in (
@@ -220,21 +223,21 @@ class GeminiAgentNode(AgentNode):
                 except (
                     genai_errors.APIError,
                     genai_errors.UnknownApiResponseError,
-                    httpx.HTTPStatusError,
-                    httpx.TransportError,
+                    httpx2.HTTPStatusError,
+                    httpx2.TransportError,
                     RuntimeError,
                 ) as e:
                     # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
                     is_retriable: bool = force_retry
                     is_connection: bool = False
 
-                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
+                    if isinstance(e, httpx2.TransportError) and not isinstance(e, httpx2.ProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, httpx.RemoteProtocolError):
+                    if isinstance(e, httpx2.RemoteProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, httpx.HTTPStatusError):
+                    if isinstance(e, httpx2.HTTPStatusError):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
@@ -361,7 +364,10 @@ class GeminiAgentNode(AgentNode):
                 assert fc.name
                 name: str = fc.name
                 tool_args: Dict[str, Any] = fc.args or {}
-                tool_use_id = fc.id or self._new_tool_use_id(name)
+
+                # `fc.id` lacks uniqueness across sessions, so netflux transcripts will use `tool_use_id`
+                # for call/response as the Runtime-unique key, while gemini response will use `fc.id`.
+                tool_use_id = self._new_tool_use_id(name)
                 tool_use_ids.append(tool_use_id)
 
                 args_ro = MappingProxyType(copy.deepcopy(tool_args))
@@ -425,7 +431,7 @@ class GeminiAgentNode(AgentNode):
                 # Transcript result in gemini sdk types.
                 result_parts.append(types.Part(
                     function_response=types.FunctionResponse(
-                        id=tool_use_id,
+                        id=fc.id,
                         name=fc.name,
                         response=response,
                     )

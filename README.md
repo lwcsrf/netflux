@@ -32,7 +32,7 @@ source .venv/bin/activate
 
 # Install the library in "editable" mode (`-e`), meaning your source code changes
 # are immediately reflected. It also installs the `test` and `all` dependency groups,
-# which include `pytest` and all the provider SDKs (Anthropic, Gemini, etc).
+# which include `pytest` and all provider SDKs.
 pip install -e ".[test,all]"
 
 # Run all tests.
@@ -419,7 +419,7 @@ from netflux.func_lib.ensemble import Ensemble                 # CodeFunction de
 #   - find_bug_ensemble = Ensemble(agent=find_bug_agent, ...)
 #   - fix_bug_workflow (CodeFunction orchestrator)
 
-# Demo auth factories (reads api keys for Anthropic & Gemini from file).
+# Demo auth factories (reads provider API keys from files).
 # Consumer must always specify the factory functions to create the LLM SDK clients
 # since this configures endpoint, authorization mechanism, etc.
 from netflux.demos.client_factory import CLIENT_FACTORIES
@@ -598,11 +598,11 @@ This refined example shows:
 
 * `AgentNode`: represents and manages the state and running of an `AgentFunction` invocation.
     * `AnthropicAgentNode`
-        * particular implementation when the `AgentFunction` is invoked with Anthropic LLM (e.g. Opus 4.1).
+        * particular implementation when the `AgentFunction` is invoked with an Anthropic LLM (e.g. Claude Opus 5).
     * `GeminiAgentNode`
-        * particular implementation when the `AgentFunction` is invoked with Gemini LLM (e.g. Gemini 3.1 Pro).
+        * particular implementation when the `AgentFunction` is invoked with a Gemini LLM (e.g. Gemini 3.8 Flash).
     * Tracks history of LLM session thus far (which it also uses in tool cycle when doing follow-up request)
-        * Subtypes `AnthropicAgentNode` and `GeminiAgentNode` store and use the SDK-specific types in their internal impl.
+        * Provider subtypes store and use the SDK-specific types in their internal implementations.
     * `node.get_transcript() -> List[TranscriptPart]`
         * Subtypes must implement; they must convert the SDK-specific types in the transcription they are tracking to the framework-common `TranscriptPart`s. They never convert types in the reverse direction.
         * For external observers (UIs, tools), prefer `NodeView.transcript: tuple[TranscriptPart, ...]` which is an immutable snapshot captured at publish time. `node.get_transcript()` returns a copy of the live list and should not be used concurrently from outside the node’s thread.

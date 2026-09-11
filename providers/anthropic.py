@@ -15,9 +15,10 @@ from . import ModelNames, Provider
 
 
 import anthropic
-import httpx
+import httpx2
 from anthropic.types import (
     Message, MessageParam,
+    RefusalStopDetails,
     Usage,
     TextBlock, TextBlockParam,
     ThinkingBlock, ThinkingBlockParam,
@@ -112,7 +113,7 @@ OUTPUT_CFG = OutputConfigParam(effort="max")
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
-MAX_STEPS = 256
+MAX_STEPS = 768
 
 
 class AnthropicAgentNode(AgentNode):
@@ -224,8 +225,8 @@ class AnthropicAgentNode(AgentNode):
                     anthropic.APIConnectionError,
                     anthropic.RateLimitError,
                     anthropic.APIStatusError,
-                    httpx.TransportError,
-                    httpx.HTTPStatusError,
+                    httpx2.TransportError,
+                    httpx2.HTTPStatusError,
                 ) as e:
                     is_retriable: bool = False
                     is_connection: bool = False
@@ -238,14 +239,14 @@ class AnthropicAgentNode(AgentNode):
                         # but the SDK is still flagging them as APIStatusError.
                         if e.status_code in (408, 409, 429) or e.status_code >= 500 or "overloaded" in e.message.lower():
                             is_retriable = True
-                    if isinstance(e, httpx.HTTPStatusError):
+                    if isinstance(e, httpx2.HTTPStatusError):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
-                    if isinstance(e, httpx.TransportError) and not isinstance(e, httpx.ProtocolError):
+                    if isinstance(e, httpx2.TransportError) and not isinstance(e, httpx2.ProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, (anthropic.APIConnectionError, httpx.RemoteProtocolError)):
+                    if isinstance(e, (anthropic.APIConnectionError, httpx2.RemoteProtocolError)):
                         is_retriable = True
                         is_connection = True
                     
@@ -287,6 +288,26 @@ class AnthropicAgentNode(AgentNode):
 
             # Incremental token accounting.
             self._accumulate_usage(resp.usage)
+
+            # Classifier refusals are successful HTTP responses, not transient failures.
+            # Discard any partial streamed content and surface the refusal without retrying.
+            if resp.stop_reason == "refusal":
+                details: Optional[RefusalStopDetails] = resp.stop_details
+                category: Optional[str] = details.category if details else None
+                explanation: Optional[str] = details.explanation if details else None
+                self._close_client()
+                self.ctx.post_exception(
+                    ModelProviderException(
+                        message=(
+                            "Anthropic returned stop_reason='refusal' "
+                            f"(category={category!r}, explanation={explanation!r})."
+                        ),
+                        provider=type(self),
+                        agent_name=self.agent_fn.name,
+                        node_id=self.id,
+                    )
+                )
+                return
 
             # Map response ContentBlocks -> *Param blocks for strict replay,
             # while also projecting into our framework transcript.
