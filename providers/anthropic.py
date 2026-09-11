@@ -75,7 +75,7 @@ from anthropic.types.tool_param import InputSchemaTyped
           blocks. These must be included when sending the conversation history back in user
           requests.
         * Model will decrypt redacted reasoning blocks when they are sent back (with signatures).
-          It is only the user that cannot see them.
+          It is only the harness and end user that can't see them.
         * Our replay policy: on every user request (tool use follow-ups), you always replay the
           full conversation history (all elements) since the initial user text prompt, in exact
           sequence sent and received, unmodified.

@@ -28,6 +28,16 @@ The `puzzle` demo also serves the purpose of proving that the provider is capabl
 
 `python -m netflux.demos.puzzle --provider={openai,anthropic,gemini}`
 
+### Reasoning Continuity (`reasoning_continuity.py`)
+
+Attempts to empirically prove correct reasoning continuity across function calls
+through the agent's own experience, correlated with the source code of the provider
+and framework it knows it is currently running in. The agent receives its exact
+runtime identity and source locations, and may use a nonce test or another method to
+correlate the source code against its own experience.
+
+`python -m netflux.demos.reasoning_continuity --provider={openai,anthropic,gemini}`
+
 ### Performance Optimizer (`perf_opt.py`)
 
 Profiles, critically analyzes, and iteratively optimizes a Python code target.
@@ -63,7 +73,8 @@ Run:
 
 ## TUI (`tui.py`)
 
-The above examples are also used as top-level Functions to demo the interactive TUI.
+The puzzle, bash/image stress tests, performance optimizer, and apply-diff demos
+are also available as top-level Functions in the interactive TUI.
 It lets you launch multiple tree roots from one terminal session and switch between their live or completed execution trees.
 
 Run:
