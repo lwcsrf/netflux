@@ -12,15 +12,16 @@ from ..core import (
     UserTextPart, ModelTextPart, ModelStatusPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
-from ..func_lib import raise_exception, status_update
+from ..func_lib import ImageResult, raise_exception, status_update
 from . import ModelNames, Provider
 
 import anthropic
+from anthropic.lib.streaming import ParsedMessageStreamEvent
 from anthropic.types import (
     Message, MessageParam,
     RefusalStopDetails,
     Usage,
-    TextBlock, TextBlockParam,
+    TextBlock, TextBlockParam, ImageBlockParam,
     ThinkingBlock, ThinkingBlockParam,
     RedactedThinkingBlock, RedactedThinkingBlockParam,
     ToolUseBlock, ToolUseBlockParam,
@@ -75,7 +76,7 @@ from anthropic.types.tool_param import InputSchemaTyped
           blocks. These must be included when sending the conversation history back in user
           requests.
         * Model will decrypt redacted reasoning blocks when they are sent back (with signatures).
-          It is only the user that cannot see them.
+          It is only the harness and end user that can't see them.
         * Our replay policy: on every user request (tool use follow-ups), you always replay the
           full conversation history (all elements) since the initial user text prompt, in exact
           sequence sent and received, unmodified.
@@ -188,6 +189,12 @@ class AnthropicAgentNode(AgentNode):
             self.client = None  # type: ignore[assignment]
 
     def run(self) -> None:
+        try:
+            self.run_agent_loop()
+        finally:
+            self._close_client()
+
+    def run_agent_loop(self) -> None:
         # Agent loop.
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
@@ -219,7 +226,7 @@ class AnthropicAgentNode(AgentNode):
                         output_config=OUTPUT_CFG,
 
                         # Explicitly enforce replay prefix checks, to ensure reasoning continuity.
-                        # This beta field is not in the stable SDK thinking type yet.
+                        # todo: switch to static types later. This beta field is not in the stable SDK thinking type yet.
                         extra_body={
                             "thinking": {
                                 **THINKING_CFG,
@@ -228,6 +235,9 @@ class AnthropicAgentNode(AgentNode):
                         },
                         extra_headers={"anthropic-beta": "thinking-binding-controls-2026-08-01"},
                     ) as stream:
+                        # Additional detection of unexpected reasoning discontinuity.
+                        for event in stream:
+                            self.assert_no_input_transformations(event)
                         resp = stream.get_final_message()
 
                         # Observed rare corner case: SDK may return a partial streamed Message snapshot with
@@ -376,10 +386,10 @@ class AnthropicAgentNode(AgentNode):
                     )
 
                 elif isinstance(blk, TextBlock):
+                    # Replay every received text block, including empty/whitespace-only blocks.
+                    assistant_params.append(TextBlockParam(text=blk.text, type="text"))
                     if blk.text and blk.text.strip():
                         text_chunks.append(blk.text)
-                        # Non-final interleaved text should also be replayed
-                        assistant_params.append(TextBlockParam(text=blk.text, type="text"))
 
             # Append assistant turn to history for strict session replay.
             self._history.append(
@@ -389,8 +399,10 @@ class AnthropicAgentNode(AgentNode):
             # Combine this iteration's text into one framework transcript part.
             # This may be intermediate or final assistant text.
             text = "\n".join(text_chunks).strip()
-            self.transcript.append(ModelTextPart(text=text))
-            self.ctx.post_transcript_update()
+            # Successful completion requires a final ModelTextPart, even if empty.
+            if text or not tool_uses:
+                self.transcript.append(ModelTextPart(text=text))
+                self.ctx.post_transcript_update()
 
             # If no tool uses -> finalize with the accumulated text.
             if not tool_uses:
@@ -447,11 +459,13 @@ class AnthropicAgentNode(AgentNode):
 
             # WaitAll + transcribe results.
             for tu, child, invoke_ex in zip(tool_uses, children, invoke_exceptions):
+                result: Any
                 out_text: str
                 is_error: bool
 
                 # Did the invocation itself fail-fast? (e.g. bad args)
-                if invoke_ex:
+                if invoke_ex is not None:
+                    result = invoke_ex
                     out_text = AgentNode.stringify_exception(invoke_ex)
                     is_error = True
 
@@ -459,9 +473,14 @@ class AnthropicAgentNode(AgentNode):
                 else:
                     assert child
                     try:
-                        # This will re-raise any exception that happened inside the tool function.
-                        result: Any = child.result()
-                        out_text = "" if result is None else str(result)
+                        # This will re-raise any exception that happened inside the function.
+                        result = child.result()
+                        if result is None:
+                            out_text = ""
+                        elif isinstance(result, ImageResult):
+                            out_text = result.status
+                        else:
+                            out_text = str(result)
                         is_error = False
                     except Exception as ex:
                         if (
@@ -474,28 +493,42 @@ class AnthropicAgentNode(AgentNode):
                             # per spec before propagating the exception outside the loop.
                             pending_agent_ex = ex
                             continue
+                        result = ex
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
 
+                # Add func response to netflux transcript.
+                # Status updates only get single `ModelStatusPart`, already injected.
                 if not self.is_valid_status_update(tu):
                     self.transcript.append(
                         ToolResultPart(
                             tool_use_id=tu.id,
                             tool_name=tu.name,
-                            outputs=out_text,
+                            outputs=result if isinstance(result, ImageResult) else out_text,
                             is_error=is_error,
                         )
                     )
                     self.ctx.post_transcript_update()
 
-                result_blocks.append(
-                    ToolResultBlockParam(
-                        tool_use_id=tu.id,
-                        type="tool_result",
-                        content=[TextBlockParam(text=out_text, type="text")],
-                        is_error=is_error,
-                    )
-                )
+                # Add func response to native anthropic transcript.
+                content: List[Union[TextBlockParam, ImageBlockParam]] = [
+                    TextBlockParam(text=out_text, type="text")
+                ]
+                if isinstance(result, ImageResult):
+                    content.append(ImageBlockParam(
+                        type="image",
+                        source={
+                            "type": "base64",
+                            "media_type": result.mime_type,
+                            "data": result.base64_data,
+                        },
+                    ))
+                result_blocks.append(ToolResultBlockParam(
+                    tool_use_id=tu.id,
+                    type="tool_result",
+                    content=content,
+                    is_error=is_error,
+                ))
 
             # Now that we finished collecting + transcribing children, it's a good time to react
             # to agent wanting to raise exception, or cancellation request, in that
@@ -508,13 +541,29 @@ class AnthropicAgentNode(AgentNode):
                 self.ctx.post_cancel()
                 self._close_client()
                 return
-            
+
             # Per protocol: next user message contains only tool_result blocks
             self._history.append(cast(MessageParam, {"role": "user", "content": result_blocks}))
 
         self._close_client()
         raise RuntimeError(f"Anthropic agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
                            "without producing a final response.")
+
+    def assert_no_input_transformations(self, event: ParsedMessageStreamEvent) -> None:
+        """
+        Require empty input transformation reports to detect reasoning discontinuity.
+        The initial report is required; final delta reports are checked when present.
+        """
+        # TODO: switch to strong SDK types once this moves out of beta.
+        if event.type == "message_start":
+            metadata = event.message.model_extra or {}
+        elif event.type == "message_delta" and "input_transformations" in (event.model_extra or {}):
+            metadata = event.model_extra or {}
+        else:
+            return
+        if metadata.get("input_transformations") != []:
+            raise AssertionError("Anthropic input_transformations must be empty; "
+                                 f"received: {metadata.get('input_transformations')!r}.")
 
     def _accumulate_usage(self, usage: Usage) -> None:
         cache_read = usage.cache_read_input_tokens or 0

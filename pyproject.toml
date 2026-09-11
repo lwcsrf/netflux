@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netflux"
-version = "0.3.5"
+version = "0.4.0"
 maintainers = [
   { name="LW Computational Science Research Foundation" },
 ]
@@ -17,8 +17,9 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "httpx2[http2]>=2.7.0, <3.0.0",
+    "httpx2[http2]>=2.7.0, <3.0.0",  # to support most provider SDKs
     "overrides",
+    "Pillow>=12.3.0",                # to support `view_image()` built-in
 ]
 
 [project.urls]

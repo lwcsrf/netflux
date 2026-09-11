@@ -34,7 +34,7 @@ from .console import (
     _visible_len,
 )
 from ._driver import ConsoleSessionDriver
-from ._logging import close_tui_logging, configure_tui_logging
+from ._logging import close_tui_logging, configure_tui_logging, log_tui_result
 from ._terminal_io import restore_console
 
 
@@ -80,6 +80,8 @@ class _RunRecord:
     cancel_event: threading.Event
     max_agent_levels: int = DEFAULT_MAX_AGENT_LEVELS
     latest_view: NodeView | None = None
+    created_at: float = field(default_factory=time.time)
+    result_log_attempted: bool = False
     terminal_callback_invoked: bool = False
     terminal_browse_applied: bool = False
     terminal_browse_pending: bool = False
@@ -227,7 +229,7 @@ class TUI(SessionController):
         if callback is None:
             return
         for run in self._runs:
-            self._invoke_terminal_callback_if_needed(run)
+            self._handle_terminal_run_if_needed(run)
 
     def set_wakeup(self, wakeup: Callable[[], None]) -> None:
         self._wakeup = wakeup
@@ -240,7 +242,7 @@ class TUI(SessionController):
     def on_session_stop(self) -> None:
         for run in self._runs:
             run.watcher_stop.set()
-        self._attempt_terminal_callbacks_for_all_runs(refresh_from_runtime=True)
+        self._handle_terminal_runs(refresh_from_runtime=True)
 
     def pump_events(self) -> bool:
         changed = False
@@ -268,7 +270,7 @@ class TUI(SessionController):
                     run.terminal_browse_pending = True
             else:
                 run.auto_unread = True
-            self._invoke_terminal_callback_if_needed(run, event.view)
+            self._handle_terminal_run_if_needed(run, event.view)
         self._request_exit_after_graceful_cancel_if_complete()
         return changed
 
@@ -439,13 +441,13 @@ class TUI(SessionController):
 
     def handle_interrupt(self) -> bool:
         if self._global_cancel_requested:
-            self._attempt_terminal_callbacks_for_all_runs(refresh_from_runtime=True)
+            self._handle_terminal_runs(refresh_from_runtime=True)
             raise KeyboardInterrupt
 
         for run in self._runs:
             run.cancel_event.set()
         self._global_cancel_requested = True
-        self._attempt_terminal_callbacks_for_all_runs(refresh_from_runtime=True)
+        self._handle_terminal_runs(refresh_from_runtime=True)
         self._request_exit_after_graceful_cancel_if_complete()
         return False
 
@@ -748,6 +750,7 @@ class TUI(SessionController):
         assert max_agent_levels is not None
 
         cancel_event = threading.Event()
+        created_at = time.time()
         try:
             node = self.runtime.invoke(
                 None,
@@ -777,6 +780,7 @@ class TUI(SessionController):
                 cancel_event=cancel_event,
                 max_agent_levels=max_agent_levels,
                 latest_view=self.runtime.get_view(node.id),
+                created_at=created_at,
             )
             watcher_index = len(self._runs)
             run.watcher_thread = threading.Thread(
@@ -797,7 +801,7 @@ class TUI(SessionController):
         self._runs.append(run)
         run_index = len(self._runs) - 1
         self._set_selected_run(run_index)
-        self._invoke_terminal_callback_if_needed(run)
+        self._handle_terminal_run_if_needed(run)
         self._ensure_selected_run_post_terminal_browse(run)
         self._form_state = None
         self._sync_visible_run()
@@ -911,7 +915,7 @@ class TUI(SessionController):
                 exc=exc,
             )
 
-    def _attempt_terminal_callbacks_for_all_runs(
+    def _handle_terminal_runs(
         self,
         *,
         refresh_from_runtime: bool,
@@ -919,7 +923,7 @@ class TUI(SessionController):
         for run in self._runs:
             if refresh_from_runtime:
                 self._refresh_run_view_from_runtime(run)
-            self._invoke_terminal_callback_if_needed(run)
+            self._handle_terminal_run_if_needed(run)
 
     def _refresh_run_view_from_runtime(self, run: _RunRecord) -> None:
         node_id: object = getattr(run.node, "id", None)
@@ -935,15 +939,35 @@ class TUI(SessionController):
             )
             return
 
-    def _invoke_terminal_callback_if_needed(
+    def _handle_terminal_run_if_needed(
         self,
         run: _RunRecord,
         view: NodeView | None = None,
     ) -> None:
-        if run.terminal_callback_invoked:
-            return
         final_view: NodeView | None = view or run.latest_view
         if final_view is None or final_view.state not in TerminalNodeStates:
+            return
+        if not run.result_log_attempted:
+            # Failed logging must not block completion or repeat on later refreshes.
+            run.result_log_attempted = True
+            try:
+                if final_view.state is NodeState.Success:
+                    content = str(final_view.outputs)
+                elif final_view.exception is not None:
+                    content = f"{type(final_view.exception).__name__}: {final_view.exception}"
+                else:
+                    content = final_view.state.value
+                log_tui_result(
+                    self.log_path,
+                    created_at=run.created_at,
+                    finished_at=final_view.ended_at if final_view.ended_at is not None else time.time(),
+                    name=run.name,
+                    content=content,
+                )
+            except Exception:
+                logger.exception("TUI could not log the result for top-level run '%s'.", run.name)
+
+        if run.terminal_callback_invoked:
             return
         callback: TerminalCallback | None = self._terminal_callback
         if callback is None:

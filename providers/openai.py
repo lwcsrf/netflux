@@ -13,10 +13,12 @@ from typing_extensions import Final, Literal, Required, TypedDict
 import openai
 from openai._constants import MAX_RETRY_AFTER_DELAY
 from openai.types.responses import (
-    EasyInputMessageParam, FunctionToolParam, Response, ResponseError,
-    ResponseFunctionToolCall, ResponseInputItemParam, ResponseInputParam, ResponseInputTextParam,
+    Response, ResponseError, ResponseUsage,
+    FunctionToolParam, ToolChoiceOptions,
+    ResponseFunctionToolCall, ResponseFunctionCallOutputItemListParam,
+    EasyInputMessageParam, ResponseInputParam, ResponseInputItemParam,
+    ResponseInputTextParam, ResponseInputTextContentParam, ResponseInputImageContentParam,
     ResponseOutputMessage, ResponseOutputRefusal, ResponseOutputText, ResponseReasoningItem,
-    ResponseUsage, ToolChoiceOptions,
 )
 from openai.types.responses.response_create_params import PromptCacheOptions
 from openai.types.responses.response_function_tool_call import CallerDirect
@@ -28,7 +30,7 @@ from ..core import (
     ModelStatusPart, ModelProviderException, ModelTextPart, Node, RunContext,
     ThinkingBlockPart, TokenUsage, ToolResultPart, ToolUsePart, UserTextPart,
 )
-from ..func_lib import raise_exception, status_update
+from ..func_lib import ImageResult, raise_exception, status_update
 from . import ModelNames, Provider
 
 
@@ -58,7 +60,7 @@ TRANSIENT_RESPONSE_ERRORS: Final = frozenset({
 
 
 # OpenAI and Pydantic expose JSON Schema as a generic dict; these TypedDicts
-# check the strict object/property subset we generate before the SDK cast,
+# check the object/property subset we generate before the SDK cast,
 # so that it's like using strong types.
 JsonScalarType = Literal["string", "integer", "number", "boolean"]
 JsonTypeName = Literal["string", "integer", "number", "boolean", "null"]
@@ -190,8 +192,8 @@ class OaiAgentNode(AgentNode):
             raise TypeError(
                 "OaiAgentNode expected client_factory to return openai.OpenAI"
             )
-        # Each node owns its factory client. Disable SDK retries while retaining
-        # its configuration (with_options() drops strict response validation).
+        # Validate SDK types once at the boundary; keep provider-owned retries.
+        client._strict_response_validation = True
         client.max_retries = 0
         return client
 
@@ -209,6 +211,10 @@ class OaiAgentNode(AgentNode):
     def run(self) -> None:
         try:
             self.run_agent_loop()
+        except openai.APIResponseValidationError as ex:
+            self.ctx.post_exception(self.provider_error(
+                f"OpenAI response validation failed:\n{ex.__cause__ or ex}", inner_exception=ex,
+            ))
         except ModelProviderException as ex:
             # Already contextualized; do not wrap it again in AgentNode.run_wrapper.
             self.ctx.post_exception(ex)
@@ -283,6 +289,12 @@ class OaiAgentNode(AgentNode):
                 # their partial output or dispatch their tools when retrying.
                 if response.usage is not None:
                     self.accumulate_usage(response.usage)
+                if response.model != self.model:
+                    raise self.provider_error(
+                        f"OpenAI response {response.id!r} changed the model: "
+                        f"expected={self.model!r}, actual={response.model!r}; "
+                        "reasoning continuity cannot be guaranteed."
+                    )
                 delay = (
                     self.retry_delay(response.error, attempt)
                     if response.status == "failed" and response.error is not None else None
@@ -599,26 +611,24 @@ class OaiAgentNode(AgentNode):
                 f"call_id={item.call_id!r}, status={item.status!r}."
             )
 
-        if not isinstance(item.call_id, str) or not item.call_id:
+        if not item.call_id:
             raise self.provider_error(
                 f"OpenAI returned an invalid function call_id: {item.call_id!r}."
             )
 
-        if not isinstance(item.name, str) or not item.name:
+        if not item.name:
             raise self.provider_error(
                 f"OpenAI returned an invalid function name {item.name!r} "
                 f"for call_id={item.call_id!r}."
             )
 
-        if item.async_ is not None and item.async_ is not False:
+        if item.async_:
             raise self.provider_error(
                 "OpenAI emitted an unsupported async function-call value: "
                 f"{item.async_!r}."
             )
 
-        if item.caller is not None and (
-            not isinstance(item.caller, CallerDirect) or item.caller.type != "direct"
-        ):
+        if item.caller is not None and not isinstance(item.caller, CallerDirect):
             raise self.provider_error(
                 "OpenAI emitted a non-direct function caller although this "
                 "provider did not opt into programmatic tool calling: "
@@ -652,24 +662,10 @@ class OaiAgentNode(AgentNode):
         return parsed
 
     def validate_output_message(self, item: ResponseOutputMessage) -> None:
-        # SDK response parsing is permissive; validate the protocol values before
-        # interpreting or replaying assistant messages.
-        if item.type != "message" or item.role != "assistant":
-            raise self.provider_error(
-                "Unsupported OpenAI assistant message: "
-                f"id={item.id!r}, type={item.type!r}, role={item.role!r}."
-            )
-
         if item.status != "completed":
             raise self.provider_error(
                 "OpenAI returned a non-completed assistant message: "
                 f"id={item.id!r}, status={item.status!r}."
-            )
-
-        if item.phase not in (None, "commentary", "final_answer"):
-            raise self.provider_error(
-                "Unsupported OpenAI assistant message phase: "
-                f"id={item.id!r}, phase={item.phase!r}."
             )
 
     def prepare_output_message(
@@ -679,17 +675,9 @@ class OaiAgentNode(AgentNode):
         has_text = False
 
         for part in item.content:
-            if isinstance(part, ResponseOutputText) and part.type == "output_text":
-                text = part.text
-            elif isinstance(part, ResponseOutputRefusal) and part.type == "refusal":
-                text = part.refusal
-            else:
-                raise self.provider_error(
-                    "Unsupported OpenAI assistant content part: "
-                    f"{type(part).__name__}: {part!r}."
-                )
+            text = part.text if isinstance(part, ResponseOutputText) else part.refusal
 
-            if text and text.strip():
+            if text.strip():
                 has_text = True
                 if deferred_chunks is None:
                     updates.append(ModelTextUpdate(text, merge=merge))
@@ -736,26 +724,26 @@ class OaiAgentNode(AgentNode):
         pending_agent_ex: Optional[AgentException] = None
         outputs: List[FunctionCallOutput] = []
 
-        for pending, child, invoke_ex in zip(
-            pending_calls,
-            children,
-            invoke_exceptions,
-        ):
+        # WaitAll + transcribe results.
+        for pending, child, invoke_ex in zip(pending_calls, children, invoke_exceptions):
+            result: Any
             out_text: str
             is_error: bool
 
             if invoke_ex is not None:
+                result = invoke_ex
                 out_text = AgentNode.stringify_exception(invoke_ex)
                 is_error = True
             else:
-                if child is None:
-                    raise self.provider_error(
-                        "OpenAI tool batch lost a child Node without an invocation "
-                        "exception."
-                    )
+                assert child
                 try:
-                    result: Any = child.result()
-                    out_text = "" if result is None else str(result)
+                    result = child.result()
+                    if result is None:
+                        out_text = ""
+                    elif isinstance(result, ImageResult):
+                        out_text = result.status
+                    else:
+                        out_text = str(result)
                     is_error = False
                 except Exception as ex:
                     if (
@@ -768,23 +756,36 @@ class OaiAgentNode(AgentNode):
                         # per spec before propagating the exception outside the loop.
                         pending_agent_ex = ex
                         continue
+                    result = ex
                     out_text = AgentNode.stringify_exception(ex)
                     is_error = True
 
+            # Add func response to netflux transcript.
+            # Status updates only get single `ModelStatusPart`, already injected.
             if not self.is_valid_status_update(pending.item.name, pending.args):
                 self.transcript.append(ToolResultPart(
                     tool_use_id=pending.tool_use_id, tool_name=pending.item.name,
-                    outputs=out_text, is_error=is_error,
+                    outputs=result if isinstance(result, ImageResult) else out_text,
+                    is_error=is_error,
                 ))
                 self.ctx.post_transcript_update()
 
-            wire_output = json.dumps(
-                {"error" if is_error else "output": out_text},
-                ensure_ascii=False, separators=(",", ":"),
-            )
-
+            # Add func response to native OpenAI transcript.
+            outcome = "exception" if is_error else "success"
+            content: ResponseFunctionCallOutputItemListParam = [
+                ResponseInputTextContentParam(
+                    type="input_text",
+                    text=f"<outcome>{outcome}</outcome>\n"
+                         f"<result_content>\n{out_text}\n</result_content>",
+                ),
+            ]
+            if isinstance(result, ImageResult):
+                content.append(ResponseInputImageContentParam(
+                    type="input_image", detail="auto",
+                    image_url=f"data:{result.mime_type};base64,{result.base64_data}",
+                ))
             outputs.append(FunctionCallOutput(
-                type="function_call_output", call_id=pending.item.call_id, output=wire_output,
+                type="function_call_output", call_id=pending.item.call_id, output=content,
             ))
 
         # React only after the full batch has been joined/transcribed.
@@ -859,23 +860,24 @@ class OaiAgentNode(AgentNode):
             if arg.argtype is str and arg.enum is not None:
                 enum_values: List[Optional[str]] = list(sorted(arg.enum))
                 if arg.optional:
-                    # Netflux already accepts None for optional args. Strict
-                    # schemas must allow null in both the type and the enum.
+                    # Netflux accepts both omission and explicit None for optional args, so allow null in
+                    # both the type and the enum for the explicit None case.
                     enum_values.append(None)
                 property_schema["enum"] = enum_values
 
             properties[arg.name] = property_schema
 
-        # In OpenAI strict mode every property is listed in required. Netflux
-        # optional args remain optional semantically by being nullable.
         schema = ObjectParametersSchema(
             type="object", properties=properties,
-            required=[arg.name for arg in fn.args], additionalProperties=False,
+            required=[arg.name for arg in fn.args if not arg.optional], additionalProperties=False,
         )
 
         tool = FunctionToolParam(
             type="function", name=fn.name, description=fn.desc,
-            parameters=cast(FunctionParameters, schema), strict=True,
+            parameters=cast(FunctionParameters, schema),
+            # Framework validation and coercion return actionable exceptions so the model can correct follow-up calls.
+            # `strict` would have the API service do this, but we don't need that, and it results in more token-verbose function calls
+            strict=False,
             allowed_callers=["direct"], defer_loading=False,
         )
         tool["async"] = False  # Reserved Python keyword in the SDK's TypedDict.
@@ -893,8 +895,8 @@ class OaiAgentNode(AgentNode):
             return "boolean"
         raise TypeError(f"Unsupported FunctionArg type for OpenAI: {py_type!r}")
 
-    def provider_error(self, message: str) -> ModelProviderException:
+    def provider_error(self, message: str, inner_exception: Optional[Exception] = None) -> ModelProviderException:
         return ModelProviderException(
             message=message, provider=type(self),
-            agent_name=self.agent_fn.name, node_id=self.id,
+            agent_name=self.agent_fn.name, node_id=self.id, inner_exception=inner_exception,
         )

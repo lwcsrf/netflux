@@ -151,8 +151,18 @@ Tool calls behave as follows:
 - if a `ToolUsePart` maps to a real child node, that child subtree is rendered inline at the matching transcript position,
 - if no child node exists, the tool call remains visible as a synthetic expandable function row.
 
+For successful `ImageResult` outputs, the expanded `result` block contains two
+plain-text rows: the `ImageResult.status` text first, followed by the literal
+`[image content]` placeholder on its own row underneath. Collapsed previews use
+only the status. This applies to transcript results and child/root node outputs;
+media bytes and base64 are never rendered or copied to the clipboard. Copying an
+image result copies the status and placeholder. `view_image` uses the same styling
+as other tools.
+
 `ModelStatusPart` entries render in transcript order like intermediate assistant text,
-with the same glyph, magenta color, and collapse behavior, but a bold `status` label.
+with the same glyph, muted steel blue color, dim content, and collapse behavior,
+but a bold, undimmed `status` label (intermediate text uses `text`).
+Both use dim, neutral expand/collapse arrows matching thinking rows.
 
 Successful terminal root results behave as follows:
 - the renderer identifies one top-level result target for the selected root tree,

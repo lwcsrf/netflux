@@ -26,7 +26,17 @@ No limits in how many guesses it gets per stage, but it needs to get the correct
 
 The `puzzle` demo also serves the purpose of proving that the provider is capable of a single continuous reasoning chain that envelopes the multi cycles of tool use.
 
-`python3 -m netflux.demos.puzzle --provider={openai,anthropic,gemini}`
+`python -m netflux.demos.puzzle --provider={openai,anthropic,gemini}`
+
+### Reasoning Continuity (`reasoning_continuity.py`)
+
+Attempts to empirically prove correct reasoning continuity across function calls
+through the agent's own experience, correlated with the source code of the provider
+and framework it knows it is currently running in. The agent receives its exact
+runtime identity and source locations, and may use a nonce test or another method to
+correlate the source code against its own experience.
+
+`python -m netflux.demos.reasoning_continuity --provider={openai,anthropic,gemini}`
 
 ### Performance Optimizer (`perf_opt.py`)
 
@@ -34,7 +44,7 @@ Profiles, critically analyzes, and iteratively optimizes a Python code target.
 Uses a combination of cProfile and critical reasoning. Produces intermediate profiling and analysis
 reports, and a final report summarizing changes and measured performance gains.
 
-`python3 -m netflux.demos.perf_opt --provider={openai,anthropic,gemini}`
+`python -m netflux.demos.perf_opt --provider={openai,anthropic,gemini}`
 
 ### Apply Diff (`apply_diff.py`)
 
@@ -43,25 +53,32 @@ The script prints the workspace path, streams a live view of the agent’s work,
 
 Run:
 
-`python3 -m netflux.demos.apply_diff --provider={openai,anthropic,gemini} [--fail-first]`
+`python -m netflux.demos.apply_diff --provider={openai,anthropic,gemini} [--fail-first]`
 
-### Bash Stress (`bash_stress.py`)
+### Built-in Stress Tests (`stress_builtins.py`)
 
-Runs a relatively bare `AgentFunction` whose job is to stress-test the built-in `bash` tool the way an agent would actually use it. By default it performs a broad progression of shell workflows, starting simple and becoming more sophisticated. Optionally, pass `--custom-instruction` to steer the run toward a narrower behavior or failure mode you want to probe.
+Choose one of three test modes: `bash`, `image`, or `tree`.
 
-The script creates a disposable workspace, changes into it before invoking the agent, streams a live tree view, and leaves the workspace on disk so you can inspect what the agent did afterward.
+- `bash`: runs a relatively bare `AgentFunction` whose role is to stress-test the built-in `bash` tool that covers a superset of how any agent might use the function.
+- `image`: inspect an existing asset, refine an SVG through at least ten visual revisions that require using `view_image` of the rasterized SVG, exercise downsizing and re-encoding of a large image, then derive more probes after looking at the `view_image` source and try them.
+- `tree`: recursively delegate with a three-agent-level limit and relay evidence of the deepest-level warning and rejected fourth level invocation attempt.
+
+Optionally, pass `--custom-instruction` to steer the run toward a narrower behavior or failure mode you want to probe. Only `tree` exposes an agent as a function, and does so recursively, and its delegates use the selected provider too.
+
+The script creates a disposable workspace, changes into it before invoking the agent, streams a live tree view, and leaves the workspace on a tmp volume for inspectability.
 
 Run:
 
-`python3 -m netflux.demos.bash_stress --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
+`python -m netflux.demos.stress_builtins {bash,image,tree} --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
 
 ## TUI (`tui.py`)
 
-The above examples are also used as top-level Functions to demo the interactive TUI.
+The puzzle, bash/image stress tests, performance optimizer, and apply-diff demos
+are also available as top-level Functions in the interactive TUI.
 It lets you launch multiple tree roots from one terminal session and switch between their live or completed execution trees.
 
 Run:
 
-`python3 -m netflux.demos.tui`
+`python -m netflux.demos.tui`
 
 Each tree launch chooses its provider in the TUI launch form. For `AgentFunction` roots, the provider field defaults to that `AgentFunction`'s `default_model`; changing it overrides only that top-level invoke.
