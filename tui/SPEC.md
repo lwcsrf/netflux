@@ -133,7 +133,7 @@ If a different root id is assigned to the same renderer, cached per-tree state i
 Default presentation:
 - agent nodes start expanded,
 - code-function nodes start collapsed,
-- detail sections start collapsed.
+- detail sections, including individual arguments on expanded code/agent nodes, start collapsed.
 
 User overrides persist for the lifetime of the renderer instance.
 
@@ -168,7 +168,7 @@ Successful terminal root results behave as follows:
 - the renderer identifies one top-level result target for the selected root tree,
 - for agent roots, this is the last `ModelTextPart` when present, otherwise the terminal `outputs` block,
 - for code roots, this is the terminal `outputs` block,
-- clipboard copy uses the raw terminal result text verbatim rather than the markdown-rendered display form,
+- copy preserves raw text: real/synthetic function headers copy full arguments and the available result/exception; detail rows copy their entire argument/result/transcript block,
 - when that result target is expanded, it is rendered through the current Rich-based terminal markdown renderer instead of being shown as raw markdown text.
 
 ### 3.5 Status and Interaction Context
@@ -185,7 +185,7 @@ Successful terminal root results behave as follows:
 - useful agent-jump actions,
 - follow mode enabled,
 - a terminal root state,
-- a copyable top-level terminal result,
+- a copyable selected element in any state (readable thinking included; redacted content, signatures, and standalone placeholders excluded),
 - a revealable top-level terminal result target.
 
 ## 4. Standalone `ConsoleRender.run(node)`
@@ -222,8 +222,8 @@ Standalone key bindings:
 - `g` / `G`: go to enclosing node top/bottom
 - Page Up / Page Down: page navigation
 - `n` / `N`: next/previous visible agent
-- `c`: copy the top-level result to the clipboard when the root has a terminal result
-- `r`: expand and focus the top-level result when the root has a terminal result
+- `c`: copy the full selected element, collapsed or expanded; continuation rows copy their whole block, unavailable selections do nothing
+- `r`: expand and focus the root result or error/cancellation exception
 - `a`: collapse enclosing agent
 - `e` / `E`: expand all / collapse all
 - `q` / Escape: leave the post-completion browser only
@@ -260,7 +260,7 @@ The standalone bottom bar:
 - preserves state/status data ahead of shortcut text under narrow widths,
 - shows `^C:cancel` while live and cancelable,
 - shows `q:quit` in terminal browse mode,
-- includes `c` / `r` result shortcuts only when the selected terminal root has a copyable/revealable result target.
+- shows `c` for copyable selected text and `r` for a root outcome (result, error, or cancellation exception).
 
 Token-bill formatting uses the compact per-provider format currently implemented by `ConsoleRender`.
 
@@ -358,8 +358,8 @@ Normal non-modal multi-pane key bindings:
 - `g` / `G`: selected-tree top/bottom
 - Page Up / Page Down: selected-tree page navigation
 - `n` / `N`: selected-tree agent jumps
-- `c`: copy the selected root result to the clipboard when it is terminal and available
-- `r`: expand and focus the selected root result when it is terminal and available
+- `c`: copy the complete selected element using the standalone copy rules
+- `r`: expand and focus the selected root's result or error/cancellation exception
 - `a`: collapse selected-tree enclosing agent
 - `e` / `E`: selected-tree expand all / collapse all
 - `Ctrl+C`: session-wide interrupt handling

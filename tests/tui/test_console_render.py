@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import ctypes
 import re
 import subprocess
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from ...core import (
     AgentFunction,
@@ -72,7 +73,7 @@ class TestConsoleRender(unittest.TestCase):
 
         self.assertEqual(rendered, "CW:2k")
 
-    def test_copy_terminal_result_uses_raw_root_result_text(self) -> None:
+    def test_copy_selected_result_uses_raw_root_result_text(self) -> None:
         fn = _make_code_function("root")
         view = NodeView(
             id=1,
@@ -89,21 +90,34 @@ class TestConsoleRender(unittest.TestCase):
             update_seqnum=1,
         )
         renderer = ConsoleRender()
-        renderer.assign_view(view)
+        renderer.render_body(width=80, height=10, view=view, tick=0)
+        self.assertTrue(renderer.focus_terminal_result())
+        renderer.render_body(width=80, height=10, tick=0)
 
         with patch("netflux.tui.console._copy_text_to_clipboard", return_value=True) as copy_mock:
-            self.assertTrue(renderer.copy_terminal_result())
+            self.assertTrue(renderer.copy_selected_text())
 
         copy_mock.assert_called_once_with("# Summary\n\n- first item")
 
     def test_copy_text_to_clipboard_uses_win32_unicode_path(self) -> None:
+        text = "à ù • │ emoji 😀🧪 CJK 漢字 tail"
+        expected = ctypes.create_unicode_buffer(text)
+        destination = ctypes.create_string_buffer(ctypes.sizeof(expected))
+        kernel32, user32 = Mock(), Mock()
+        kernel32.GlobalAlloc.return_value = 1
+        kernel32.GlobalLock.return_value = ctypes.addressof(destination)
+        user32.OpenClipboard.return_value = True
+        user32.EmptyClipboard.return_value = True
+        user32.SetClipboardData.return_value = 1
         with patch("netflux.tui.console.sys.platform", "win32"), patch(
-            "netflux.tui.console._copy_text_to_clipboard_windows",
-            return_value=True,
-        ) as win_copy, patch("netflux.tui.console.subprocess.run") as run_mock:
-            self.assertTrue(_copy_text_to_clipboard("à ù • │ emoji 😀 CJK 漢字"))
+            "ctypes.WinDLL", side_effect=[kernel32, user32], create=True,
+        ), patch("netflux.tui.console.subprocess.run") as run_mock:
+            self.assertTrue(_copy_text_to_clipboard(text))
 
-        win_copy.assert_called_once_with("à ù • │ emoji 😀 CJK 漢字")
+        kernel32.GlobalAlloc.assert_called_once_with(0x0042, ctypes.sizeof(expected))
+        self.assertEqual(destination.raw, bytes(expected))
+        user32.SetClipboardData.assert_called_once_with(13, 1)
+        kernel32.GlobalFree.assert_not_called()
         run_mock.assert_not_called()
 
     def test_copy_text_to_clipboard_prefers_wl_copy_on_linux(self) -> None:
@@ -208,10 +222,12 @@ class TestConsoleRender(unittest.TestCase):
             update_seqnum=1,
         )
         renderer = ConsoleRender()
-        renderer.assign_view(agent_view)
+        renderer.render_body(width=80, height=10, view=agent_view, tick=0)
+        self.assertTrue(renderer.focus_terminal_result())
+        renderer.render_body(width=80, height=10, tick=0)
 
         with patch("netflux.tui.console._copy_text_to_clipboard", return_value=True) as copy_mock:
-            self.assertTrue(renderer.copy_terminal_result())
+            self.assertTrue(renderer.copy_selected_text())
 
         copy_mock.assert_called_once_with("final transcript result")
 

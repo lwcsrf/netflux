@@ -30,7 +30,7 @@ class RightPaneInteractionContext:
     can_jump_agents: bool = False
     follow_mode: bool = False
     is_terminal: bool = False
-    can_copy_root_result: bool = False
+    can_copy_selected_text: bool = False
     can_focus_root_result: bool = False
 
 

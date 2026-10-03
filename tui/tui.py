@@ -390,7 +390,7 @@ class TUI(SessionController):
             renderer = self._selected_renderer()
             if renderer is None:
                 return False
-            copied, message = renderer.copy_terminal_result_with_feedback()
+            copied, message = renderer.copy_selected_text_with_feedback()
             if not copied and message:
                 self._set_flash_message(message)
             return False
