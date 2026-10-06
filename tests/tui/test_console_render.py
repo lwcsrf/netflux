@@ -4,6 +4,8 @@ import ctypes
 import re
 import subprocess
 import unittest
+from dataclasses import replace
+from threading import Event
 from unittest.mock import Mock, patch
 
 from ...core import (
@@ -14,6 +16,7 @@ from ...core import (
     NodeView,
     RunContext,
     TokenBill,
+    TokenUsage,
 )
 from ...providers import Provider
 from ...tui import ConsoleRender
@@ -53,6 +56,169 @@ def _strip_ansi(text: str) -> str:
 
 
 class TestConsoleRender(unittest.TestCase):
+    def test_toggle_node_details_collapses_owning_node(self) -> None:
+        target = NodeView(
+            id=2,
+            fn=_make_agent_function("target"),
+            inputs={"first": "one", "last": "two"},
+            state=NodeState.Success,
+            outputs=None,
+            exception=None,
+            children=(),
+            usage=None,
+            transcript=(),
+            started_at=0.0,
+            ended_at=0.0,
+            update_seqnum=1,
+        )
+        cases = (
+            (NodeState.Success, TokenUsage(output_tokens_total=7), None, "n:2", (0,)),
+            (NodeState.Error, None, ValueError("first line\nlast line"), "ae:2", (0, 1, 2)),
+            (NodeState.Canceled, None, RuntimeError("first line\nlast line"), "ae:2", (0, 1, 2)),
+        )
+        for state, usage, exception, anchor, offsets in cases:
+            for nested in (False, True):
+                for offset in offsets:
+                    with self.subTest(state=state, nested=nested, offset=offset):
+                        view = replace(target, state=state, usage=usage, exception=exception)
+                        if nested:
+                            view = replace(
+                                target,
+                                id=1,
+                                fn=_make_agent_function("parent"),
+                                children=(replace(target, id=3), view),
+                            )
+                        renderer = ConsoleRender(follow=False)
+                        renderer.render_body(width=80, height=30, view=view, tick=0)
+                        rows = [
+                            idx for idx, info in enumerate(renderer._line_infos)
+                            if info.key is None and anchor in info.anchors
+                        ]
+                        renderer._set_cursor(rows[offset])
+
+                        renderer.toggle_expanded()
+
+                        self.assertEqual(renderer._collapse_overrides, {"n:2": True})
+                        renderer.render_body(width=80, height=30, tick=0)
+                        self.assertEqual(renderer._line_infos[renderer._cursor].key, "n:2")
+                        keys = {info.key for info in renderer._line_infos}
+                        self.assertNotIn("aa:2:last", keys)
+                        if nested:
+                            self.assertTrue({"n:1", "n:3", "aa:1:last", "aa:3:last"} <= keys)
+
+    def test_toggle_expanded_content_collapses_its_section(self) -> None:
+        view = NodeView(
+            id=1,
+            fn=_make_agent_function("root"),
+            inputs={"first": "argument one\nargument two", "last": "other"},
+            state=NodeState.Success,
+            outputs=None,
+            exception=None,
+            children=(),
+            usage=None,
+            transcript=(ModelTextPart(text="transcript one\n\ntranscript two"),),
+            started_at=0.0,
+            ended_at=0.0,
+            update_seqnum=1,
+        )
+        for key in ("aa:1:first", "tp:1:0:model"):
+            with self.subTest(section=key):
+                renderer = ConsoleRender(follow=False)
+                renderer._collapse_overrides[key] = False
+                renderer.render_body(width=80, height=20, view=view, tick=0)
+                content_rows = [
+                    idx for idx, info in enumerate(renderer._line_infos)
+                    if info.key is None and key in info.anchors
+                ]
+                self.assertGreaterEqual(len(content_rows), 2)
+                renderer._set_cursor(content_rows[-1])
+
+                renderer.toggle_expanded()
+
+                self.assertEqual(renderer._collapse_overrides, {key: True})
+                renderer.render_body(width=80, height=20, tick=0)
+                self.assertEqual(renderer._line_infos[renderer._cursor].key, key)
+                self.assertFalse(any(
+                    info.key is None and key in info.anchors
+                    for info in renderer._line_infos
+                ))
+
+    def test_toggle_empty_agent_header_collapses_parent_not_previous_sibling(self) -> None:
+        leaf = NodeView(
+            id=4,
+            fn=_make_agent_function("leaf"),
+            inputs={},
+            state=NodeState.Running,
+            outputs=None,
+            exception=None,
+            children=(),
+            usage=None,
+            transcript=(),
+            started_at=0.0,
+            ended_at=None,
+            update_seqnum=1,
+        )
+        sibling = replace(leaf, id=3, inputs={"argument": "value"})
+        parent = replace(leaf, id=2, children=(sibling, leaf))
+        root = replace(leaf, id=1, children=(parent,))
+        for action in ("keyboard", "mouse"):
+            with self.subTest(action=action):
+                renderer = ConsoleRender(follow=False)
+                renderer.render_body(width=80, height=20, view=root, tick=0)
+                row = next(
+                    idx for idx, info in enumerate(renderer._line_infos)
+                    if info.key == "n:4"
+                )
+                self.assertFalse(renderer._line_infos[row].expandable)
+                renderer._set_cursor(row)
+
+                if action == "mouse":
+                    renderer.handle_mouse_event(x=0, y=row)
+                else:
+                    renderer.toggle_expanded()
+
+                self.assertEqual(renderer._collapse_overrides, {"n:2": True})
+                renderer.render_body(width=80, height=20, tick=0)
+                self.assertEqual(renderer._line_infos[renderer._cursor].key, "n:2")
+                self.assertEqual(
+                    [info.key for info in renderer._line_infos], ["n:1", "n:2"]
+                )
+
+    def test_toggle_cancellation_footer_preserves_fallback_and_stops_following(self) -> None:
+        cancel_event = Event()
+        cancel_event.set()
+        view = NodeView(
+            id=1,
+            fn=_make_agent_function("root"),
+            inputs={"query": "first line\nlast line"},
+            state=NodeState.Running,
+            outputs=None,
+            exception=None,
+            children=(),
+            usage=None,
+            transcript=(),
+            started_at=0.0,
+            ended_at=None,
+            update_seqnum=1,
+        )
+        for footer_offset in (1, 2):
+            for expanded in (False, True):
+                with self.subTest(footer_offset=footer_offset, expanded=expanded):
+                    renderer = ConsoleRender(cancel_event=cancel_event, follow=True)
+                    if expanded:
+                        renderer._collapse_overrides["aa:1:query"] = False
+                    renderer.render_body(width=80, height=20, view=view, tick=0)
+                    self.assertIn("Cancelation pending", _strip_ansi(renderer._lines[-1]))
+                    renderer._set_cursor(len(renderer._lines) - footer_offset, disable_follow=False)
+                    self.assertTrue(renderer._follow_mode)
+
+                    renderer.toggle_expanded()
+
+                    self.assertEqual(renderer._collapse_overrides, {"aa:1:query": True})
+                    self.assertFalse(renderer._follow_mode)
+                    renderer.render_body(width=80, height=20, tick=0)
+                    self.assertEqual(renderer._line_infos[renderer._cursor].key, "aa:1:query")
+
     def test_total_token_bill_uses_compact_k_suffixes(self) -> None:
         rendered = ConsoleRender._format_total_token_bill(
             {

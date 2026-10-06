@@ -826,9 +826,20 @@ class ConsoleRender:
         if self._toggle_line_locked(self._cursor):
             return
 
+        anchors = self._line_infos[self._cursor].anchors
+        node = self._find_node_range(self._cursor, min_size=2)
         for i in range(self._cursor - 1, -1, -1):
             parent_info = self._line_infos[i]
-            if parent_info.expandable and parent_info.key is not None:
+            if (
+                parent_info.expandable
+                and parent_info.key is not None
+                and (
+                    parent_info.key in anchors
+                    or (node is not None and i == node.start)
+                    # Preserve the existing fallback for standalone footer rows.
+                    or (not anchors and node is None)
+                )
+            ):
                 self._collapse_overrides[parent_info.key] = True
                 self._set_cursor(i, disable_follow=True)
                 return
