@@ -256,6 +256,7 @@ class AnthropicAgentNode(AgentNode):
                     anthropic.APIStatusError,
                     httpx2.TransportError,
                     httpx2.HTTPStatusError,
+                    UnicodeDecodeError,
                 ) as e:
                     is_retriable: bool = False
                     is_connection: bool = False
@@ -275,7 +276,12 @@ class AnthropicAgentNode(AgentNode):
                     if isinstance(e, httpx2.TransportError) and not isinstance(e, httpx2.ProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, (anthropic.APIConnectionError, httpx2.RemoteProtocolError)):
+                    if isinstance(e, (
+                        anthropic.APIConnectionError,
+                        httpx2.RemoteProtocolError,
+                        # Retry if EOF truncates a UTF-8 character or an SSE event contains invalid UTF-8.
+                        UnicodeDecodeError,
+                    )):
                         is_retriable = True
                         is_connection = True
                     
