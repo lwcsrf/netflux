@@ -221,7 +221,7 @@ class SingleTreeConsoleController(SessionController):
             return False
 
         if key == "c":
-            copied, message = self._renderer.copy_terminal_result_with_feedback()
+            copied, message = self._renderer.copy_selected_text_with_feedback()
             if not copied and message:
                 self._set_flash_message(message)
             return False

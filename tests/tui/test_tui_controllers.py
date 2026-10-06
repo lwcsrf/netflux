@@ -364,7 +364,7 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         self.assertIn("q:quit", frame)
         self.assertTrue(controller.should_exit())
 
-    def test_copy_result_failure_shows_clipboard_install_hint(self) -> None:
+    def test_copy_selected_failure_shows_clipboard_install_hint(self) -> None:
         fn = _make_code_function("done")
         runtime = Runtime([fn], client_factories={})
         cancel_event = mp.Event()
@@ -378,11 +378,12 @@ class TestSingleTreeConsoleController(unittest.TestCase):
 
         with patch.object(
             renderer,
-            "copy_terminal_result_with_feedback",
+            "copy_selected_text_with_feedback",
             return_value=(False, "Clipboard unavailable. Install wl-copy, xclip, or xsel."),
-        ):
+        ) as copy_mock:
             self.assertFalse(controller.handle_key("c"))
 
+        copy_mock.assert_called_once_with()
         frame = _strip_ansi(controller.render_frame(TerminalSize(columns=140, lines=10), tick=0))
         self.assertIn("Install wl-copy, xclip, or xsel", frame.splitlines()[-1])
 
@@ -1510,10 +1511,10 @@ class TestTUIState(unittest.TestCase):
         rendered = tui.render_frame(TerminalSize(columns=100, lines=15), tick=0)
         bottom_bar = _strip_ansi(rendered.splitlines()[-1])
 
-        self.assertRegex(bottom_bar, r"(^|  )c(?:(:copy result|:copy)|  )")
+        self.assertRegex(bottom_bar, r"(^|  )c(?:(:copy selected|:copy)|  )")
         self.assertRegex(bottom_bar, r"(^|  )r(?:(:show result|:result)|  )")
 
-    def test_copy_result_failure_shows_clipboard_install_hint_in_bottom_bar(self) -> None:
+    def test_copy_selected_failure_shows_clipboard_install_hint_in_bottom_bar(self) -> None:
         fn = _make_code_function("done")
         runtime = Runtime([fn], client_factories={})
         renderer = ConsoleRender(cancel_event=mp.Event())
@@ -1536,11 +1537,12 @@ class TestTUIState(unittest.TestCase):
 
         with patch.object(
             renderer,
-            "copy_terminal_result_with_feedback",
+            "copy_selected_text_with_feedback",
             return_value=(False, "Clipboard unavailable. Install wl-copy, xclip, or xsel."),
-        ):
+        ) as copy_mock:
             self.assertFalse(tui.handle_key("c"))
 
+        copy_mock.assert_called_once_with()
         rendered = tui.render_frame(TerminalSize(columns=140, lines=15), tick=0)
         bottom_bar = _strip_ansi(rendered.splitlines()[-1])
 

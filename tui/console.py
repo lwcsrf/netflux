@@ -161,7 +161,8 @@ def _copy_text_to_clipboard_windows(text: str) -> bool:
     user32.SetClipboardData.argtypes = [wintypes.UINT, ctypes.c_void_p]
     user32.SetClipboardData.restype = ctypes.c_void_p
 
-    size = (len(text) + 1) * ctypes.sizeof(ctypes.c_wchar)
+    buffer = ctypes.create_unicode_buffer(text)
+    size = ctypes.sizeof(buffer)
     handle = kernel32.GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, size)
     if not handle:
         return False
@@ -172,7 +173,6 @@ def _copy_text_to_clipboard_windows(text: str) -> bool:
         return False
 
     try:
-        buffer = ctypes.create_unicode_buffer(text)
         ctypes.memmove(locked, ctypes.addressof(buffer), size)
     finally:
         kernel32.GlobalUnlock(handle)
@@ -320,14 +320,16 @@ def _strip_ansi(text: str) -> str:
     return _RE_COMPLETE_CSI.sub("", text)
 
 
-def _short_repr(value: Any, max_len: int = 40) -> str:
+def _short_repr(
+    value: Any, max_len: int = 40, *, fallback_text: str | None = None,
+) -> str:
     """Short string representation, truncated if needed."""
     if isinstance(value, ImageResult):
         return _preview_text(value.status, max_len)
     try:
         s = repr(value)
     except Exception:
-        s = str(value)
+        s = fallback_text if fallback_text is not None else str(value)
     if len(s) > max_len:
         return s[: max_len - 3] + "..."
     return s
@@ -344,13 +346,18 @@ def _format_args(
     inputs: dict[str, Any],
     max_len: int = 800,
     per_val_len: int = 120,
+    *,
+    input_texts: Mapping[str, str | None] | None = None,
 ) -> str:
     """Format function arguments as a compact string."""
     if not inputs:
         return ""
     rendered: list[tuple[str, str]] = []
     for k, v in inputs.items():
-        rendered_val = _short_repr(v, per_val_len)
+        rendered_val = _short_repr(
+            v, per_val_len,
+            fallback_text=input_texts.get(k) if input_texts is not None else None,
+        )
         rendered.append((k, rendered_val))
     rendered.sort(key=lambda kv: len(kv[1]))
     items = [f"{k}={val}" for k, val in rendered]
@@ -493,6 +500,10 @@ class LineInfo:
     is_agent_header: bool = False
     toggle_col: int | None = None
     anchors: tuple[str, ...] = ()
+    # Source text of the selected element, shared by all its display rows.
+    # Function headers retain sections and join them only when copied.
+    # None means unavailable; an empty string is a valid clipboard payload.
+    copy_text: str | _FunctionCopyText | None = None
 
 
 @dataclass
@@ -513,10 +524,68 @@ class _RenderedBlockLine:
 
 
 @dataclass(frozen=True)
-class _RootResultTarget:
+class _NodeOutcomeTarget:
     key: str
-    display_text: str
-    copy_text: str
+    text: str
+
+
+@dataclass(frozen=True)
+class _FunctionCopyText:
+    sections: tuple[tuple[str, str], ...]
+
+    def to_text(self) -> str:
+        return "\n\n".join(f"{label}:\n{text}" for label, text in self.sections)
+
+
+def _node_outcome_target(view: NodeView) -> _NodeOutcomeTarget | None:
+    """Resolve the outcome displayed for a node, independently of selection."""
+    if view.state in (NodeState.Error, NodeState.Canceled):
+        if view.exception is None:
+            return None
+        prefix = "ae" if view.fn.is_agent() else "ce"
+        return _NodeOutcomeTarget(f"{prefix}:{view.id}", str(view.exception))
+    if view.state is not NodeState.Success:
+        return None
+    if view.fn.is_agent():
+        for idx in range(len(view.transcript) - 1, -1, -1):
+            part = view.transcript[idx]
+            if isinstance(part, ModelTextPart):
+                return _NodeOutcomeTarget(f"tp:{view.id}:{idx}:model", part.text)
+        prefix = "ao"
+    else:
+        prefix = "cr"
+    if view.outputs is None:
+        return None
+    return _NodeOutcomeTarget(f"{prefix}:{view.id}", _output_text(view.outputs))
+
+
+def _function_copy_text(
+    inputs: Mapping[str, str | None],
+    outcome: str | None,
+    *,
+    outcome_label: str = "result",
+) -> _FunctionCopyText | None:
+    """Share captured source strings without duplicating large values on redraw."""
+    sections: list[tuple[str, str]] = []
+    for name, text in inputs.items():
+        if text is None:
+            return None
+        sections.append((name, text))
+    if outcome is not None:
+        sections.append((outcome_label, outcome))
+    return _FunctionCopyText(tuple(sections)) if sections else None
+
+
+def _argument_texts(inputs: Mapping[str, Any]) -> dict[str, str | None]:
+    """Convert each argument once for both its header copy and detail rows."""
+    texts: dict[str, str | None] = {}
+    for name, value in inputs.items():
+        try:
+            texts[name] = _output_text(value)
+        except Exception:
+            # Preserve repr-based previews when complete text is unavailable.
+            texts[name] = None
+    return texts
 
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -623,69 +692,51 @@ class ConsoleRender:
     def _is_collapsed(self, key: str, default: bool) -> bool:
         return self._collapse_overrides.get(key, default)
 
-    def _terminal_root_result_target_locked(self) -> _RootResultTarget | None:
+    def _terminal_root_result_target_locked(self) -> _NodeOutcomeTarget | None:
         view = self._last_view
-        if view is None or view.state is not NodeState.Success:
+        try:
+            return _node_outcome_target(view) if view is not None else None
+        except Exception:
+            # A value may have a usable repr for its preview but a failing str.
             return None
-
-        if view.fn.is_agent():
-            for idx in range(len(view.transcript) - 1, -1, -1):
-                part = view.transcript[idx]
-                if isinstance(part, ModelTextPart):
-                    copy_text = _output_text(view.outputs) if view.outputs is not None else part.text
-                    return _RootResultTarget(
-                        key=f"tp:{view.id}:{idx}:model",
-                        display_text=part.text,
-                        copy_text=copy_text,
-                    )
-            if view.outputs is None:
-                return None
-            rendered = _output_text(view.outputs)
-            return _RootResultTarget(
-                key=f"ao:{view.id}",
-                display_text=rendered,
-                copy_text=rendered,
-            )
-
-        if view.outputs is None:
-            return None
-
-        rendered = _output_text(view.outputs)
-        return _RootResultTarget(
-            key=f"cr:{view.id}",
-            display_text=rendered,
-            copy_text=rendered,
-        )
 
     def _rendered_root_result_lines_locked(
         self,
+        view: NodeView,
+        target: _NodeOutcomeTarget | None,
         key: str,
-        text: str,
         content_prefix: str,
     ) -> list[_RenderedBlockLine] | None:
-        target = self._terminal_root_result_target_locked()
+        if view.id != self._root_id or view.state is not NodeState.Success:
+            return None
         if target is None or target.key != key:
             return None
         if (
-            self._last_view is not None
-            and isinstance(self._last_view.outputs, ImageResult)
-            and key in (f"ao:{self._last_view.id}", f"cr:{self._last_view.id}")
+            isinstance(view.outputs, ImageResult)
+            and key in (f"ao:{view.id}", f"cr:{view.id}")
         ):
             # Use plain result rows for images; final assistant text still uses Markdown.
             return None
         width = max(1, self._cols - _visible_len(content_prefix))
-        return _render_markdown_lines(text, width=width)
+        return _render_markdown_lines(target.text, width=width)
 
-    def copy_terminal_result(self) -> bool:
-        success, _ = self.copy_terminal_result_with_feedback()
+    def _selected_copy_text_locked(self) -> str | _FunctionCopyText | None:
+        if 0 <= self._cursor < len(self._line_infos):
+            return self._line_infos[self._cursor].copy_text
+        return None
+
+    def copy_selected_text(self) -> bool:
+        success, _ = self.copy_selected_text_with_feedback()
         return success
 
-    def copy_terminal_result_with_feedback(self) -> tuple[bool, str | None]:
+    def copy_selected_text_with_feedback(self) -> tuple[bool, str | None]:
         with self._lock:
-            target = self._terminal_root_result_target_locked()
-        if target is None:
+            text = self._selected_copy_text_locked()
+        if text is None:
             return False, None
-        if _copy_text_to_clipboard(target.copy_text):
+        if isinstance(text, _FunctionCopyText):
+            text = text.to_text()
+        if _copy_text_to_clipboard(text):
             return True, None
         return False, _clipboard_copy_failure_message()
 
@@ -775,9 +826,20 @@ class ConsoleRender:
         if self._toggle_line_locked(self._cursor):
             return
 
+        anchors = self._line_infos[self._cursor].anchors
+        node = self._find_node_range(self._cursor, min_size=2)
         for i in range(self._cursor - 1, -1, -1):
             parent_info = self._line_infos[i]
-            if parent_info.expandable and parent_info.key is not None:
+            if (
+                parent_info.expandable
+                and parent_info.key is not None
+                and (
+                    parent_info.key in anchors
+                    or (node is not None and i == node.start)
+                    # Preserve the existing fallback for standalone footer rows.
+                    or (not anchors and node is None)
+                )
+            ):
                 self._collapse_overrides[parent_info.key] = True
                 self._set_cursor(i, disable_follow=True)
                 return
@@ -988,7 +1050,7 @@ class ConsoleRender:
             "collapse_agent": self.collapse_enclosing_agent,
             "expand_all": self.expand_all_nodes,
             "collapse_all": self.collapse_all_nodes,
-            "copy_result": self.copy_terminal_result,
+            "copy_result": self.copy_selected_text,
             "focus_result": self.focus_terminal_result,
         }
         handler = action_map.get(action)
@@ -1040,7 +1102,7 @@ class ConsoleRender:
             can_jump_agents=can_jump,
             follow_mode=self._follow_mode,
             is_terminal=is_terminal,
-            can_copy_root_result=result_target is not None,
+            can_copy_selected_text=self._selected_copy_text_locked() is not None,
             can_focus_root_result=result_target is not None,
         )
 
@@ -1197,7 +1259,7 @@ class ConsoleRender:
             or has_usage
             or has_result
             or has_error
-            or (not is_agent and has_inputs)
+            or has_inputs
         )
         if nv.fn.is_code():
             has_details = True
@@ -1205,6 +1267,23 @@ class ConsoleRender:
         # Defaults: agents expanded, code functions collapsed
         default_collapsed = not is_agent
         collapsed = self._is_collapsed(key, default_collapsed)
+
+        input_texts = _argument_texts(nv.inputs)
+        try:
+            outcome = _node_outcome_target(nv)
+            copy_text = _function_copy_text(
+                input_texts,
+                outcome.text if outcome is not None else None,
+                outcome_label=(
+                    "canceled" if nv.state is NodeState.Canceled
+                    else "error" if nv.state is NodeState.Error
+                    else "result"
+                ),
+            )
+        except Exception:
+            # Clipboard-only formatting must not break a valid collapsed preview.
+            outcome = None
+            copy_text = None
 
         # ── Header line ──────────────────────────────────────────────────
 
@@ -1218,13 +1297,9 @@ class ConsoleRender:
 
         # Summary / inline content
         if collapsed:
-            parts = self._build_collapsed_summary(nv, has_children, is_agent)
+            parts = self._build_collapsed_summary(nv, has_children, is_agent, input_texts, outcome)
             if parts:
                 header += f" {_color(' | '.join(parts), dim=True)}"
-        elif is_agent and nv.inputs:
-            args_inline = _format_args(nv.inputs, max_len=140, per_val_len=50)
-            if args_inline:
-                header += f"({_color(args_inline, dim=True)})"
 
         # Emit header
         if depth > 0:
@@ -1244,6 +1319,7 @@ class ConsoleRender:
                 is_agent_header=is_agent,
                 toggle_col=_visible_index_of_any(line_text, {FOLD, UNFOLD}),
                 anchors=anchors,
+                copy_text=copy_text,
             )
         )
 
@@ -1270,9 +1346,11 @@ class ConsoleRender:
         detail_prefix = child_prefix + "│    "
         content_prefix = child_prefix + "│      "
 
+        self._emit_arguments(nv, input_texts, detail_prefix, content_prefix, lines, infos)
         if is_agent:
             self._emit_agent_details(
                 nv,
+                outcome,
                 child_prefix,
                 detail_prefix,
                 content_prefix,
@@ -1285,6 +1363,7 @@ class ConsoleRender:
         else:
             self._emit_code_details(
                 nv,
+                outcome,
                 detail_prefix,
                 content_prefix,
                 lines,
@@ -1348,11 +1427,13 @@ class ConsoleRender:
         nv: NodeView,
         has_children: bool,
         is_agent: bool,
+        input_texts: Mapping[str, str | None],
+        outcome: _NodeOutcomeTarget | None,
     ) -> list[str]:
         """Return summary fragments for a collapsed node."""
         parts: list[str] = []
         if is_agent and nv.inputs:
-            args = _format_args(nv.inputs, max_len=100, per_val_len=40)
+            args = _format_args(nv.inputs, max_len=100, per_val_len=40, input_texts=input_texts)
             if args:
                 parts.append(args)
         if has_children:
@@ -1364,20 +1445,32 @@ class ConsoleRender:
             if n_agent_fns:
                 parts.append(f"{n_agent_fns} AgentFn")
         if not is_agent and nv.inputs:
-            args = _format_args(nv.inputs, max_len=80, per_val_len=40)
+            args = _format_args(nv.inputs, max_len=80, per_val_len=40, input_texts=input_texts)
             if args:
                 parts.append(args)
-        if _has_output(nv):
-            parts.append(f"=> {_short_repr(nv.outputs, 50)}")
+        preview_value = nv.outputs
+        if is_agent and nv.state is NodeState.Success:
+            preview_value = next(
+                (part.text for part in reversed(nv.transcript) if isinstance(part, ModelTextPart)),
+                nv.outputs,
+            )
+        if nv.state is NodeState.Success and preview_value is not None:
+            preview = _short_repr(
+                preview_value, 50,
+                fallback_text=outcome.text if outcome is not None else None,
+            )
+            parts.append(f"=> {preview}")
         elif _has_error(nv):
+            error_text = outcome.text if outcome is not None else str(nv.exception)
             parts.append(
                 f"{_color('!!', fg='red', bold=True)} "
-                f"{_short_repr(str(nv.exception), 50)}"
+                f"{_short_repr(error_text, 50)}"
             )
         elif nv.state is NodeState.Canceled and nv.exception is not None:
+            error_text = outcome.text if outcome is not None else str(nv.exception)
             parts.append(
                 f"{_color('CANCEL', fg='yellow', bold=True)} "
-                f"{_short_repr(str(nv.exception), 50)}"
+                f"{_short_repr(error_text, 50)}"
             )
         return parts
 
@@ -1406,6 +1499,7 @@ class ConsoleRender:
         dim: bool = False,
         bold: bool = False,
         anchors: tuple[str, ...] = (),
+        copy_text: str | None = None,
     ) -> None:
         """Append a content line, wrapping to fit within the terminal width.
 
@@ -1420,14 +1514,14 @@ class ConsoleRender:
 
         if len(raw_text) <= avail:
             lines.append(f"{prefix}{_color(raw_text, fg=fg, dim=dim, bold=bold)}")
-            infos.append(LineInfo(anchors=anchors))
+            infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
             return
 
         pos = 0
         while pos < len(raw_text):
             chunk = raw_text[pos : pos + avail]
             lines.append(f"{prefix}{_color(chunk, fg=fg, dim=dim, bold=bold)}")
-            infos.append(LineInfo(anchors=anchors))
+            infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
             pos += avail
 
     # ── Shared detail-rendering helpers ───────────────────────────────────
@@ -1443,16 +1537,20 @@ class ConsoleRender:
         fg: str | None = None,
         dim: bool = False,
         anchors: tuple[str, ...] = (),
+        copy_text: str | None = None,
     ) -> None:
         """Emit a block of text lines with optional truncation."""
         emitted = text_lines if max_lines is None else text_lines[:max_lines]
         for tl in emitted:
-            self._append_content(tl, prefix, lines, infos, fg=fg, dim=dim, anchors=anchors)
+            self._append_content(
+                tl, prefix, lines, infos, fg=fg, dim=dim,
+                anchors=anchors, copy_text=copy_text,
+            )
         if max_lines is not None and len(text_lines) > max_lines:
             lines.append(
                 f"{prefix}{_color(f'... ({len(text_lines)} lines total)', dim=True)}"
             )
-            infos.append(LineInfo(anchors=anchors))
+            infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
 
     def _emit_rendered_block(
         self,
@@ -1462,6 +1560,7 @@ class ConsoleRender:
         infos: list[LineInfo],
         *,
         anchors: tuple[str, ...] = (),
+        copy_text: str | None = None,
     ) -> None:
         for rendered_line in rendered_lines:
             if rendered_line.styled_text is not None:
@@ -1470,7 +1569,7 @@ class ConsoleRender:
                 if _visible_len(styled_text) > avail:
                     styled_text = _crop_line(styled_text, avail)
                 lines.append(f"{prefix}{styled_text}")
-                infos.append(LineInfo(anchors=anchors))
+                infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
                 continue
             self._append_content(
                 rendered_line.text,
@@ -1481,11 +1580,13 @@ class ConsoleRender:
                 dim=rendered_line.dim,
                 bold=rendered_line.bold,
                 anchors=anchors,
+                copy_text=copy_text,
             )
 
     def _emit_kv_pairs(
         self,
         inputs: dict[str, Any],
+        input_texts: Mapping[str, str | None],
         header_prefix: str,
         value_prefix: str,
         lines: list[str],
@@ -1496,13 +1597,20 @@ class ConsoleRender:
     ) -> None:
         """Emit key-value pairs, using multi-line display for long values."""
         for k, v in inputs.items():
-            val_str = str(v)
+            val_str = input_texts[k]
+            if val_str is None:
+                lines.append(
+                    f"{header_prefix}{_color(ARGS_GLYPH + ' ' + k + ': ', fg='cyan')}"
+                    f"{_color(_short_repr(v, 100), dim=True)}"
+                )
+                infos.append(LineInfo(anchors=anchors))
+                continue
             val_lines = val_str.splitlines()
             if len(val_lines) > 1 or len(val_str) > 100:
                 lines.append(
                     f"{header_prefix}{_color(ARGS_GLYPH + ' ' + k + ':', fg='cyan')}"
                 )
-                infos.append(LineInfo(anchors=anchors))
+                infos.append(LineInfo(anchors=anchors, copy_text=val_str))
                 self._emit_content_block(
                     val_lines,
                     value_prefix,
@@ -1511,6 +1619,7 @@ class ConsoleRender:
                     max_lines=max_lines,
                     dim=True,
                     anchors=anchors,
+                    copy_text=val_str,
                 )
             else:
                 lines.append(
@@ -1518,7 +1627,7 @@ class ConsoleRender:
                     f"{_color(ARGS_GLYPH + ' ' + k + ': ', fg='cyan')}"
                     f"{_color(val_str, dim=True)}"
                 )
-                infos.append(LineInfo(anchors=anchors))
+                infos.append(LineInfo(anchors=anchors, copy_text=val_str))
 
     def _preview_for_header(
         self,
@@ -1598,6 +1707,7 @@ class ConsoleRender:
                 default_collapsed=True,
                 toggle_col=_visible_index_of_any(label, {FOLD, UNFOLD}),
                 anchors=(key,),
+                copy_text=text,
             )
         )
         if not collapsed:
@@ -1612,6 +1722,7 @@ class ConsoleRender:
                     fg=content_fg,
                     dim=content_dim,
                     anchors=(key,),
+                    copy_text=text,
                 )
             else:
                 self._emit_rendered_block(
@@ -1620,6 +1731,7 @@ class ConsoleRender:
                     lines,
                     infos,
                     anchors=(key,),
+                    copy_text=text,
                 )
 
     def _emit_value_part(
@@ -1661,6 +1773,7 @@ class ConsoleRender:
                 default_collapsed=True,
                 toggle_col=_visible_index_of_any(line, {FOLD, UNFOLD}),
                 anchors=(key,),
+                copy_text=text,
             )
         )
         if not collapsed:
@@ -1673,6 +1786,7 @@ class ConsoleRender:
                     max_lines=None,
                     dim=True,
                     anchors=(key,),
+                    copy_text=text,
                 )
             else:
                 self._emit_rendered_block(
@@ -1681,6 +1795,7 @@ class ConsoleRender:
                     lines,
                     infos,
                     anchors=(key,),
+                    copy_text=text,
                 )
 
     def _emit_synthetic_function_row(
@@ -1697,6 +1812,18 @@ class ConsoleRender:
         infos: list[LineInfo],
     ) -> None:
         key = f"fncall:{node_id}:{invocation_id}"
+        input_texts = _argument_texts(args or {})
+        result_text = None
+        try:
+            if result_part is not None:
+                result_text = _output_text(result_part.outputs)
+            copy_text = _function_copy_text(
+                input_texts,
+                result_text,
+                outcome_label="error" if result_part is not None and result_part.is_error else "result",
+            )
+        except Exception:
+            copy_text = None
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
 
@@ -1710,14 +1837,17 @@ class ConsoleRender:
             status = "completed"
             status_fg = "green"
 
-        args_preview = _format_args(args or {}, max_len=90, per_val_len=40)
+        args_preview = _format_args(args or {}, max_len=90, per_val_len=40, input_texts=input_texts)
         suffix = f" ({args_preview})" if args_preview else ""
         if result_part is None:
             result_preview = ""
-        elif result_part.is_error:
-            result_preview = f" {_color('!!', fg='red', bold=True)} {_short_repr(result_part.outputs, 60)}"
         else:
-            result_preview = f" {_color('=>', dim=True)} {_short_repr(result_part.outputs, 60)}"
+            marker = (
+                _color('!!', fg='red', bold=True) if result_part.is_error
+                else _color('=>', dim=True)
+            )
+            preview = _short_repr(result_part.outputs, 60, fallback_text=result_text)
+            result_preview = f" {marker} {preview}"
 
         header = f"{indicator} {FUNCTION_GLYPH} {function_name} [{status}]{suffix}{result_preview}"
         line = f"{detail_prefix}{_color(header, fg=status_fg)}"
@@ -1729,6 +1859,7 @@ class ConsoleRender:
                 default_collapsed=True,
                 toggle_col=_visible_index_of_any(line, {FOLD, UNFOLD}),
                 anchors=(key,),
+                copy_text=copy_text,
             )
         )
 
@@ -1738,6 +1869,7 @@ class ConsoleRender:
         if args:
             self._emit_kv_pairs(
                 args,
+                input_texts,
                 content_prefix,
                 content_prefix + "  ",
                 lines,
@@ -1756,10 +1888,12 @@ class ConsoleRender:
 
         label = "error" if result_part.is_error else "result"
         color = "red" if result_part.is_error else "green"
+        if result_text is None:
+            result_text = _output_text(result_part.outputs)
         lines.append(f"{content_prefix}{_color(f'{RESULT_GLYPH} {label}:', fg=color)}")
-        infos.append(LineInfo(anchors=(key,)))
+        infos.append(LineInfo(anchors=(key,), copy_text=result_text))
         self._emit_content_block(
-            _output_text(result_part.outputs).splitlines() or [""],
+            result_text.splitlines() or [""],
             content_prefix + "  ",
             lines,
             infos,
@@ -1767,11 +1901,13 @@ class ConsoleRender:
             fg="red" if result_part.is_error else None,
             dim=not result_part.is_error,
             anchors=(key,),
+            copy_text=result_text,
         )
 
     def _emit_agent_details(
         self,
         nv: NodeView,
+        outcome: _NodeOutcomeTarget | None,
         child_prefix: str,
         detail_prefix: str,
         content_prefix: str,
@@ -1785,7 +1921,7 @@ class ConsoleRender:
         if nv.usage:
             usage_text = self._format_usage(nv.usage)
             lines.append(f"{detail_prefix}{usage_text}")
-            infos.append(LineInfo(anchors=(f"n:{nv.id}",)))
+            infos.append(LineInfo(anchors=(f"n:{nv.id}",), copy_text=_strip_ansi(usage_text)))
 
         tool_use_by_id: dict[str, ToolUsePart] = {}
         tool_result_by_id: dict[str, ToolResultPart] = {}
@@ -1888,8 +2024,9 @@ class ConsoleRender:
                     content_dim=True,
                     show_char_count=is_final_text,
                     rendered_lines=self._rendered_root_result_lines_locked(
+                        nv,
+                        outcome,
                         model_key,
-                        part.text,
                         content_prefix,
                     ),
                 )
@@ -1996,25 +2133,28 @@ class ConsoleRender:
 
         if _has_output(nv) and not has_model_text:
             result_key = f"ao:{nv.id}"
+            result_text = outcome.text if outcome is not None else _output_text(nv.outputs)
             self._emit_text_part(
                 key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
-                text=_output_text(nv.outputs),
+                text=result_text,
                 detail_prefix=detail_prefix,
                 content_prefix=content_prefix,
                 lines=lines,
                 infos=infos,
                 fg="green",
                 rendered_lines=self._rendered_root_result_lines_locked(
+                    nv,
+                    outcome,
                     result_key,
-                    _output_text(nv.outputs),
                     content_prefix,
                 ),
             )
         elif has_error_outcome:
             self._emit_error_block(
                 nv,
+                outcome,
                 detail_prefix,
                 content_prefix,
                 lines,
@@ -2022,60 +2162,83 @@ class ConsoleRender:
                 anchors=(f"ae:{nv.id}",),
             )
 
-    def _emit_code_details(
+    def _emit_arguments(
         self,
         nv: NodeView,
+        input_texts: Mapping[str, str | None],
         detail_prefix: str,
         content_prefix: str,
         lines: list[str],
         infos: list[LineInfo],
     ) -> None:
-        """Emit expanded content for a code function: args and result."""
-        if nv.inputs:
-            for arg_name, arg_value in nv.inputs.items():
-                self._emit_value_part(
-                    key=f"ca:{nv.id}:{arg_name}",
-                    title=arg_name,
-                    glyph=ARGS_GLYPH,
-                    text=str(arg_value),
-                    detail_prefix=detail_prefix,
-                    content_prefix=content_prefix,
-                    lines=lines,
-                    infos=infos,
-                    fg="cyan",
+        prefix = "aa" if nv.fn.is_agent() else "ca"
+        for arg_name, arg_value in nv.inputs.items():
+            key = f"{prefix}:{nv.id}:{arg_name}"
+            text = input_texts[arg_name]
+            if text is None:
+                lines.append(
+                    f"{detail_prefix}{_color(ARGS_GLYPH + ' ' + arg_name + ': ', fg='cyan')}"
+                    f"{_color(_short_repr(arg_value, 100), dim=True)}"
                 )
+                infos.append(LineInfo(key=key, anchors=(key,)))
+                continue
+            self._emit_value_part(
+                key=key,
+                title=arg_name,
+                glyph=ARGS_GLYPH,
+                text=text,
+                detail_prefix=detail_prefix,
+                content_prefix=content_prefix,
+                lines=lines,
+                infos=infos,
+                fg="cyan",
+            )
 
+    def _emit_code_details(
+        self,
+        nv: NodeView,
+        outcome: _NodeOutcomeTarget | None,
+        detail_prefix: str,
+        content_prefix: str,
+        lines: list[str],
+        infos: list[LineInfo],
+    ) -> None:
+        """Emit the expanded result or exception for a code function."""
         if _has_output(nv):
             result_key = f"cr:{nv.id}"
+            result_text = outcome.text if outcome is not None else _output_text(nv.outputs)
             self._emit_value_part(
                 key=result_key,
                 title="result",
                 glyph=RESULT_GLYPH,
-                text=_output_text(nv.outputs),
+                text=result_text,
                 detail_prefix=detail_prefix,
                 content_prefix=content_prefix,
                 lines=lines,
                 infos=infos,
                 fg="green",
                 rendered_lines=self._rendered_root_result_lines_locked(
+                    nv,
+                    outcome,
                     result_key,
-                    _output_text(nv.outputs),
                     content_prefix,
                 ),
             )
         elif _has_error(nv) or (nv.state is NodeState.Canceled and nv.exception is not None):
             self._emit_error_block(
                 nv,
+                outcome,
                 detail_prefix,
                 content_prefix,
                 lines,
                 infos,
-                anchors=(f"n:{nv.id}",),
+                anchors=(f"ce:{nv.id}",),
             )
 
     def _emit_error_block(
         self,
         nv: NodeView,
+        outcome: _NodeOutcomeTarget | None,
         detail_prefix: str,
         content_prefix: str,
         lines: list[str],
@@ -2086,16 +2249,20 @@ class ConsoleRender:
         is_cancel = nv.state is NodeState.Canceled
         label = "canceled" if is_cancel else "error"
         color = "yellow" if is_cancel else "red"
+        text = outcome.text if outcome is not None else (
+            str(nv.exception) if nv.exception is not None else None
+        )
         lines.append(f"{detail_prefix}{_color(f'✖ {label}:', fg=color, bold=True)}")
-        infos.append(LineInfo(anchors=anchors))
+        infos.append(LineInfo(anchors=anchors, copy_text=text))
         self._emit_content_block(
-            str(nv.exception).splitlines() if nv.exception is not None else [""],
+            text.splitlines() if text is not None else [""],
             content_prefix,
             lines,
             infos,
             max_lines=None,
             fg=color,
             anchors=anchors,
+            copy_text=text,
         )
 
     def _emit_thinking_slot(
@@ -2109,6 +2276,8 @@ class ConsoleRender:
         infos: list[LineInfo],
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
+        # Redacted content may itself be ciphertext. Signatures are never text.
+        copy_text = part.content if not part.redacted and part.content else None
 
         # Character count
         n_chars = len(part.content) if part.content else 0
@@ -2134,18 +2303,20 @@ class ConsoleRender:
                 default_collapsed=True,
                 toggle_col=_visible_index_of_any(line, {FOLD, UNFOLD}),
                 anchors=(key,),
+                copy_text=copy_text,
             )
         )
 
-        if not collapsed and part.content:
+        if not collapsed and copy_text is not None:
             self._emit_content_block(
-                part.content.splitlines(),
+                copy_text.splitlines(),
                 content_prefix,
                 lines,
                 infos,
                 max_lines=None,
                 dim=True,
                 anchors=(key,),
+                copy_text=copy_text,
             )
 
     # ── Token usage formatting ────────────────────────────────────────────
