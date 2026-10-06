@@ -276,14 +276,12 @@ class AnthropicAgentNode(AgentNode):
                     if isinstance(e, httpx2.TransportError) and not isinstance(e, httpx2.ProtocolError):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, (
-                        anthropic.APIConnectionError,
-                        httpx2.RemoteProtocolError,
-                        # Retry if EOF truncates a UTF-8 character or an SSE event contains invalid UTF-8.
-                        UnicodeDecodeError,
-                    )):
+                    if isinstance(e, (anthropic.APIConnectionError, httpx2.RemoteProtocolError)):
                         is_retriable = True
                         is_connection = True
+                    if isinstance(e, UnicodeDecodeError):
+                        # Retry if EOF truncates a UTF-8 character or an SSE event contains invalid UTF-8.
+                        is_retriable = True
                     
                     if not is_retriable or attempt >= max_attempts:
                         self._close_client()
