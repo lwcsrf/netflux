@@ -69,24 +69,15 @@ from google.genai import errors as genai_errors
     - Re-use the `Bash` and `TextEditor` functions inspired by Anthropic's spec, but you need
       to provide the full tool specs unlike Anthropic.
 
-### Multi-hop continuation (Gemini 4 Argon)
-
-* One thinking-tool cycle may span several requests (hops). CONTINUATION plus a
-  continuation_token means generation is unfinished; MAX_TOKENS exhausts our
-  output budget and is an error, even if a token is returned.
-* Reuse the original contents, system instruction, tools, and generation settings
-  on every hop, including the same total max_output_tokens. Only the latest
-  continuation_token changes; do not append partial output to contents.
-* Buffer each hop's native Parts in order, preserving signatures and boundaries.
-  At generation completion, append one combined model Content to native history,
-  project it into the netflux transcript, and then execute any tool calls.
-* Set automatic_continuation=False so we own retry policy and backoff consistently
-  and retry only the latest hop. Each outer-loop iteration is one hop; the existing
-  inner retry loop leaves earlier buffered parts and the request history intact.
-* Accumulate usage per accepted hop; context_window_in/out describe the latest hop.
-  Continuation hops publish usage immediately while their content stays buffered.
-
-Reference: https://ai.google.dev/gemini-api/docs/generate-content/long-decode
+* Multi-hop continuations; starting with Gemini 4 Argon:
+    * Long generations can now be forced to span multiple request cycles, called "hops",
+      indicated by stop_reason and continuation_token (encapsulates the multi-hop state thus far).
+    * A continuation token preserves generation state over multi-hops;
+      the next hop resumes from original input + continuation token.
+    * The outputs of multi-hop combine into one model response = one thinking-tools agent cycle.
+    * Manual continuation gives callers control over retry policy and backoff, so
+      retries can be scoped to the current hop.
+    * Ref: `https://ai.google.dev/gemini-api/docs/generate-content/long-decode`.
 """
 
 MAX_TOKENS = 131_072
