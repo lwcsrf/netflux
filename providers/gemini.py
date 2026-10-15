@@ -68,17 +68,27 @@ from google.genai import errors as genai_errors
 * No particular tool specially used in training for bash or text editor like opus.
     - Re-use the `Bash` and `TextEditor` functions inspired by Anthropic's spec, but you need
       to provide the full tool specs unlike Anthropic.
+
+* Multi-hop continuations; starting with Gemini 4 Argon:
+    * Long generations can now be forced to span multiple request cycles, called "hops",
+      indicated by stop_reason and continuation_token (encapsulates the multi-hop state thus far).
+    * A continuation token preserves generation state over multi-hops;
+      the next hop resumes from original input + continuation token.
+    * The outputs of multi-hop combine into one model response = one thinking-tools agent cycle.
+    * Manual continuation gives callers control over retry policy and backoff, so
+      retries can be scoped to the current hop.
+    * Ref: `https://ai.google.dev/gemini-api/docs/generate-content/long-decode`.
 """
 
-MAX_TOKENS = 64000
+MAX_TOKENS = 131_072
 THINKING_CFG = types.ThinkingConfig(
     thinking_level=types.ThinkingLevel.HIGH,
     # Disable Thought Summaries always: they are not useful, and we don't want to
     # accidentally allow them to be included as past thinking content ever.
     include_thoughts=False,
 )
-# Prevent agent loop runaway. Max tool call + response cycles before giving up.
-MAX_STEPS = 256
+# Prevent agent loop runaway. Max model request hops, excluding retries.
+MAX_STEPS = 768
 
 class GeminiAgentNode(AgentNode):
     """
@@ -132,11 +142,12 @@ class GeminiAgentNode(AgentNode):
 
     def append_model_text(self, text: str) -> None:
         """Coalesce adjacent nonblank text."""
-        if not text.strip():
+        if not text or len(text) == 0:
             return
         if self.transcript and isinstance(self.transcript[-1], ModelTextPart):
-            text = self.transcript[-1].text + "\n" + text
-            # Published snapshots share frozen parts, so replace rather than mutate.
+            text = self.transcript[-1].text + text
+            # Published snapshots (like NodeView) use immutable frozen Parts list
+            # but reference shared Part objects, so always replace rather than mutate.
             self.transcript[-1] = ModelTextPart(text=text)
         else:
             self.transcript.append(ModelTextPart(text=text))
@@ -186,18 +197,26 @@ class GeminiAgentNode(AgentNode):
             automatic_function_calling=types.AutomaticFunctionCallingConfig(
                 disable=True
             ),
+            # We control retries and scope the retry down to the latest continuation only.
+            automatic_continuation=False,
             thinking_config=THINKING_CFG,
             max_output_tokens=MAX_TOKENS,
         )
+        pending_parts: list[types.Part] = []   # To accumulate all parts in multi-hop cycle.
+        continuation_token: Optional[bytes] = None
 
         # Agent loop.
+        # Prior to Argon, every thinking-tools agent cycle was one iteration of this loop.
+        # Since Argon, each iteration is one "hop" within a thinking-tools agent cycle.
         for _ in range(MAX_STEPS):
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
                 self._close_client()
                 return
 
-            # One thinking-tool turn.
+            hop_config: types.GenerateContentConfig = config.model_copy(
+                update={"continuation_token": continuation_token}
+            )
             resp: types.GenerateContentResponse
             candidate: types.Candidate
             max_attempts = 8
@@ -210,13 +229,14 @@ class GeminiAgentNode(AgentNode):
                     resp = self.client.models.generate_content(
                         model=self.model,
                         contents=cast(types.ContentListUnionDict, self._history),
-                        config=config,
+                        config=hop_config,
                     )
 
-                    # Should never happen in practice. If it does, will not be retried below.
+                    # Blocked prompts can legitimately return no candidates (different than block during generation).
+                    # Not likely retriable, so raise non-retriable. Very rare in practice.
                     if not resp.candidates:
-                        # Will be converted by wrapper to ModelProviderException with more context.
-                        raise RuntimeError("Gemini returned no candidates.")
+                        raise RuntimeError(
+                            f"Gemini returned no candidates. Prompt feedback: {resp.prompt_feedback!r}")
                     candidate = resp.candidates[0]
 
                     # Todo: Use SDK enum once it's added.
@@ -240,16 +260,19 @@ class GeminiAgentNode(AgentNode):
                         types.FinishReason.SPII,
                         types.FinishReason.MALFORMED_FUNCTION_CALL,
                         types.FinishReason.UNEXPECTED_TOOL_CALL,
+                        "MALFORMED_RESPONSE",  # Not yet exposed by the SDK enum.
                     ):
                         # Force retry below. Burn one attempt.
                         force_retry = True
                         raise RuntimeError(f"Candidate finish_reason is: {candidate.finish_reason}.")
 
-                    # Workaround for an empirical issue solved by retry (observed Oct 2025).
-                    if not candidate.content and not candidate.finish_reason:
+                    # Workaround for an empirical issue solved by retry.
+                    if ((not candidate.content or not candidate.content.parts)
+                            and not candidate.finish_reason
+                            and not candidate.continuation_token):
                         # Force retry below. Burn one attempt.
                         force_retry = True
-                        raise RuntimeError(f"Response has no content and no finish_reason.")
+                        raise RuntimeError(f"Response has no content and no finish_reason and no continuation.")
 
                     break
                 except (
@@ -319,30 +342,49 @@ class GeminiAgentNode(AgentNode):
             assert resp.usage_metadata is not None, "Gemini response missing usage metadata"
             self._accumulate_usage(resp.usage_metadata)
 
-            # Sanity checks.
+            # Validate each hop before adding its parts to the pending generation.
             if candidate.content:
-                assert candidate.content.role == "model", (
-                    f"Last response role must be 'model'. Got: {candidate.content.role}") 
-            else:
-                assert candidate.finish_reason == types.FinishReason.STOP, (
-                    f"finish_reason != STOP and no content is present. "
-                    f"Got: {candidate.finish_reason} {candidate.finish_message}")
-                # No new content and we are done.
-                # Finalize with whatever is in the transcript.
+                assert candidate.content.role in (None, "model"), (
+                    f"Unexpected Gemini response role: {candidate.content.role}")
+                self._check_thoughts_sanity(candidate.content)
+            hop_parts: types.Parts = (candidate.content.parts or []) if candidate.content else []
+
+            if candidate.finish_reason == types.FinishReason.CONTINUATION or (
+                candidate.finish_reason is None and candidate.continuation_token
+            ):
+                if not candidate.continuation_token:
+                    raise RuntimeError("Gemini returned CONTINUATION without a continuation token.")
+                pending_parts.extend(hop_parts)
+                continuation_token = candidate.continuation_token
+                # Publish per-hop usage, while both transcripts wait for the complete generation.
+                self.ctx.post_transcript_update()
+                continue
+
+            if candidate.finish_reason == types.FinishReason.MAX_TOKENS:
+                raise RuntimeError(f"Gemini exhausted max_output_tokens ({MAX_TOKENS}).")
+
+            assert candidate.finish_reason == types.FinishReason.STOP or (
+                candidate.finish_reason is None and any(p.function_call for p in hop_parts)
+            ), (
+                "Expected a completed Gemini generation. "
+                f"Got: {candidate.finish_reason} {candidate.finish_message}")
+
+            # Multi-hop agent cycle is ready to proceed after this final hop.
+            pending_parts.extend(hop_parts)
+            parts: types.Parts = pending_parts
+            pending_parts = []
+            continuation_token = None
+            if not parts:
                 self.ctx.post_success(self._final_text())
                 self._close_client()
                 return
-            
-            # Thoughts are supposed to be empty (hidden) or we want to know of API change.
-            self._check_thoughts_sanity(candidate.content)           
 
-            # Always append sanitized model content (keeps history complete) for replay.
-            self._history.append(candidate.content)
+            self._history.append(types.Content(role="model", parts=parts))
 
             part: types.Part
             calls: List[types.FunctionCall] = []
             text_chunks: List[str] = []
-            for part in candidate.content.parts:  # pyright: ignore[reportOptionalIterable]
+            for part in parts:
                 thought_sig: Optional[bytes] = part.thought_signature
                 if thought_sig:
                     # Thought signatures are always recorded in transcript as ThinkingBlockPart
@@ -396,7 +438,7 @@ class GeminiAgentNode(AgentNode):
             invoke_exceptions: List[Optional[Exception]] = []    # Index to match `calls` 1:1.
             tool_use_ids: List[str] = []
             for fc in calls:
-                assert fc.name
+                assert fc.name, "Gemini returned a function call with a missing or empty name."
                 name: str = fc.name
                 tool_args: Dict[str, Any] = fc.args or {}
 
@@ -427,7 +469,7 @@ class GeminiAgentNode(AgentNode):
 
             # WaitAll + transcribe results.
             for fc, child, invoke_ex, tool_use_id in zip(calls, children, invoke_exceptions, tool_use_ids):
-                assert fc.name
+                assert fc.name, "Gemini returned a function call with a missing or empty name."
                 result: Any
                 out_text: str
                 is_error: bool
@@ -512,7 +554,7 @@ class GeminiAgentNode(AgentNode):
             self._history.append(types.Content(role="user", parts=result_parts))
 
         self._close_client()
-        raise RuntimeError(f"Gemini agent loop exceeded MAX_STEPS ({MAX_STEPS}) "
+        raise RuntimeError(f"Gemini agent loop exceeded MAX_STEPS ({MAX_STEPS} model hops) "
                            "without producing a final response.")
 
     def _accumulate_usage(self, usage: types.GenerateContentResponseUsageMetadata):

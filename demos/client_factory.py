@@ -17,7 +17,7 @@ httpx_limits = httpx2.Limits(
 )
 httpx_timeout = httpx2.Timeout(
     connect=10.0,
-    read=900.0,  # allow long synchronous reasoning responses
+    read=1200.0,  # allow long synchronous reasoning responses
     write=120.0,
     pool=10.0,
 )
@@ -57,9 +57,8 @@ def anthropic_client_factory(): # -> anthropic.Anthropic
         # default in httpx2; leave unless you need to disable env proxies:
         # trust_env=False,
     )
-    # We have our own retry layer, but Anthropic may have different
-    # or more informed retry criteria, so also use a small number of retries here.
-    max_retries = 1
+    # We have our own retry layer in the provider.
+    max_retries = 0
 
     return anthropic.Anthropic(api_key=key, http_client=http_client, max_retries=max_retries)
 
@@ -70,10 +69,9 @@ def gemini_client_factory(): # -> genai.Client
 
     key = _read_key("gemini.key")
 
-    # We have our own retry layer, but Gemini SDK may have different
-    # or more informed retry criteria, so also use a small number of retries here.
+    # We have our own retry layer.
     sdk_retry = types.HttpRetryOptions(
-        attempts=2,             # total attempts = (1 original + 1 retry)
+        attempts=1,             # total attempts
         initial_delay=1.0,      # seconds
         max_delay=5.0,          # seconds (our provider retry layer has longer max)
         exp_base=2.0,
@@ -85,8 +83,8 @@ def gemini_client_factory(): # -> genai.Client
         # api_version="v1",  # uncomment to pin to stable
         httpx_client=http_client,
         retry_options=sdk_retry,
-        # Avoid setting HttpOptions.timeout here so we don't override the fine-grained HTTPX timeouts.
-        # If you *do* set it, it will be used as the request timeout AND send X-Server-Timeout.
+        # Required in addition to httpx_timeout.
+        timeout=1_200_000,
     )
 
     return genai.Client(api_key=key, http_options=http_options)
