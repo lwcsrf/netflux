@@ -865,6 +865,14 @@ class AgentNode(Node):
             backoff_seconds=backoff_seconds,
             backoff_started_at=time.time() if backoff_seconds is not None else None,
         ))
+        retry = (
+            f"scheduled backoff {backoff_seconds:g}s"
+            if backoff_seconds is not None else "immediate retry, no backoff"
+        )
+        logger.error(
+            "Node %s (%s) retriable exception (attempt %s, %s): %s",
+            self.id, self.fn.name, attempt, retry, _format_exception_for_log(exception),
+        )
 
     def record_continuation(self) -> None:
         """Record a Continuation in the agent loop."""
@@ -1042,3 +1050,11 @@ class CancellationException(Exception):
     def __init__(self, message: str = "Operation was canceled (no reason provided)"):
         super().__init__(message)
 
+
+def _format_exception_for_log(exception: Exception) -> str:
+    """Include the exception type and tolerate an unavailable message."""
+    try:
+        message = str(exception)
+    except Exception:
+        message = "(message unavailable)"
+    return f"{type(exception).__name__}: {message}"

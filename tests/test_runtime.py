@@ -1406,8 +1406,8 @@ class TestRuntimeStateTransitions(unittest.TestCase):
 
     def test_post_exception_sets_exception_and_logs(self) -> None:
         runtime, node = self._make_runtime_with_dummy_node(node_id=3)
-        exc = RuntimeError("boom")
-        with self.assertLogs(level=logging.ERROR) as captured:
+        exc = RuntimeError("boom\nmore detail")
+        with self.assertLogs("netflux.runtime", level=logging.ERROR) as captured:
             runtime.post_exception(node, exc)
         self.assertEqual(node.state, NodeState.Error)
         self.assertIs(node.exception, exc)
@@ -1415,7 +1415,13 @@ class TestRuntimeStateTransitions(unittest.TestCase):
         view = runtime.get_view(node.id)
         self.assertEqual(view.state, NodeState.Error)
         self.assertIs(view.exception, exc)
-        self.assertTrue(any("boom" in msg for msg in captured.output))
+        record, = captured.records
+        self.assertEqual(
+            record.getMessage(),
+            f"Node {node.id} ({node.fn.name}) ended with exception: RuntimeError: boom\nmore detail",
+        )
+        self.assertIsNone(record.exc_info)
+        self.assertEqual(str(exc), "boom\nmore detail")
 
     def test_post_cancel_sets_canceled_state(self) -> None:
         runtime, node = self._make_runtime_with_dummy_node(node_id=4)

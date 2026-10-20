@@ -28,6 +28,7 @@ from .core import (
     ModelTextPart,
     ToolUsePart,
     ToolResultPart,
+    _format_exception_for_log,
 )
 from .providers import Provider, get_AgentNode_impl
 
@@ -552,7 +553,10 @@ class Runtime:
             node.done.set()
 
         # Log immediately so there is trace of it even if consumer never collects .result()
-        logger.error(f"Node {node.id} ({node.fn.name}) ended with exception: {exception}")
+        logger.error(
+            "Node %s (%s) ended with exception: %s",
+            node.id, node.fn.name, _format_exception_for_log(exception),
+        )
 
     def post_cancel(
         self,
