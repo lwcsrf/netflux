@@ -169,12 +169,13 @@ all outcomes. Each starts collapsed:
 
 - retries: red `▸ 🧰 ExceptionType | attempt N | message…`, with zero-based attempts
   and a single-line preview; expanding shows the full message,
-- continuations: dim thinking-style `▸ ↪ continuation`,
-- scheduled backoffs: dim thinking-style `▸ ⏱️ backoff elapsed / total` below the
+- continuations: dim thinking-style `▸ ↪️ continuation`,
+- scheduled backoffs: dim thinking-style `▸ 🕒 backoff elapsed / total` below the
   retry, visible independently of its collapse state.
 
 Continuation/backoff expansion changes only the arrow. Status, arrow, and emoji
-columns stay aligned with sibling rows; only active backoffs show a spinner.
+columns stay aligned with sibling rows. Their arrows and labels are dim; their
+emoji are undimmed. Only active backoffs show a bold cyan, undimmed spinner.
 Completion leaves the status slot blank. Backoff timing uses the recorded start
 and interval, with `ended_at` as the cancellation cutoff: interrupted waits show
 canceled; completed waits stay completed. Providers also publish an update after completed waits.

@@ -2043,7 +2043,7 @@ class ConsoleRender:
         key = f"event:{nv.id}:{event_index}"
         if isinstance(event, Continuation):
             self._emit_thinking_slot(
-                key=key, title="continuation", glyph="↪",
+                key=key, title="continuation", glyph="↪️", glyph_dim=False,
                 detail_prefix=detail_prefix, content_prefix=content_prefix,
                 lines=lines, infos=infos,
             )
@@ -2102,7 +2102,7 @@ class ConsoleRender:
             if elapsed < duration:
                 status = _SPINNER_FRAMES[tick % len(_SPINNER_FRAMES)]
         self._emit_thinking_slot(
-            key=f"{key}:backoff", title=backoff_text, glyph="⏱️", status=status,
+            key=f"{key}:backoff", title=backoff_text, glyph="🕒", glyph_dim=False, status=status,
             detail_prefix=detail_prefix, content_prefix=content_prefix,
             lines=lines, infos=infos,
         )
@@ -2527,6 +2527,7 @@ class ConsoleRender:
         infos: list[LineInfo],
         title: str = "thinking",
         glyph: str = THINKING,
+        glyph_dim: bool = True,
         status: str = "",
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
@@ -2543,12 +2544,18 @@ class ConsoleRender:
         if collapsed:
             preview = _preview_text(copy_text or "", 60)
             preview_part = f": {preview}" if preview else ""
-        text = f"{indicator} {glyph} {title}{preview_part}{char_info}"
+        # Reserve the same glyph width for thinking, continuation, and backoff.
+        glyph_slot = glyph + " " * max(0, cell_len(THINKING) - cell_len(glyph))
+        text = (
+            f"{_color(indicator, dim=True)} "
+            f"{_color(glyph_slot, dim=glyph_dim)} "
+            f"{_color(f'{title}{preview_part}{char_info}', dim=True)}"
+        )
 
         # Details already reserve the two columns preceding the fold arrow.
         if status:
-            detail_prefix = f"{detail_prefix[:-2]}{_color(status, fg='cyan')} "
-        line = f"{detail_prefix}{_color(text, dim=True)}"
+            detail_prefix = f"{detail_prefix[:-2]}{_color(status, fg='cyan', bold=True)} "
+        line = f"{detail_prefix}{text}"
         lines.append(line)
         infos.append(
             LineInfo(

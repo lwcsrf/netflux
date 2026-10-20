@@ -145,10 +145,10 @@ class TestConsoleRender(unittest.TestCase):
             replace(event, attempt=2),
         )
         cases = (
-            (NodeState.Running, None, 106, "│  ⠋ ▸ ⏱️ backoff 3.0s / 5.0s"),
-            (NodeState.Running, None, 108, "│    ▸ ⏱️ backoff 5.0s / 5.0s"),
-            (NodeState.Canceled, 107, 200, "│    ▸ ⏱️ backoff canceled (5.0s)"),
-            (NodeState.Canceled, 109, 106, "│    ▸ ⏱️ backoff 5.0s / 5.0s"),
+            (NodeState.Running, None, 106, "│  ⠋ ▸ 🕒 backoff 3.0s / 5.0s"),
+            (NodeState.Running, None, 108, "│    ▸ 🕒 backoff 5.0s / 5.0s"),
+            (NodeState.Canceled, 107, 200, "│    ▸ 🕒 backoff canceled (5.0s)"),
+            (NodeState.Canceled, 109, 106, "│    ▸ 🕒 backoff 5.0s / 5.0s"),
         )
         for state, ended_at, now, expected in cases:
             with self.subTest(state=state, ended_at=ended_at):
@@ -160,7 +160,7 @@ class TestConsoleRender(unittest.TestCase):
                         info.key: _strip_ansi(line)
                         for info, line in zip(renderer._line_infos, renderer._lines) if info.key
                     }
-                    self.assertEqual(rows["event:1:0:backoff"], "│    ▸ ⏱️ backoff 2.0s / 2.0s")
+                    self.assertEqual(rows["event:1:0:backoff"], "│    ▸ 🕒 backoff 2.0s / 2.0s")
                     self.assertNotIn("event:1:1:backoff", rows)
                     row = next(i for i, info in enumerate(renderer._line_infos) if info.key == "event:1:2:backoff")
                     self.assertEqual(expected, _strip_ansi(renderer._lines[row]))
@@ -223,7 +223,10 @@ class TestConsoleRender(unittest.TestCase):
         keys = [info.key for info in renderer._line_infos]
         self.assertEqual(keys, ["n:1", "tp:1:0:thinking", "event:1:0", "tp:1:1:thinking"])
         continuation_line = renderer._lines[2]
-        self.assertEqual(continuation_line, renderer._lines[1].replace("➰ thinking", "↪ continuation"))
+        self.assertEqual(
+            _strip_ansi(continuation_line),
+            _strip_ansi(renderer._lines[1]).replace("➰ thinking", "↪️ continuation"),
+        )
         self.assertTrue(renderer._line_infos[2].expandable)
         self.assertIsNone(renderer._line_infos[2].copy_text)
         renderer._set_cursor(2)
