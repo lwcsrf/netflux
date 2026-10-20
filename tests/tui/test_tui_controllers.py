@@ -10,9 +10,12 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+
+from rich.cells import cell_len
 
 from ...core import (
     AgentFunction,
@@ -33,11 +36,12 @@ from ...tui._logging import close_tui_logging
 from ...tui._controller_helpers import (
     compose_bottom_bar,
     multi_pane_shortcut_variants,
+    standalone_shortcut_variants,
     preferred_left_pane_width,
     render_too_small_frame,
 )
 from ...tui._controllers import SingleTreeConsoleController
-from ...tui._contracts import SelectedTreeStatus, SessionController, TerminalSize
+from ...tui._contracts import RightPaneInteractionContext, SelectedTreeStatus, SessionController, TerminalSize
 from ...tui._driver import ConsoleSessionDriver
 from ...tui._terminal_io import (
     _WIN_ENABLE_MOUSE_INPUT,
@@ -404,10 +408,15 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         controller.handle_key("e")
         controller.handle_key("E")
         controller.handle_key("r")
+        controller.handle_key("x")
+        controller.handle_key("X")
 
         self.assertEqual(
             [call.args[0] for call in renderer.apply_action.call_args_list],
-            ["collapse_agent", "expand_all", "collapse_all", "focus_result"],
+            [
+                "collapse_agent", "expand_all", "collapse_all", "focus_result",
+                "next_exception", "prev_exception",
+            ],
         )
 
     def test_interrupt_uses_node_cancel_event_when_renderer_has_none(self) -> None:
@@ -495,7 +504,82 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         self.assertNotIn("Pg", rendered)
 
 
+class TestExceptionNavigationControllers(unittest.TestCase):
+    def _controller(
+        self, view: NodeView, *, multi_pane: bool,
+    ) -> tuple[SessionController, ConsoleRender]:
+        renderer = ConsoleRender(follow=False)
+        renderer.assign_view(view)
+        cancel_event = threading.Event()
+        node = Mock(id=view.id, cancel_event=cancel_event)
+        node.watch.return_value = view
+        if not multi_pane:
+            controller = SingleTreeConsoleController(renderer, node)
+            self.addCleanup(controller.on_session_stop)
+            return controller, renderer
+        log_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(log_dir.cleanup)
+        controller = TUI(
+            Runtime([view.fn], client_factories={}),
+            log_path=os.path.join(log_dir.name, "tui.log"),
+        )
+        self.addCleanup(close_tui_logging, controller.log_path)
+        self.addCleanup(controller.on_session_stop)
+        controller._runs = [
+            _RunRecord(
+                name="exception navigation", fn=view.fn, node=node,
+                renderer=renderer, cancel_event=cancel_event, latest_view=view,
+            )
+        ]
+        controller._selected_run = 0
+        return controller, renderer
+
+    def test_result_key_reopens_and_copies_collapsed_terminal_exception(self) -> None:
+        text = "terminal first line\nterminal second line"
+        size = TerminalSize(columns=160, lines=15)
+        for multi_pane in (False, True):
+            for state, exception in (
+                (NodeState.Error, ValueError(text)),
+                (NodeState.Canceled, CancellationException(text)),
+            ):
+                with self.subTest(multi_pane=multi_pane, state=state):
+                    view = replace(
+                        _make_agent_view(
+                            _make_agent_function("agent"), state=state, update_seqnum=1,
+                        ),
+                        exception=exception,
+                    )
+                    controller, renderer = self._controller(view, multi_pane=multi_pane)
+                    controller.render_frame(size, tick=0)
+                    controller.handle_key("x" if state is NodeState.Error else "r")
+                    controller.render_frame(size, tick=0)
+                    controller.handle_key(" ")
+                    collapsed = controller.render_frame(size, tick=0)
+                    self.assertTrue(renderer._collapse_overrides["ae:1"])
+                    self.assertIn("model output 1", _strip_ansi(collapsed))
+                    self.assertNotIn("terminal second line", _strip_ansi(collapsed))
+
+                    controller.handle_key("r")
+                    reopened = controller.render_frame(size, tick=0)
+                    self.assertIn("terminal second line", _strip_ansi(reopened))
+                    with patch("netflux.tui.console._copy_text_to_clipboard", return_value=True) as copy:
+                        controller.handle_key("c")
+                    copy.assert_called_once_with(text)
+
+
 class TestBottomBarFormatting(unittest.TestCase):
+    def test_exception_shortcuts_require_visible_exception_targets(self) -> None:
+        for variants in (standalone_shortcut_variants, multi_pane_shortcut_variants):
+            for has_lines, can_jump in ((False, False), (False, True), (True, False), (True, True)):
+                with self.subTest(
+                    formatter=variants.__name__, has_lines=has_lines, can_jump=can_jump,
+                ):
+                    context = RightPaneInteractionContext(
+                        has_lines=has_lines, can_jump_exceptions=can_jump,
+                    )
+                    shortcuts = " ".join(" ".join(items) for items in variants(context))
+                    self.assertEqual("x/X" in shortcuts, has_lines and can_jump)
+
     def test_compose_bottom_bar_shows_cancel_pending(self) -> None:
         bar = compose_bottom_bar(
             120,
@@ -1570,10 +1654,15 @@ class TestTUIState(unittest.TestCase):
         tui.handle_key("e")
         tui.handle_key("E")
         tui.handle_key("r")
+        tui.handle_key("x")
+        tui.handle_key("X")
 
         self.assertEqual(
             [call.args[0] for call in renderer.apply_action.call_args_list],
-            ["collapse_agent", "expand_all", "collapse_all", "focus_result"],
+            [
+                "collapse_agent", "expand_all", "collapse_all", "focus_result",
+                "next_exception", "prev_exception",
+            ],
         )
 
     def test_terminal_run_ignores_cancel_tree_key(self) -> None:
@@ -1686,7 +1775,7 @@ class TestTUIState(unittest.TestCase):
         self.assertEqual(tui._runs[0].node.inputs, {"value": None})
         self.assertIsNone(tui._runs[0].node.result())
 
-    def test_launch_form_accepts_literal_j_and_k(self) -> None:
+    def test_launch_form_accepts_literal_navigation_keys(self) -> None:
         fn = CodeFunction(
             name="texty",
             desc="text input target",
@@ -1699,11 +1788,11 @@ class TestTUIState(unittest.TestCase):
         tui._open_launch_form(0)
         assert tui._form_state is not None
 
-        tui.handle_key("j")
-        tui.handle_key("k")
+        for key in "jkxX":
+            tui.handle_key(key)
 
         self.assertEqual(tui._form_state.cursor, 0)
-        self.assertEqual(tui._form_state.fields[0].value, "jk")
+        self.assertEqual(tui._form_state.fields[0].value, "jkxX")
 
     def test_launch_form_newline_submits(self) -> None:
         fn = _make_code_function("newline_submit")
@@ -2798,7 +2887,11 @@ class TestTUIState(unittest.TestCase):
 
         self.assertNotIn("\x1b[K", body)
         for line in body.splitlines():
-            self.assertEqual(len(_strip_ansi(line)), 20)
+            visible = _strip_ansi(line)
+            # Older supported Rich versions undercount these two-cell emoji.
+            for glyph in ("⏱️", "✒️", "⚙️"):
+                visible = visible.replace(glyph, "😀")
+            self.assertEqual(cell_len(visible), 20)
 
     def test_render_body_placeholder_respects_requested_viewport(self) -> None:
         renderer = ConsoleRender(cancel_event=mp.Event())

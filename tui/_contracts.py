@@ -32,6 +32,7 @@ class RightPaneInteractionContext:
     is_terminal: bool = False
     can_copy_selected_text: bool = False
     can_focus_root_result: bool = False
+    can_jump_exceptions: bool = False
 
 
 class SessionController(Protocol):

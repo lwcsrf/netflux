@@ -52,6 +52,8 @@ _MULTI_ACTION_KEYS = {
     "page_down": "page_down",
     "n": "next_agent",
     "N": "prev_agent",
+    "x": "next_exception",
+    "X": "prev_exception",
     "r": "focus_result",
     "a": "collapse_agent",
     "e": "expand_all",
@@ -1461,7 +1463,8 @@ class TUI(SessionController):
     def _pad_visible(text: str, width: int) -> str:
         visible = _visible_len(text)
         if visible > width:
-            return _crop_line(text, width)
+            text = _crop_line(text, width)
+            visible = _visible_len(text)
         if visible < width:
             return text + " " * (width - visible)
         return text

@@ -31,6 +31,8 @@ _STANDALONE_ACTION_KEYS = {
     "page_down": "page_down",
     "n": "next_agent",
     "N": "prev_agent",
+    "x": "next_exception",
+    "X": "prev_exception",
     "r": "focus_result",
     "a": "collapse_agent",
     "e": "expand_all",

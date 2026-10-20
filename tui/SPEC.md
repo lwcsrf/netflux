@@ -164,12 +164,40 @@ with the same glyph, muted steel blue color, dim content, and collapse behavior,
 but a bold, undimmed `status` label (intermediate text uses `text`).
 Both use dim, neutral expand/collapse arrows matching thinking rows.
 
+Intermediate events retain their recorded transcript positions and order across
+all outcomes. Each starts collapsed:
+
+- retries: red `▸ 🧰 ExceptionType | attempt N | message…`, with zero-based attempts
+  and a single-line preview; expanding shows the full message,
+- continuations: dim thinking-style `▸ ↪ continuation`,
+- scheduled backoffs: dim thinking-style `▸ ⏱️ backoff elapsed / total` below the
+  retry, visible independently of its collapse state.
+
+Continuation/backoff expansion changes only the arrow. Status, arrow, and emoji
+columns stay aligned with sibling rows; only active backoffs show a spinner.
+Completion leaves the status slot blank. Backoff timing uses the recorded start
+and interval, with `ended_at` as the cancellation cutoff: interrupted waits show
+canceled; completed waits stay completed. Providers also publish an update after completed waits.
+
+Final exceptions start expanded and collapse independently: red `▾ error:` or
+yellow `▾ canceled:`, without extra icons. Retry rows likewise omit the cross.
+
+Buffered multi-hop parts appear after the request's events only on success;
+failure or cancellation discards them. Events split merged text at recorded
+offsets. Each fragment copies the whole original part; split final results use
+plain text and retain the complete part as their result target.
+
 Successful terminal root results behave as follows:
 - the renderer identifies one top-level result target for the selected root tree,
 - for agent roots, this is the last `ModelTextPart` when present, otherwise the terminal `outputs` block,
 - for code roots, this is the terminal `outputs` block,
 - copy preserves raw text: real/synthetic function headers copy full arguments and the available result/exception; detail rows copy their entire argument/result/transcript block,
-- when that result target is expanded, it is rendered through the current Rich-based terminal markdown renderer instead of being shown as raw markdown text.
+- when that result target is expanded, it is rendered through the current Rich-based terminal markdown renderer instead of being shown as raw markdown text, except when split by intermediate events.
+
+`x` / `X` visits agent retries and final errors in rendered order, including
+offscreen targets and retries from agents later canceled. Other rows are excluded.
+Collapsed ancestors hide descendants; a collapsed failed agent header represents
+its final error. Use `e` to expose all node subtrees before browsing exceptions.
 
 ### 3.5 Status and Interaction Context
 
@@ -183,6 +211,7 @@ Successful terminal root results behave as follows:
 - any lines,
 - useful expand/collapse actions,
 - useful agent-jump actions,
+- useful exception-jump actions,
 - follow mode enabled,
 - a terminal root state,
 - a copyable selected element in any state (readable thinking included; redacted content, signatures, and standalone placeholders excluded),
@@ -222,7 +251,8 @@ Standalone key bindings:
 - `g` / `G`: go to enclosing node top/bottom
 - Page Up / Page Down: page navigation
 - `n` / `N`: next/previous visible agent
-- `c`: copy the full selected element, collapsed or expanded; continuation rows copy their whole block, unavailable selections do nothing
+- `x` / `X`: next/previous visible agent exception
+- `c`: copy the full selected element, collapsed or expanded; wrapped content rows copy their whole block, unavailable selections do nothing
 - `r`: expand and focus the root result or error/cancellation exception
 - `a`: collapse enclosing agent
 - `e` / `E`: expand all / collapse all
@@ -358,6 +388,7 @@ Normal non-modal multi-pane key bindings:
 - `g` / `G`: selected-tree top/bottom
 - Page Up / Page Down: selected-tree page navigation
 - `n` / `N`: selected-tree agent jumps
+- `x` / `X`: selected-tree exception jumps
 - `c`: copy the complete selected element using the standalone copy rules
 - `r`: expand and focus the selected root's result or error/cancellation exception
 - `a`: collapse selected-tree enclosing agent

@@ -36,6 +36,7 @@ test = [
 # Optional `tui` subpackage dependencies
 tui = [
     "rich>=12.6.0",
+    "wcwidth>=0.2.13",
 ]
 
 # Provider-specific dependencies

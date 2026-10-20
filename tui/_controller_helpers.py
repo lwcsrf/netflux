@@ -289,6 +289,11 @@ def standalone_shortcut_variants(ctx: RightPaneInteractionContext) -> list[list[
             compact.append("n/N:next/prev")
             terse.append("n/N")
 
+        if getattr(ctx, "can_jump_exceptions", False):
+            full.append("x/X:exception")
+            compact.append("x/X:exception")
+            terse.append("x/X")
+
         if getattr(ctx, "can_copy_selected_text", False):
             full.append("c:copy selected")
             compact.append("c:copy")
@@ -355,6 +360,11 @@ def multi_pane_shortcut_variants(
             full.append("n/N:agent")
             compact.append("n/N:agent")
             terse.append("n/N")
+
+        if getattr(ctx, "can_jump_exceptions", False):
+            full.append("x/X:exception")
+            compact.append("x/X:exception")
+            terse.append("x/X")
 
         if getattr(ctx, "can_copy_selected_text", False):
             full.append("c:copy selected")
