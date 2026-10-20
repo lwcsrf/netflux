@@ -100,6 +100,21 @@ class ModelTextUpdate:
 TranscriptUpdate = Union[ThinkingBlockPart, ToolUsePart, ModelStatusPart, ModelTextUpdate]
 
 
+class OaiResponseError(Exception):
+    """Exception wrapper around failed `openai.types.responses.Response`
+    returned from a non-raising
+    `openai.resources.responses.Responses.create()` call.
+    """
+
+    def __init__(self, response: Response, msg: str) -> None:
+        super().__init__(msg)
+        self.status = response.status
+        self.id = response.id
+        self.incomplete_details = response.incomplete_details
+        self.error = response.error
+        self.msg = msg
+
+
 class OaiAgentNode(AgentNode):
     """AgentNode implementation using OpenAI's modern Responses API.
 
@@ -215,6 +230,8 @@ class OaiAgentNode(AgentNode):
             self.ctx.post_exception(self.provider_error(
                 f"OpenAI response validation failed:\n{ex.__cause__ or ex}", inner_exception=ex,
             ))
+        except OaiResponseError as ex:
+            self.ctx.post_exception(self.provider_error(ex.msg, inner_exception=ex))
         except ModelProviderException as ex:
             # Already contextualized; do not wrap it again in AgentNode.run_wrapper.
             self.ctx.post_exception(ex)
@@ -279,12 +296,6 @@ class OaiAgentNode(AgentNode):
                     stream=False,
                     # Stateless responses include encrypted reasoning by default.
                 )
-            except (openai.APIConnectionError, openai.APIStatusError) as ex:
-                delay = self.retry_delay(ex, attempt)
-                if delay is None or attempt == MAX_ATTEMPTS:
-                    raise
-                should_rebuild_client = isinstance(ex, openai.APIConnectionError)
-            else:
                 # Failed/incomplete responses also consume tokens. Never replay
                 # their partial output or dispatch their tools when retrying.
                 if response.usage is not None:
@@ -295,13 +306,20 @@ class OaiAgentNode(AgentNode):
                         f"expected={self.model!r}, actual={response.model!r}; "
                         "reasoning continuity cannot be guaranteed."
                     )
+                self.assert_response_contract(response)
+                return response
+            except (openai.APIConnectionError, openai.APIStatusError) as ex:
+                delay = self.retry_delay(ex, attempt)
+                if delay is None or attempt == MAX_ATTEMPTS:
+                    raise
+                should_rebuild_client = isinstance(ex, openai.APIConnectionError)
+            except OaiResponseError as ex:
                 delay = (
-                    self.retry_delay(response.error, attempt)
-                    if response.status == "failed" and response.error is not None else None
+                    self.retry_delay(ex.error, attempt)
+                    if ex.status == "failed" and ex.error is not None else None
                 )
                 if delay is None or attempt == MAX_ATTEMPTS:
-                    self.assert_response_contract(response)
-                    return response
+                    raise
                 should_rebuild_client = False
 
             if self.is_cancel_requested():
@@ -353,7 +371,8 @@ class OaiAgentNode(AgentNode):
 
     def assert_response_contract(self, response: Response) -> None:
         if response.status != "completed":
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 f"OpenAI response {response.id!r} did not complete: "
                 f"status={response.status!r}, "
                 f"incomplete_details={response.incomplete_details!r}, "
@@ -361,38 +380,44 @@ class OaiAgentNode(AgentNode):
             )
 
         if response.error is not None:
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 f"OpenAI returned an error on a completed response: {response.error!r}."
             )
 
         if response.incomplete_details is not None:
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI returned incomplete_details on a completed response: "
                 f"{response.incomplete_details!r}."
             )
 
         if response.previous_response_id is not None:
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI unexpectedly associated the response with "
                 f"previous_response_id={response.previous_response_id!r}; "
                 "this provider is manual-replay only."
             )
 
         if response.conversation is not None:
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI unexpectedly associated the response with a server-side "
                 f"conversation: {response.conversation!r}."
             )
 
         if response.truncation != "disabled":
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI did not honor fail-closed truncation: "
                 f"expected 'disabled', got {response.truncation!r}."
             )
 
         reasoning = response.reasoning
         if reasoning is None:
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI omitted the effective reasoning configuration."
             )
 
@@ -403,18 +428,21 @@ class OaiAgentNode(AgentNode):
         )
         expected_reasoning = ("standard", "max", "all_turns")
         if actual_reasoning != expected_reasoning:
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI changed the effective reasoning configuration: "
                 f"expected={expected_reasoning!r}, actual={actual_reasoning!r}."
             )
 
         cache_options = response.prompt_cache_options
         if cache_options is None:
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI omitted the effective prompt-cache configuration."
             )
         if cache_options.mode != "implicit":
-            raise self.provider_error(
+            raise OaiResponseError(
+                response,
                 "OpenAI changed the effective prompt-cache configuration: "
                 f"expected mode='implicit', actual={cache_options.mode!r}."
             )
