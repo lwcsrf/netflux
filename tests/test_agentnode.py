@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from ..core import (
     AgentFunction,
@@ -9,6 +10,8 @@ from ..core import (
     TokenUsage,
     ModelTextPart,
     ModelProviderException,
+    Continuation,
+    TranscriptPosition,
 )
 from ..providers import Provider
 from ..runtime import Runtime
@@ -43,6 +46,38 @@ class _FakeAgentNode(AgentNode):
         self.ctx.post_success("ok")
 
 class TestAgentNodeUtilities(unittest.TestCase):
+    def test_intermediate_events_publish_stable_snapshots(self):
+        fn = AgentFunction(
+            name="events", desc="", args=[], system_prompt="system",
+            user_prompt_template="prompt", uses=[], default_model=Provider.Anthropic,
+        )
+        runtime = Runtime([fn], client_factories={Provider.Anthropic: lambda: None})
+        # Drive the existing fake node synchronously.
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=_FakeAgentNode), \
+                patch.object(_FakeAgentNode, "start"):
+            node: _FakeAgentNode = runtime.invoke(None, fn, {})  # type: ignore[assignment]
+        node.ctx.post_running()
+        node.transcript.append(ModelTextPart("A🙂"))
+        node.ctx.post_transcript_update()
+        before = runtime.get_view(node.id)
+        failure = RuntimeError("retry")
+        node.record_retriable_exception(failure, attempt=0)
+        during = node.watch(as_of_seq=before.update_seqnum, timeout=0)
+        assert during is not None
+        self.assertEqual(during.transcript, before.transcript)
+        event, = during.intermediate_events
+        self.assertIs(event.exception, failure)  # type: ignore[attr-defined]
+        self.assertEqual(event.position, node.transcript_end_position)
+        self.assertEqual(event.position, TranscriptPosition(0, 2))
+        node.record_continuation()
+        node.transcript[-1] = ModelTextPart("A🙂\nB")
+        node.ctx.post_success(node.transcript[-1].text)
+        final = runtime.get_view(node.id)
+        self.assertEqual(final.intermediate_events, (event, Continuation(event.position)))
+        self.assertEqual(before.intermediate_events, ())
+        self.assertEqual(during.intermediate_events, (event,))
+        self.assertEqual(during.transcript, (ModelTextPart("A🙂"),))
+
     def test_build_user_text_formats_inputs(self):
         """Create AgentFunction with user_prompt_template like 'Hello {name}'; build AgentNode with inputs dict {'name': 'Ada'}; assert build_user_text returns 'Hello Ada'.
         This is to guard against changes that might accidentally remove the substitution behavior."""

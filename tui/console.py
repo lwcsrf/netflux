@@ -13,6 +13,7 @@ Keyboard controls during live execution:
     k / ↑       Move cursor up
     Space       Toggle expand/collapse (or collapse enclosing block)
     n / N       Next / previous visible agent
+    x / X       Next / previous visible agent exception
     g           Go to top of enclosing node
     G           Go to bottom of enclosing node
     PgUp/PgDn   Scroll by page
@@ -29,20 +30,26 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from functools import lru_cache
 from threading import Event
 from typing import Any, Iterator, Mapping
 
+from rich.cells import cell_len as _rich_cell_len
 from rich.console import Console
 from rich.markdown import Markdown
+from wcwidth import wcswidth
 
 from ._contracts import RightPaneInteractionContext, SelectedTreeStatus
 from ..core import (
+    Continuation,
     Function,
+    IntermediateEvent,
     ModelStatusPart,
     ModelTextPart,
     Node,
     NodeState,
     NodeView,
+    RetriableException,
     TokenBill,
     ThinkingBlockPart,
     ToolResultPart,
@@ -111,6 +118,16 @@ _MOUSE_SCROLL_ROWS = 5
 #   final byte        0x40-0x7E  => [@-~]
 _RE_COMPLETE_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _RE_TRAILING_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*$")
+# Exception messages may contain terminal hyperlinks or other commands from
+# upstream diagnostics. Strip those only for display, retaining raw copy text.
+_RE_EXCEPTION_ESCAPE = re.compile(
+    r"\x1b(?:\].*?(?:\x07|\x1b\\|$)"  # OSC (including hyperlinks).
+    r"|[PX^_].*?(?:\x1b\\|$)"          # Other terminal control strings.
+    r"|\[[0-?]*[ -/]*[@-~]?"          # Complete or truncated CSI.
+    r"|[ -/]*[0-~])",                 # Other ESC commands, e.g. terminal reset.
+    re.DOTALL,
+)
+_RE_EXCEPTION_CONTROL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
 def _color(
     text: str,
@@ -300,24 +317,36 @@ def _preview_text(text: str, max_len: int = 60) -> str:
     """Return a short single-line preview of *text* for collapsed block headers.
 
     Strips leading whitespace, collapses the first meaningful line into at most
-    *max_len* characters, appending '…' if truncated.
+    *max_len* terminal cells, appending '…' if truncated.
     """
     if not text:
         return ""
     # Take the first non-empty line
     for raw_line in text.splitlines():
-        stripped = raw_line.strip()
+        stripped = raw_line.expandtabs(8).strip()
         if stripped:
             break
     else:
         return ""
-    if len(stripped) <= max_len:
-        return stripped
-    return stripped[: max_len - 1] + "…"
+    if stripped.isascii() and stripped.isprintable():
+        return stripped if len(stripped) <= max_len else stripped[:max(0, max_len - 1)] + "…"
+    # A collapsed preview must not measure an entire, potentially large
+    # Unicode transcript on every redraw. Stop at the first overflowing cell.
+    used = 0
+    for _, cluster in _iter_cell_clusters(stripped):
+        used += cell_len(cluster)
+        if used > max_len:
+            return stripped[:_visible_prefix_end(stripped, max(0, max_len - 1))] + "…"
+    return stripped
 
 
 def _strip_ansi(text: str) -> str:
     return _RE_COMPLETE_CSI.sub("", text)
+
+
+def _exception_display_text(text: str) -> str:
+    """Keep exception text inert while preserving tabs and line breaks."""
+    return _RE_EXCEPTION_CONTROL.sub("", _RE_EXCEPTION_ESCAPE.sub("", text))
 
 
 def _short_repr(
@@ -374,6 +403,8 @@ def _render_markdown_lines(text: str, *, width: int) -> list[_RenderedBlockLine]
         force_terminal=True,
         color_system="standard",
         width=max(1, width),
+        # Rich honors an explicit width under TERM=dumb only with both dimensions.
+        height=25,
         legacy_windows=False,
     )
     console.print(Markdown(text, hyperlinks=False), end="")
@@ -417,9 +448,24 @@ def _skip_csi_sequence(s: str, start: int) -> int:
     return match.end()
 
 
-def _iter_visible_chars(s: str) -> Iterator[tuple[int, int, str]]:
-    """Yield (visible_column, slice_end, char) for each non-ANSI character in *s*."""
-    visible = 0
+_cached_wcswidth = lru_cache(maxsize=4096)(wcswidth)
+
+
+def cell_len(text: str) -> int:
+    """Measure terminal cells consistently across supported Rich versions."""
+    if text.isascii() and text.isprintable():
+        return len(text)
+    # Match Rich's cache bounds without retaining large transcript strings.
+    width = _cached_wcswidth(text) if len(text) < 512 else wcswidth(text)
+    # wcswidth rejects control characters. Retain Rich's existing handling of
+    # those, including incomplete ANSI sequences, rather than a negative width.
+    return _rich_cell_len(text) if width < 0 else width
+
+
+def _iter_cell_clusters(s: str) -> Iterator[tuple[int, str]]:
+    """Yield source endpoints and visible clusters without splitting modifiers."""
+    cluster = ""
+    end = 0
     i = 0
     n = len(s)
     while i < n:
@@ -427,33 +473,46 @@ def _iter_visible_chars(s: str) -> Iterator[tuple[int, int, str]]:
         if next_i != i:
             i = next_i
             continue
-        yield visible, i + 1, s[i]
-        visible += 1
+        character = s[i]
+        if cluster and not (
+            cell_len(character) == 0
+            or cluster.endswith("\u200d")
+            or "\U0001f3fb" <= character <= "\U0001f3ff"
+            or (
+                len(cluster) == 1
+                and "\U0001f1e6" <= cluster <= "\U0001f1ff"
+                and "\U0001f1e6" <= character <= "\U0001f1ff"
+            )
+        ):
+            yield end, cluster
+            cluster = ""
+        cluster += character
+        end = i + 1
         i += 1
+    if cluster:
+        yield end, cluster
 
 
 def _visible_prefix_end(s: str, max_cols: int) -> int:
-    """Return the string index that spans *max_cols* visible characters."""
-    visible = 0
-    i = 0
-    n = len(s)
-    while i < n and visible < max_cols:
-        next_i = _skip_csi_sequence(s, i)
-        if next_i != i:
-            i = next_i
-            continue
-        visible += 1
-        i += 1
-    return i
+    """Return an ANSI-safe prefix that fits within *max_cols* terminal cells."""
+    used = 0
+    end = 0
+    for slice_end, cluster in _iter_cell_clusters(s):
+        size = cell_len(cluster)
+        if used + size > max_cols:
+            break
+        used += size
+        end = slice_end
+    return end
 
 
 def _needs_crop(line: str, max_cols: int) -> bool:
     """Return whether cropping should run, preserving legacy handling of malformed CSI."""
-    return len(_RE_COMPLETE_CSI.sub("", line)) > max_cols
+    return cell_len(_RE_COMPLETE_CSI.sub("", line)) > max_cols
 
 
 def _crop_line(line: str, max_cols: int) -> str:
-    """Crop a line to *max_cols* visible characters, ANSI-safe."""
+    """Crop a line to *max_cols* terminal cells, ANSI-safe."""
     if not _needs_crop(line, max_cols):
         return line
     chunk = line[:_visible_prefix_end(line, max_cols)]
@@ -463,16 +522,53 @@ def _crop_line(line: str, max_cols: int) -> str:
 
 
 def _visible_len(s: str) -> int:
-    """Length of string excluding ANSI escape sequences."""
-    return sum(1 for _ in _iter_visible_chars(s))
+    """Terminal-cell width, excluding complete and trailing ANSI sequences."""
+    return cell_len(_RE_TRAILING_CSI.sub("", _strip_ansi(s)))
+
+
+def _wrap_line(line: str, width: int) -> Iterator[str]:
+    """Fold a line by terminal cells, retaining text and ANSI styling."""
+    if line and line.isascii() and line.isprintable():
+        # Ordinary transcript text needs no Unicode or ANSI parsing on redraw.
+        for start in range(0, len(line), width):
+            yield line[start : start + width]
+        return
+    # Scan once: repeatedly clipping the remaining suffix makes a long CJK
+    # exception quadratic, which would stall every live redraw.
+    styles = ""
+    start = 0
+    used = 0
+    previous_end = 0
+
+    def retain_styles(chunk: str) -> None:
+        nonlocal styles
+        for match in _RE_COMPLETE_CSI.finditer(chunk):
+            sequence = match.group()
+            if sequence in ("\x1b[m", RESET):
+                styles = ""
+            elif sequence.endswith("m"):
+                styles = styles.replace(sequence, "") + sequence
+
+    for end, cluster in _iter_cell_clusters(line):
+        size = cell_len(cluster)
+        if used and used + size > width:
+            chunk = line[start:previous_end]
+            rendered = styles + chunk + (RESET if styles or "\x1b" in chunk else "")
+            yield _crop_line(rendered, width) if used > width else rendered
+            retain_styles(chunk)
+            start = previous_end
+            used = 0
+        used += size
+        previous_end = end
+    chunk = styles + line[start:]
+    # A viewport narrower than one glyph cannot show that glyph.
+    yield _crop_line(chunk, width) if _visible_len(chunk) > width else chunk
 
 
 def _visible_index_of_any(s: str, targets: set[str]) -> int | None:
     """Return the visible-column index of the first matching glyph in *s*."""
-    for visible, _, ch in _iter_visible_chars(s):
-        if ch in targets:
-            return visible
-    return None
+    positions = [position for target in targets if (position := s.find(target)) >= 0]
+    return _visible_len(s[:min(positions)]) if positions else None
 
 
 def _highlight_line(line: str, width: int) -> str:
@@ -498,6 +594,7 @@ class LineInfo:
     default_collapsed: bool = False
     is_node_header: bool = False
     is_agent_header: bool = False
+    is_exception_target: bool = False
     toggle_col: int | None = None
     anchors: tuple[str, ...] = ()
     # Source text of the selected element, shared by all its display rows.
@@ -749,10 +846,17 @@ class ConsoleRender:
             if self._root_id is not None:
                 self._collapse_overrides[f"n:{self._root_id}"] = False
             self._collapse_overrides[target.key] = False
+            if self._last_view is not None:
+                for event in self._last_view.intermediate_events:
+                    position = event.position
+                    source_key = f"tp:{self._last_view.id}:{position.part_index}:model"
+                    if source_key == target.key and position.text_offset:
+                        self._collapse_overrides[f"{source_key}:{position.text_offset}"] = False
             self._follow_mode = False
             self._selected_key = None
             self._selected_anchor = target.key
-            self._selected_anchor_occurrence = len(self._lines) + 1024
+            # Resolve the last row after expansion, regardless of result size.
+            self._selected_anchor_occurrence = -1
 
             matches = [
                 idx
@@ -964,6 +1068,26 @@ class ConsoleRender:
             target = nxt[0] if nxt else targets[-1]
             self._set_cursor(target, disable_follow=True)
 
+    def _jump_exception(self, *, forward: bool) -> None:
+        with self._lock:
+            targets = [
+                idx for idx, info in enumerate(self._line_infos)
+                if info.is_exception_target
+            ]
+            if not targets:
+                return
+            if forward:
+                target = next((idx for idx in targets if idx > self._cursor), targets[-1])
+            else:
+                target = next((idx for idx in reversed(targets) if idx < self._cursor), targets[0])
+            self._set_cursor(target, disable_follow=True)
+
+    def jump_next_exception(self) -> None:
+        self._jump_exception(forward=True)
+
+    def jump_prev_exception(self) -> None:
+        self._jump_exception(forward=False)
+
     def toggle_expanded(self) -> None:
         with self._lock:
             self._toggle_expanded_locked()
@@ -1047,6 +1171,8 @@ class ConsoleRender:
             "go_bottom": self.go_bottom,
             "next_agent": self.jump_next_agent,
             "prev_agent": self.jump_prev_agent,
+            "next_exception": self.jump_next_exception,
+            "prev_exception": self.jump_prev_exception,
             "collapse_agent": self.collapse_enclosing_agent,
             "expand_all": self.expand_all_nodes,
             "collapse_all": self.collapse_all_nodes,
@@ -1100,6 +1226,7 @@ class ConsoleRender:
             has_lines=has_lines,
             can_expand_collapse=can_expand,
             can_jump_agents=can_jump,
+            can_jump_exceptions=any(info.is_exception_target for info in self._line_infos),
             follow_mode=self._follow_mode,
             is_terminal=is_terminal,
             can_copy_selected_text=self._selected_copy_text_locked() is not None,
@@ -1260,6 +1387,7 @@ class ConsoleRender:
             or has_result
             or has_error
             or has_inputs
+            or bool(nv.intermediate_events)
         )
         if nv.fn.is_code():
             has_details = True
@@ -1317,6 +1445,7 @@ class ConsoleRender:
                 default_collapsed=default_collapsed,
                 is_node_header=True,
                 is_agent_header=is_agent,
+                is_exception_target=is_agent and collapsed and _has_error(nv),
                 toggle_col=_visible_index_of_any(line_text, {FOLD, UNFOLD}),
                 anchors=anchors,
                 copy_text=copy_text,
@@ -1509,20 +1638,14 @@ class ConsoleRender:
         chunk is emitted as a separate display line with the same prefix and
         styling.
         """
-        prefix_vis = _visible_len(prefix)
-        avail = max(20, self._cols - prefix_vis)
-
-        if len(raw_text) <= avail:
-            lines.append(f"{prefix}{_color(raw_text, fg=fg, dim=dim, bold=bold)}")
-            infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
-            return
-
-        pos = 0
-        while pos < len(raw_text):
-            chunk = raw_text[pos : pos + avail]
+        raw_text = raw_text.expandtabs(8)
+        # Reserve room for a wide glyph even when deep indentation fills the
+        # pane. Otherwise every wrapped content row would lose its payload.
+        prefix = _crop_line(prefix, max(0, self._cols - min(2, self._cols)))
+        avail = max(1, self._cols - _visible_len(prefix))
+        for chunk in _wrap_line(raw_text, avail):
             lines.append(f"{prefix}{_color(chunk, fg=fg, dim=dim, bold=bold)}")
             infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
-            pos += avail
 
     # ── Shared detail-rendering helpers ───────────────────────────────────
 
@@ -1564,12 +1687,10 @@ class ConsoleRender:
     ) -> None:
         for rendered_line in rendered_lines:
             if rendered_line.styled_text is not None:
-                avail = max(20, self._cols - _visible_len(prefix))
-                styled_text = rendered_line.styled_text
-                if _visible_len(styled_text) > avail:
-                    styled_text = _crop_line(styled_text, avail)
-                lines.append(f"{prefix}{styled_text}")
-                infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
+                avail = max(1, self._cols - _visible_len(prefix))
+                for styled_text in _wrap_line(rendered_line.styled_text, avail):
+                    lines.append(f"{prefix}{styled_text}")
+                    infos.append(LineInfo(anchors=anchors, copy_text=copy_text))
                 continue
             self._append_content(
                 rendered_line.text,
@@ -1635,7 +1756,7 @@ class ConsoleRender:
         header_prefix: str,
         header_plain: str,
     ) -> str:
-        max_len = max(20, self._cols - _visible_len(header_prefix) - len(header_plain) - 4)
+        max_len = max(20, self._cols - _visible_len(header_prefix) - _visible_len(header_plain) - 4)
         return _preview_text(text, max_len)
 
     def _preview_for_rendered_lines(
@@ -1673,7 +1794,11 @@ class ConsoleRender:
         content_dim: bool = True,
         show_char_count: bool = True,
         rendered_lines: list[_RenderedBlockLine] | None = None,
+        copy_text: str | None = None,
+        source_key: str | None = None,
     ) -> None:
+        copy_text = text if copy_text is None else copy_text
+        anchors = (key,) if source_key is None or source_key == key else (key, source_key)
         collapsed = self._is_collapsed(key, default=True)
         indicator = FOLD if collapsed else UNFOLD
         char_count = f" ({len(text):,} chars)" if show_char_count else ""
@@ -1706,8 +1831,8 @@ class ConsoleRender:
                 expandable=True,
                 default_collapsed=True,
                 toggle_col=_visible_index_of_any(label, {FOLD, UNFOLD}),
-                anchors=(key,),
-                copy_text=text,
+                anchors=anchors,
+                copy_text=copy_text,
             )
         )
         if not collapsed:
@@ -1721,8 +1846,8 @@ class ConsoleRender:
                     max_lines=None,
                     fg=content_fg,
                     dim=content_dim,
-                    anchors=(key,),
-                    copy_text=text,
+                    anchors=anchors,
+                    copy_text=copy_text,
                 )
             else:
                 self._emit_rendered_block(
@@ -1730,8 +1855,8 @@ class ConsoleRender:
                     content_prefix,
                     lines,
                     infos,
-                    anchors=(key,),
-                    copy_text=text,
+                    anchors=anchors,
+                    copy_text=copy_text,
                 )
 
     def _emit_value_part(
@@ -1904,6 +2029,84 @@ class ConsoleRender:
             copy_text=result_text,
         )
 
+    def _emit_intermediate_event(
+        self,
+        nv: NodeView,
+        event_index: int,
+        event: IntermediateEvent,
+        detail_prefix: str,
+        content_prefix: str,
+        tick: int,
+        lines: list[str],
+        infos: list[LineInfo],
+    ) -> None:
+        key = f"event:{nv.id}:{event_index}"
+        if isinstance(event, Continuation):
+            self._emit_thinking_slot(
+                key=key, title="continuation", glyph="↪️", glyph_dim=False,
+                detail_prefix=detail_prefix, content_prefix=content_prefix,
+                lines=lines, infos=infos,
+            )
+            return
+        if not isinstance(event, RetriableException):
+            return
+
+        try:
+            text = str(event.exception)
+        except Exception:
+            # Observing a recovered failure must not break the execution tree.
+            text = f"{type(event.exception).__name__} (message unavailable)"
+        collapsed = self._is_collapsed(key, default=True)
+        indicator = FOLD if collapsed else UNFOLD
+        header = f"{indicator} {FUNCTION_GLYPH} {type(event.exception).__name__} | attempt {event.attempt} |"
+        display_text = _exception_display_text(text)
+        preview = self._preview_for_header(display_text, detail_prefix, header)
+        header = f"{header} {preview}"
+        available = max(1, self._cols - cell_len(_strip_ansi(detail_prefix)))
+        if cell_len(header) > available:
+            header = _strip_ansi(_crop_line(header, available - 1)) + "…"
+        label = f"{detail_prefix}{_color(header, fg='red')}"
+        lines.append(label)
+        infos.append(LineInfo(
+            key=key,
+            expandable=True,
+            default_collapsed=True,
+            is_exception_target=True,
+            toggle_col=_visible_index_of_any(label, {FOLD, UNFOLD}),
+            anchors=(key,),
+            copy_text=text,
+        ))
+        if not collapsed:
+            self._emit_content_block(
+                display_text.splitlines() or [""], content_prefix, lines, infos,
+                max_lines=None, fg="red", anchors=(key,), copy_text=text,
+            )
+
+        if event.backoff_seconds is None or event.backoff_started_at is None:
+            return
+        duration = event.backoff_seconds
+        deadline = event.backoff_started_at + duration
+        status = ""
+        if (
+            nv.state is NodeState.Canceled
+            and nv.ended_at is not None
+            and nv.ended_at < deadline
+        ):
+            backoff_text = f"backoff canceled ({duration:.1f}s)"
+        else:
+            # A canceled snapshot fixes the wait's outcome even if the wall
+            # clock changes before this historical row is rendered again.
+            now = nv.ended_at if nv.state is NodeState.Canceled and nv.ended_at is not None else time.time()
+            elapsed = max(0.0, now - event.backoff_started_at)
+            backoff_text = f"backoff {min(elapsed, duration):.1f}s / {duration:.1f}s"
+            if elapsed < duration:
+                status = _SPINNER_FRAMES[tick % len(_SPINNER_FRAMES)]
+        self._emit_thinking_slot(
+            key=f"{key}:backoff", title=backoff_text, glyph="🕒", glyph_dim=False, status=status,
+            detail_prefix=detail_prefix, content_prefix=content_prefix,
+            lines=lines, infos=infos,
+        )
+
     def _emit_agent_details(
         self,
         nv: NodeView,
@@ -1933,18 +2136,36 @@ class ConsoleRender:
 
         render_entries: list[tuple[str, int, Any]] = []
         seen_invocation_ids: set[str] = set()
+        events_by_part: dict[int, list[tuple[int, IntermediateEvent]]] = {}
+        for event_index, event in enumerate(nv.intermediate_events):
+            events_by_part.setdefault(event.position.part_index, []).append((event_index, event))
         for tx_idx, part in enumerate(nv.transcript):
+            located_events = events_by_part.get(tx_idx, [])
+            for event_index, event in located_events:
+                if event.position.text_offset is None:
+                    render_entries.append(("event", tx_idx, (event_index, event)))
             if isinstance(part, UserTextPart):
                 render_entries.append(("user", tx_idx, part))
             elif isinstance(part, ModelTextPart):
-                # Keep every text part, including text before later reasoning,
-                # tool calls, or additional model text; each has its own row.
-                render_entries.append(("model", tx_idx, part))
+                start = 0
+                for event_index, event in located_events:
+                    offset = event.position.text_offset
+                    if offset is None:
+                        continue
+                    if offset > start:
+                        render_entries.append(("model", tx_idx, (part, start, offset)))
+                    render_entries.append(("event", tx_idx, (event_index, event)))
+                    start = offset
+                if start < len(part.text) or not part.text:
+                    render_entries.append(("model", tx_idx, (part, start, len(part.text))))
             elif isinstance(part, ModelStatusPart):
                 render_entries.append(("status", tx_idx, part))
             elif isinstance(part, ThinkingBlockPart):
                 # Collapse adjacent empty thinking rows, keeping any available content.
-                if tx_idx > 0 and isinstance(nv.transcript[tx_idx - 1], ThinkingBlockPart):
+                if (
+                    tx_idx > 0 and isinstance(nv.transcript[tx_idx - 1], ThinkingBlockPart)
+                    and render_entries and render_entries[-1][0] == "thinking"
+                ):
                     if not part.content:
                         continue
                     if not render_entries[-1][2].content:
@@ -1961,6 +2182,9 @@ class ConsoleRender:
                 seen_invocation_ids.add(part.tool_use_id)
                 render_entries.append(("call_result_only", tx_idx, part))
 
+        for event_index, event in events_by_part.get(len(nv.transcript), []):
+            render_entries.append(("event", len(nv.transcript), (event_index, event)))
+
         visible_children = self._visible_children(nv)
         rendered_child_ids: set[int] = set()
         for child in visible_children:
@@ -1969,7 +2193,8 @@ class ConsoleRender:
             render_entries.append(("child_only", len(nv.transcript), child))
 
         last_model_text_idx = next(
-            (tx_idx for kind, tx_idx, _ in reversed(render_entries) if kind == "model"),
+            (idx for idx in range(len(nv.transcript) - 1, -1, -1)
+             if isinstance(nv.transcript[idx], ModelTextPart)),
             None,
         )
         has_model_text = last_model_text_idx is not None
@@ -1980,6 +2205,13 @@ class ConsoleRender:
 
         for idx, (kind, tx_idx, payload) in enumerate(render_entries):
             is_last_item = (idx == len(render_entries) - 1) and not has_trailing_output
+
+            if kind == "event":
+                event_index, event = payload
+                self._emit_intermediate_event(
+                    nv, event_index, event, detail_prefix, content_prefix, tick, lines, infos,
+                )
+                continue
 
             if kind == "user":
                 part = payload
@@ -1998,21 +2230,29 @@ class ConsoleRender:
                 continue
 
             if kind in ("model", "status"):
-                part = payload
+                if kind == "model":
+                    part, start, end = payload
+                else:
+                    part, start, end = payload, 0, len(payload.text)
                 assert isinstance(part, (ModelTextPart, ModelStatusPart))
-                model_key = f"tp:{nv.id}:{tx_idx}:{kind}"
+                is_fragment = start != 0 or end != len(part.text)
+                source_key = f"tp:{nv.id}:{tx_idx}:{kind}"
+                model_key = source_key if start == 0 else f"{source_key}:{start}"
                 # Match final-result selection: only the last text of a successful
                 # node is labeled as its result; status updates remain statuses.
                 is_final_text = (
                     kind == "model"
                     and nv.state is NodeState.Success
                     and tx_idx == last_model_text_idx
+                    and end == len(part.text)
                 )
                 self._emit_text_part(
                     key=model_key,
                     title="status" if kind == "status" else ("result" if is_final_text else "text"),
                     glyph=RESULT_GLYPH if is_final_text else TEXT_GLYPH,
-                    text=part.text,
+                    text=part.text[start:end],
+                    copy_text=part.text,
+                    source_key=source_key,
                     detail_prefix=detail_prefix,
                     content_prefix=content_prefix,
                     lines=lines,
@@ -2023,7 +2263,7 @@ class ConsoleRender:
                     content_fg=None if is_final_text else "steel_blue",
                     content_dim=True,
                     show_char_count=is_final_text,
-                    rendered_lines=self._rendered_root_result_lines_locked(
+                    rendered_lines=None if is_fragment else self._rendered_root_result_lines_locked(
                         nv,
                         outcome,
                         model_key,
@@ -2252,10 +2492,21 @@ class ConsoleRender:
         text = outcome.text if outcome is not None else (
             str(nv.exception) if nv.exception is not None else None
         )
-        lines.append(f"{detail_prefix}{_color(f'✖ {label}:', fg=color, bold=True)}")
-        infos.append(LineInfo(anchors=anchors, copy_text=text))
+        key = f"{'ae' if nv.fn.is_agent() else 'ce'}:{nv.id}"
+        collapsed = self._is_collapsed(key, default=False)
+        indicator = FOLD if collapsed else UNFOLD
+        line = f"{detail_prefix}{_color(f'{indicator} {label}:', fg=color, bold=True)}"
+        lines.append(line)
+        infos.append(LineInfo(
+            key=key, expandable=True,
+            toggle_col=_visible_index_of_any(line, {FOLD, UNFOLD}),
+            anchors=anchors, copy_text=text,
+            is_exception_target=nv.fn.is_agent() and _has_error(nv),
+        ))
+        if collapsed:
+            return
         self._emit_content_block(
-            text.splitlines() if text is not None else [""],
+            _exception_display_text(text).splitlines() if text is not None else [""],
             content_prefix,
             lines,
             infos,
@@ -2267,34 +2518,44 @@ class ConsoleRender:
 
     def _emit_thinking_slot(
         self,
-        part: ThinkingBlockPart,
+        part: ThinkingBlockPart | None = None,
         *,
         key: str,
         detail_prefix: str,
         content_prefix: str,
         lines: list[str],
         infos: list[LineInfo],
+        title: str = "thinking",
+        glyph: str = THINKING,
+        glyph_dim: bool = True,
+        status: str = "",
     ) -> None:
         collapsed = self._is_collapsed(key, default=True)
         # Redacted content may itself be ciphertext. Signatures are never text.
-        copy_text = part.content if not part.redacted and part.content else None
+        copy_text = part.content if part is not None and not part.redacted and part.content else None
 
         # Character count
-        n_chars = len(part.content) if part.content else 0
+        n_chars = len(copy_text) if copy_text else 0
         char_info = f" ({n_chars:,} chars)" if n_chars else ""
 
         indicator = FOLD if collapsed else UNFOLD
 
-        if part.redacted:
-            text = f"{indicator} {THINKING} thinking"
-        else:
-            preview_part = ""
-            if collapsed:
-                preview = _preview_text(part.content or "", 60)
-                preview_part = f": {preview}" if preview else ""
-            text = f"{indicator} {THINKING} thinking{preview_part}{char_info}"
+        preview_part = ""
+        if collapsed:
+            preview = _preview_text(copy_text or "", 60)
+            preview_part = f": {preview}" if preview else ""
+        # Reserve the same glyph width for thinking, continuation, and backoff.
+        glyph_slot = glyph + " " * max(0, cell_len(THINKING) - cell_len(glyph))
+        text = (
+            f"{_color(indicator, dim=True)} "
+            f"{_color(glyph_slot, dim=glyph_dim)} "
+            f"{_color(f'{title}{preview_part}{char_info}', dim=True)}"
+        )
 
-        line = f"{detail_prefix}{_color(text, dim=True)}"
+        # Details already reserve the two columns preceding the fold arrow.
+        if status:
+            detail_prefix = f"{detail_prefix[:-2]}{_color(status, fg='cyan', bold=True)} "
+        line = f"{detail_prefix}{text}"
         lines.append(line)
         infos.append(
             LineInfo(
