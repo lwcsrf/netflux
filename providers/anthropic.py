@@ -287,15 +287,17 @@ class AnthropicAgentNode(AgentNode):
                         self._close_client()
                         raise
 
-                    if self.is_cancel_requested():
-                        self.ctx.post_cancel()
-                        self._close_client()
-                        return
-
                     delay = base_delay * (2 ** (attempt - 1))
                     delay = min(delay, 30)
                     # Add small jitter to prevent thundering herd.
                     delay += random.uniform(0, delay * 0.1)
+
+                    self.record_retriable_exception(e, attempt=attempt - 1, backoff_seconds=delay)
+
+                    if self.is_cancel_requested():
+                        self.ctx.post_cancel()
+                        self._close_client()
+                        return
 
                     # Sleep unless canceled.
                     if self.cancel_event:
@@ -305,6 +307,7 @@ class AnthropicAgentNode(AgentNode):
                             return
                     else:
                         time.sleep(delay)
+                    self.ctx.post_update()
 
                     # Rebuild client on transport errors to reset broken sessions/sockets.
                     if is_connection:

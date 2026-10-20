@@ -306,15 +306,17 @@ class GeminiAgentNode(AgentNode):
                         self._close_client()
                         raise
 
-                    if self.is_cancel_requested():
-                        self.ctx.post_cancel()
-                        self._close_client()
-                        return
-
                     delay = base_delay * (2 ** (attempt - 1))
                     delay = min(delay, 30)
                     # Add small jitter to prevent thundering herd.
                     delay += random.uniform(0, delay * 0.1)
+
+                    self.record_retriable_exception(e, attempt=attempt - 1, backoff_seconds=delay)
+
+                    if self.is_cancel_requested():
+                        self.ctx.post_cancel()
+                        self._close_client()
+                        return
 
                     # Sleep unless/until canceled.
                     if self.cancel_event:
@@ -324,6 +326,7 @@ class GeminiAgentNode(AgentNode):
                             return
                     else:
                         time.sleep(delay)
+                    self.ctx.post_update()
 
                     # Rebuild client on transport errors to reset broken sessions/sockets.
                     if is_connection:
@@ -356,8 +359,9 @@ class GeminiAgentNode(AgentNode):
                     raise RuntimeError("Gemini returned CONTINUATION without a continuation token.")
                 pending_parts.extend(hop_parts)
                 continuation_token = candidate.continuation_token
-                # Publish per-hop usage, while both transcripts wait for the complete generation.
-                self.ctx.post_transcript_update()
+                
+                # Publish the continuation and usage while both transcripts remain buffered.
+                self.record_continuation()
                 continue
 
             if candidate.finish_reason == types.FinishReason.MAX_TOKENS:

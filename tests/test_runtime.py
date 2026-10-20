@@ -1101,7 +1101,7 @@ class TestRuntimeInvocation(unittest.TestCase):
         self.assertEqual(view.transcript, (ModelTextPart(text="early"),))
         self.assertTrue(
             any(
-                "post_transcript_update" in msg and "has no effect and is ignored" in msg
+                "post_update()" in msg and "has no effect and is ignored" in msg
                 for msg in captured.output
             )
         )

@@ -4,6 +4,7 @@ from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Union, get_args, Mapping
 import inspect
 import logging
+import time
 from threading import Event, Lock, Thread
 from overrides import override
 
@@ -415,6 +416,40 @@ class ThinkingBlockPart(TranscriptPart):
     signature: str
     redacted: bool = False
 
+@dataclass(frozen=True)
+class TranscriptPosition:
+    """Before part_index, or at a Python string offset within that text part.
+    Part indexes stay fixed; extending trailing text must preserve its prefix.
+    `part_index == len(transcript)`, with no offset, denotes the current end.
+    Used to locate `IntermediateEvent`s relative to `TranscriptPart`s.
+    """
+    part_index: int
+    text_offset: Optional[int] = None
+
+@dataclass(frozen=True)
+class IntermediateEvent:
+    """
+    An observation anchored to published transcript content, in an AgentNode.
+    """
+    position: TranscriptPosition
+
+@dataclass(frozen=True)
+class Continuation(IntermediateEvent):
+    """Sentinel to indicate when a successful provider hop
+    is continuing into another request as part of a multi-hop."""
+
+@dataclass(frozen=True)
+class RetriableException(IntermediateEvent):
+    """
+    A retriable Exception (intermediate; not any Node's outcome) during
+    one iteration of an AgentNode's outer thinking-tools loop. Attempt is
+    zero-based and resets after the agent loop has a successful request.
+    """
+    exception: Exception
+    attempt: int
+    backoff_seconds: Optional[float] = None
+    backoff_started_at: Optional[float] = None
+
 @dataclass
 class RunContext:
     runtime: 'Runtime'      # type: ignore
@@ -499,8 +534,13 @@ class RunContext:
             raise RuntimeError("post_cancel may only be called from within a Node execution context")
         self.runtime.post_cancel(self.node, exception)
 
-    def post_transcript_update(self) -> None:
+    def post_update(self) -> None:
+        """Publish observable node state without changing its execution state."""
+        if self.node is None:
+            raise RuntimeError("post_update may only be called from within a Node execution context")
+        self.runtime.post_update(self.node)
 
+    def post_transcript_update(self) -> None:
         if self.node is None:
             raise RuntimeError("post_transcript_update may only be called from within a Node execution context")
         self.runtime.post_transcript_update(self.node)
@@ -555,6 +595,7 @@ class NodeView:
     # `children`. Correlation is done via matching tool_use_id. Entries are absent when no
     # child was created (e.g. invoke_tool_function threw) or not yet created (transient gap).
     transcript_child_map: Mapping[int, 'NodeView'] = field(default_factory=dict)
+    intermediate_events: tuple[IntermediateEvent, ...] = ()
 
     def total_tree_token_bill(self) -> Dict[Provider, TokenBill]:
         bills: Dict[Provider, TokenBill] = {}
@@ -778,6 +819,8 @@ class AgentNode(Node):
         assert isinstance(fn, AgentFunction), "AgentNode must wrap an AgentFunction"
         self.agent_fn: AgentFunction = fn
         self.transcript: List[TranscriptPart] = []
+        # Append-only; collection order breaks ties at the same transcript position.
+        self.intermediate_events: List[IntermediateEvent] = []
 
         if not callable(client_factory):
             raise TypeError("AgentNode requires a callable client_factory")
@@ -789,6 +832,43 @@ class AgentNode(Node):
 
     def get_transcript(self) -> List[TranscriptPart]:
         return list(self.transcript)  # shallow copy
+
+    @property
+    def transcript_end_position(self) -> TranscriptPosition:
+        """Latest transcript end position"""
+        if self.transcript and isinstance(self.transcript[-1], ModelTextPart):
+            return TranscriptPosition(len(self.transcript) - 1, len(self.transcript[-1].text))
+        return TranscriptPosition(len(self.transcript))
+
+    def _record_intermediate_event(self, event: IntermediateEvent) -> None:
+        # Like transcript updates, recording belongs to the node's execution thread.
+        self.intermediate_events.append(event)
+        self.ctx.post_update()
+
+    def record_retriable_exception(
+        self,
+        exception: Exception,
+        *,
+        attempt: int,
+        backoff_seconds: Optional[float] = None,
+    ) -> None:
+        """
+        Record a retriable, intermediate Exception in the agent loop.
+        Any backoff interval sleep is commenced by the agent loop after calling this.
+        """
+        if backoff_seconds is not None and backoff_seconds <= 0:
+            backoff_seconds = None
+        self._record_intermediate_event(RetriableException(
+            position=self.transcript_end_position,
+            exception=exception,
+            attempt=attempt,
+            backoff_seconds=backoff_seconds,
+            backoff_started_at=time.time() if backoff_seconds is not None else None,
+        ))
+
+    def record_continuation(self) -> None:
+        """Record a Continuation in the agent loop."""
+        self._record_intermediate_event(Continuation(self.transcript_end_position))
 
     @property
     @abstractmethod

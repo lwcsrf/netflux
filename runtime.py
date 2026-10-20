@@ -304,11 +304,13 @@ class Runtime:
 
         usage: Optional[TokenUsage] = None
         transcript: tuple = ()
+        intermediate_events: tuple = ()
         provider: Optional[Provider] = None
         if isinstance(node, AgentNode):
             # Snapshot token usage and transcript as immutables.
             usage = copy.deepcopy(node.token_usage)
             transcript = tuple(node.transcript)
+            intermediate_events = tuple(node.intermediate_events)
             provider = node.provider
 
         # Build transcript_child_map: correlate ToolUsePart/ToolResultPart -> child NodeView
@@ -337,6 +339,7 @@ class Runtime:
             children=tuple(child_views),
             usage=usage,
             transcript=transcript,
+            intermediate_events=intermediate_events,
             started_at=node.started_at,
             ended_at=node.ended_at,
             update_seqnum=self._global_seqno,
@@ -582,10 +585,17 @@ class Runtime:
 
     def post_transcript_update(self, node: Node) -> None:
         """Called by a Node when its transcript changed and a new NodeView snapshot should be published."""
+        self._post_update(node)
+
+    def post_update(self, node: Node) -> None:
+        """Publish a snapshot after any observable update, including events or usage."""
+        self._post_update(node)
+
+    def _post_update(self, node: Node) -> None:
         with self._lock:
             if node.state in TerminalNodeStates:
                 logger.error(
-                    "Ignoring post_transcript_update for terminal node %s (%s); "
+                    "Ignoring post_update() for already-terminal node %s (%s); "
                     "it has no effect and is ignored.",
                     node.id, node.fn.name,
                 )

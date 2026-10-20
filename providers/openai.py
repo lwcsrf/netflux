@@ -321,6 +321,7 @@ class OaiAgentNode(AgentNode):
                 if delay is None or attempt == MAX_ATTEMPTS:
                     raise
                 should_rebuild_client = isinstance(ex, openai.APIConnectionError)
+                self.record_retriable_exception(ex, attempt=attempt - 1, backoff_seconds=delay)
             except OaiResponseError as ex:
                 delay = (
                     self.retry_delay(ex.error, attempt)
@@ -329,6 +330,7 @@ class OaiAgentNode(AgentNode):
                 if delay is None or attempt == MAX_ATTEMPTS:
                     raise
                 should_rebuild_client = False
+                self.record_retriable_exception(ex, attempt=attempt - 1, backoff_seconds=delay)
 
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
@@ -340,6 +342,7 @@ class OaiAgentNode(AgentNode):
                     return None
             else:
                 time.sleep(delay)
+            self.ctx.post_update()
 
             if self.is_cancel_requested():
                 self.ctx.post_cancel()
