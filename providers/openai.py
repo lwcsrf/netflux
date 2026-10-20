@@ -100,6 +100,14 @@ class ModelTextUpdate:
 TranscriptUpdate = Union[ThinkingBlockPart, ToolUsePart, ModelStatusPart, ModelTextUpdate]
 
 
+def _safe_repr(value: object) -> str:
+    try:
+        return repr(value)
+    except Exception:
+        # Diagnostic formatting must not prevent retrying a response.
+        return f"<{type(value).__name__} repr failed>"
+
+
 class OaiResponseError(Exception):
     """Exception wrapper around failed `openai.types.responses.Response`
     returned from a non-raising
@@ -375,21 +383,21 @@ class OaiAgentNode(AgentNode):
                 response,
                 f"OpenAI response {response.id!r} did not complete: "
                 f"status={response.status!r}, "
-                f"incomplete_details={response.incomplete_details!r}, "
-                f"error={response.error!r}."
+                f"incomplete_details={_safe_repr(response.incomplete_details)}, "
+                f"error={_safe_repr(response.error)}."
             )
 
         if response.error is not None:
             raise OaiResponseError(
                 response,
-                f"OpenAI returned an error on a completed response: {response.error!r}."
+                f"OpenAI returned an error on a completed response: {_safe_repr(response.error)}."
             )
 
         if response.incomplete_details is not None:
             raise OaiResponseError(
                 response,
                 "OpenAI returned incomplete_details on a completed response: "
-                f"{response.incomplete_details!r}."
+                f"{_safe_repr(response.incomplete_details)}."
             )
 
         if response.previous_response_id is not None:
@@ -404,7 +412,7 @@ class OaiAgentNode(AgentNode):
             raise OaiResponseError(
                 response,
                 "OpenAI unexpectedly associated the response with a server-side "
-                f"conversation: {response.conversation!r}."
+                f"conversation: {_safe_repr(response.conversation)}."
             )
 
         if response.truncation != "disabled":
