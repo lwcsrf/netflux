@@ -14,7 +14,8 @@ from typing import Callable, Mapping
 from ..core import AgentFunction, Function, FunctionArg, Node, NodeState, NodeView, TerminalNodeStates, TokenBill
 from ..providers import Provider
 from ..runtime import DEFAULT_MAX_AGENT_LEVELS, Runtime
-from ._contracts import RightPaneInteractionContext, SelectedTreeStatus, SessionController, TerminalSize
+from ._confirmation import CancelConfirmation
+from ._contracts import InterruptMode, RightPaneInteractionContext, SelectedTreeStatus, SessionController, TerminalSize
 from ._controller_helpers import (
     compose_bottom_bar,
     multi_pane_shortcut_variants,
@@ -200,6 +201,7 @@ class TUI(SessionController):
         self._interactive = True
         self._should_exit = False
         self._global_cancel_requested = False
+        self._cancel_confirmation: CancelConfirmation | None = None
         self._selected_run: int | None = None
         self._visible_run: int | None = None
         self._runs: list[_RunRecord] = []
@@ -211,6 +213,7 @@ class TUI(SessionController):
         self._exit_after_render = False
         self._terminal_callback: TerminalCallback | None = None
         self._wakeup: Callable[[], None] = lambda: None
+        self._interrupt_mode_callback: Callable[[InterruptMode], None] = lambda _mode: None
         self._flash_message: str | None = None
         self._flash_until: float = 0.0
 
@@ -236,6 +239,9 @@ class TUI(SessionController):
     def set_wakeup(self, wakeup: Callable[[], None]) -> None:
         self._wakeup = wakeup
 
+    def set_interrupt_mode_callback(self, callback: Callable[[InterruptMode], None]) -> None:
+        self._interrupt_mode_callback = callback
+
     def on_session_start(self, *, interactive: bool) -> None:
         self._interactive = interactive
         if not interactive:
@@ -253,9 +259,13 @@ class TUI(SessionController):
                 event = self._event_queue.get_nowait()
             except queue.Empty:
                 break
-            changed = True
             run = self._runs[event.run_index]
             prev_view = run.latest_view
+            # Shutdown can synchronously refresh ahead of the watcher queue.
+            # Never let an older queued snapshot undo that terminal state.
+            if prev_view is not None and event.view.update_seqnum <= prev_view.update_seqnum:
+                continue
+            changed = True
             run.latest_view = event.view
             if self._selected_run is None:
                 self._set_selected_run(event.run_index)
@@ -288,6 +298,9 @@ class TUI(SessionController):
         self._last_size = size
         self._too_small = multi_pane_too_small(size)
         self._sync_visible_run()
+        if self._cancel_confirmation is not None:
+            self._clear_selected_terminal_browse_pending()
+            return self._cancel_confirmation.render_frame(size)
         if self._form_state is not None:
             self._clear_selected_terminal_browse_pending()
             frame = self._render_launch_form(size, tick)
@@ -363,6 +376,16 @@ class TUI(SessionController):
         return self._finalize_frame("\n".join(frame_rows))
 
     def handle_key(self, key: str) -> bool:
+        if self._cancel_confirmation is not None:
+            confirmed = self._cancel_confirmation.handle_key(key)
+            if confirmed is not None:
+                self._cancel_confirmation = None
+                if confirmed:
+                    self._request_global_cancel()
+                else:
+                    self._sync_visible_run()
+                    self._interrupt_mode_callback("defer")
+            return False
         if self._form_state is not None:
             if self._too_small:
                 return False
@@ -385,7 +408,7 @@ class TUI(SessionController):
             return False
         if key.isdigit():
             idx = int(key)
-            if idx < len(self.invocable_functions):
+            if not self._global_cancel_requested and idx < len(self.invocable_functions):
                 self._activate_function(idx)
             return False
         if key == "c":
@@ -404,6 +427,8 @@ class TUI(SessionController):
         return False
 
     def handle_mouse(self, event: object) -> bool:
+        if self._cancel_confirmation is not None:
+            return False
         if self._form_state is not None:
             if self._too_small:
                 return False
@@ -442,16 +467,30 @@ class TUI(SessionController):
         return False
 
     def handle_interrupt(self) -> bool:
+        if self._cancel_confirmation is not None:
+            return False
         if self._global_cancel_requested:
             self._handle_terminal_runs(refresh_from_runtime=True)
             raise KeyboardInterrupt
 
+        if self._interactive:
+            self._interrupt_mode_callback("ignore")
+            self._cancel_confirmation = CancelConfirmation(title="Cancel all runs and quit?")
+            self._sync_visible_run()
+            return False
+        self._request_global_cancel()
+        return False
+
+    def _request_global_cancel(self) -> None:
+        self._form_state = None
         for run in self._runs:
             run.cancel_event.set()
         self._global_cancel_requested = True
+        self._sync_visible_run()
+        # Only restore force interrupts after cancellation state is committed.
+        self._interrupt_mode_callback("force")
         self._handle_terminal_runs(refresh_from_runtime=True)
         self._request_exit_after_graceful_cancel_if_complete()
-        return False
 
     def should_exit(self) -> bool:
         return self._should_exit
@@ -932,7 +971,7 @@ class TUI(SessionController):
         if not isinstance(node_id, int):
             return
         try:
-            run.latest_view = self.runtime.get_view(node_id)
+            view = self.runtime.get_view(node_id)
         except KeyError:
             logger.error(
                 "TUI could not refresh run '%s' because node_id=%s was missing from the runtime.",
@@ -940,6 +979,8 @@ class TUI(SessionController):
                 node_id,
             )
             return
+        if run.latest_view is None or view.update_seqnum > run.latest_view.update_seqnum:
+            run.latest_view = view
 
     def _handle_terminal_run_if_needed(
         self,
@@ -1437,6 +1478,8 @@ class TUI(SessionController):
             self._set_selected_run(run_index)
 
     def _launch_function_hit(self, local_x: int, row: int, width: int, bottom_rows: int) -> None:
+        if self._global_cancel_requested:
+            return
         if row == 0:
             return
 
@@ -1577,7 +1620,7 @@ class TUI(SessionController):
         self._sync_visible_run()
 
     def _current_visible_run(self) -> int | None:
-        if self._form_state is not None or self._too_small:
+        if self._cancel_confirmation is not None or self._form_state is not None or self._too_small:
             return None
         if self._selected_run is None or not (0 <= self._selected_run < len(self._runs)):
             return None

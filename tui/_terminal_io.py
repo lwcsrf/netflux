@@ -31,8 +31,13 @@ class InterruptEvent:
     pass
 
 
+class ConsoleBusyError(RuntimeError):
+    """Console acquisition failed without changing the current owner's state."""
+
+
 _console_lock = threading.Lock()
 _console_ready = False
+_console_restore_pending = False
 _POSIX_PENDING_ESCAPE_SEQ: str | None = None
 _POSIX_PENDING_ESCAPE_DEADLINE: float | None = None
 _POSIX_PENDING_ESCAPE_DISCARD = False
@@ -43,6 +48,7 @@ _POSIX_BARE_ESCAPE_GRACE = 0.05
 _WIN_STD_OUTPUT_HANDLE = -11
 _WIN_STD_INPUT_HANDLE = -10
 _WIN_ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+_WIN_ENABLE_PROCESSED_INPUT = 0x0001
 _WIN_ENABLE_WINDOW_INPUT = 0x0008
 _WIN_ENABLE_EXTENDED_FLAGS = 0x0080
 _WIN_ENABLE_QUICK_EDIT_MODE = 0x0040
@@ -99,20 +105,60 @@ class _WinInputRecord(ctypes.Structure):
     _fields_ = [("EventType", ctypes.c_ushort), ("Event", _WinEventUnion)]
 
 
-def pre_console() -> None:
+def _windows_kernel32() -> ctypes.CDLL:
+    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    # ctypes otherwise defaults HANDLE arguments/results to 32-bit integers.
+    signatures = (
+        ("GetStdHandle", [ctypes.c_ulong], ctypes.c_void_p),
+        ("GetConsoleMode", [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint)], ctypes.c_int),
+        ("SetConsoleMode", [ctypes.c_void_p, ctypes.c_uint], ctypes.c_int),
+        ("FlushConsoleInputBuffer", [ctypes.c_void_p], ctypes.c_int),
+        ("PeekConsoleInputW", [ctypes.c_void_p, ctypes.POINTER(_WinInputRecord), ctypes.c_uint,
+                              ctypes.POINTER(ctypes.c_uint)], ctypes.c_int),
+        ("ReadConsoleInputW", [ctypes.c_void_p, ctypes.POINTER(_WinInputRecord), ctypes.c_uint,
+                              ctypes.POINTER(ctypes.c_uint)], ctypes.c_int),
+    )
+    for name, argtypes, restype in signatures:
+        function = getattr(kernel32, name, None)
+        if hasattr(function, "argtypes"):
+            function.argtypes = argtypes
+            function.restype = restype
+    return kernel32
+
+
+def prepare_windows_console_input() -> None:
+    """Shield foreground work before controller startup, without changing screens."""
+    if os.name != "nt":
+        return
+    with _console_lock:
+        if _console_ready or _console_restore_pending or _WINDOWS_INPUT_MODE_SAVED is not None:
+            raise ConsoleBusyError("Console cleanup is still pending; restore it before starting another session.")
+        _configure_windows_console_input(enable_mouse=True)
+
+
+def pre_console(*, windows_input_prepared: bool = False) -> None:
     if not sys.stdout.isatty():
         return
-    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
+    global _console_ready, _console_restore_pending
+    global _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
     global _POSIX_PENDING_ESCAPE_DISCARD, _POSIX_ORPHAN_ESCAPE_DEADLINE
     with _console_lock:
         if _console_ready:
             return
+        if _console_restore_pending or (_WINDOWS_INPUT_MODE_SAVED is not None and not windows_input_prepared):
+            raise RuntimeError("Console cleanup is still pending; restore it before starting another session.")
+        if windows_input_prepared and _WINDOWS_INPUT_MODE_SAVED is None:
+            raise RuntimeError("Prepared Windows console input is no longer available.")
         _POSIX_PENDING_ESCAPE_SEQ = None
         _POSIX_PENDING_ESCAPE_DEADLINE = None
         _POSIX_PENDING_ESCAPE_DISCARD = False
         _POSIX_ORPHAN_ESCAPE_DEADLINE = None
+        # Setup can fail after changing console modes or writing only part of
+        # the escape sequence. Cleanup must still own that partial setup.
+        _console_restore_pending = True
         _enable_vt_if_windows()
-        _configure_windows_console_input(enable_mouse=True)
+        if sys.stdin.isatty() and not windows_input_prepared:
+            _configure_windows_console_input(enable_mouse=True)
         sys.stdout.write(
             "\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[3J"
             "\x1b[?1000h\x1b[?1006h"
@@ -122,21 +168,33 @@ def pre_console() -> None:
 
 
 def restore_console() -> None:
-    if not sys.stdout.isatty():
-        return
-    global _console_ready, _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
+    global _console_ready, _console_restore_pending
+    global _POSIX_PENDING_ESCAPE_SEQ, _POSIX_PENDING_ESCAPE_DEADLINE
     global _POSIX_PENDING_ESCAPE_DISCARD, _POSIX_ORPHAN_ESCAPE_DEADLINE
     with _console_lock:
-        if not _console_ready:
+        if not (_console_ready or _console_restore_pending or _WINDOWS_INPUT_MODE_SAVED is not None):
             return
         _POSIX_PENDING_ESCAPE_SEQ = None
         _POSIX_PENDING_ESCAPE_DEADLINE = None
         _POSIX_PENDING_ESCAPE_DISCARD = False
         _POSIX_ORPHAN_ESCAPE_DEADLINE = None
-        _configure_windows_console_input(enable_mouse=False)
-        sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?7h\x1b[?1049l")
-        sys.stdout.flush()
         _console_ready = False
+        error: BaseException | None = None
+        try:
+            # Input mode restoration is independent of stdout still being a TTY.
+            _configure_windows_console_input(enable_mouse=False)
+        except BaseException as exc:
+            error = exc
+        try:
+            if _console_restore_pending and sys.stdout.isatty():
+                sys.stdout.write("\x1b[?1000l\x1b[?1006l\x1b[?25h\x1b[?7h\x1b[?1049l")
+                sys.stdout.flush()
+                _console_restore_pending = False
+        except BaseException as exc:
+            if error is None:
+                error = exc
+        if error is not None:
+            raise error
 
 
 def ui_driver(s: str) -> None:
@@ -157,7 +215,7 @@ def _enable_vt_if_windows() -> None:
     if os.name != "nt":
         return
 
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32 = _windows_kernel32()
     handle = kernel32.GetStdHandle(_WIN_STD_OUTPUT_HANDLE)
     mode = ctypes.c_uint()
     if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
@@ -175,14 +233,16 @@ def _configure_windows_console_input(*, enable_mouse: bool) -> None:
 
     if os.name != "nt":
         return
-
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
-    handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
-    mode = ctypes.c_uint()
-    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+    if not enable_mouse and _WINDOWS_INPUT_MODE_SAVED is None:
         return
 
+    kernel32 = _windows_kernel32()
+    handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
+
     if enable_mouse:
+        mode = ctypes.c_uint()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            raise OSError("GetConsoleMode failed for console input setup")
         if _WINDOWS_INPUT_MODE_SAVED is None:
             _WINDOWS_INPUT_MODE_SAVED = mode.value
         # Window-buffer resize notifications are required for resize-only redraws on Windows.
@@ -192,13 +252,43 @@ def _configure_windows_console_input(*, enable_mouse: bool) -> None:
             | _WIN_ENABLE_WINDOW_INPUT
             | _WIN_ENABLE_MOUSE_INPUT
         )
-        new_mode &= ~_WIN_ENABLE_QUICK_EDIT_MODE
-        kernel32.SetConsoleMode(handle, new_mode)
+        # Read Ctrl-C as an input record, so it cannot unwind an in-progress
+        # controller callback or escape a cancellation confirmation screen.
+        new_mode &= ~(_WIN_ENABLE_QUICK_EDIT_MODE | _WIN_ENABLE_PROCESSED_INPUT)
+        if not kernel32.SetConsoleMode(handle, new_mode):
+            raise OSError("SetConsoleMode failed for console input setup")
         return
 
     if _WINDOWS_INPUT_MODE_SAVED is not None:
-        kernel32.SetConsoleMode(handle, _WINDOWS_INPUT_MODE_SAVED)
+        if not kernel32.SetConsoleMode(handle, _WINDOWS_INPUT_MODE_SAVED):
+            raise OSError("SetConsoleMode failed for console input restoration")
         _WINDOWS_INPUT_MODE_SAVED = None
+
+
+def enable_windows_terminal_interrupt() -> None:
+    """Rearm physical Ctrl-C after confirmation without restoring UI modes."""
+    kernel32 = _windows_kernel32()
+    handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
+    mode = ctypes.c_uint()
+    if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        raise OSError("GetConsoleMode failed while enabling force interrupt")
+    if not kernel32.SetConsoleMode(handle, mode.value | _WIN_ENABLE_PROCESSED_INPUT):
+        raise OSError("SetConsoleMode failed while enabling force interrupt")
+
+
+def discard_pending_input(fd: int | None = None) -> None:
+    """Drop input queued in the modal before accepting input in the next mode."""
+    if os.name == "nt":
+        kernel32 = _windows_kernel32()
+        handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
+        if not kernel32.FlushConsoleInputBuffer(handle):
+            raise OSError("FlushConsoleInputBuffer failed while leaving confirmation")
+    elif fd is not None:
+        import termios
+
+        termios.tcflush(fd, termios.TCIFLUSH)
+    _clear_posix_pending_escape()
+    _clear_posix_orphan_escape()
 
 
 def _decode_posix_escape_sequence(seq: str) -> str | MouseEvent | None:
@@ -363,6 +453,12 @@ def _read_posix_escape(
         piece = os.read(fd, 1).decode("utf-8", errors="ignore")
         if not piece:
             return _buffer_posix_escape(seq, deadline=deadline, discard=discard)
+        if piece == "\x03":
+            # Ctrl-C remains an interrupt even in a partial or discarded escape
+            # sequence now that interactive terminals deliver it as input.
+            _clear_posix_pending_escape()
+            _clear_posix_orphan_escape()
+            return piece
 
         seq += piece
         deadline = time.monotonic() + _POSIX_ESCAPE_INTERBYTE_TIMEOUT
@@ -448,7 +544,7 @@ def _decode_windows_mouse_event(event: _WinMouseEventRecord) -> MouseEvent | Non
 
 
 def read_key_windows() -> str | MouseEvent | ResizeEvent | InterruptEvent | None:
-    kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+    kernel32 = _windows_kernel32()
     handle = kernel32.GetStdHandle(_WIN_STD_INPUT_HANDLE)
     while True:
         preview = _WinInputRecord()

@@ -40,7 +40,7 @@ from ...tui._controller_helpers import (
     preferred_left_pane_width,
     render_too_small_frame,
 )
-from ...tui._controllers import SingleTreeConsoleController
+from ...tui._controllers import SingleTreeConsoleController, _ViewEvent
 from ...tui._contracts import RightPaneInteractionContext, SelectedTreeStatus, SessionController, TerminalSize
 from ...tui._driver import ConsoleSessionDriver
 from ...tui._terminal_io import (
@@ -319,6 +319,9 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         controller.on_session_start(interactive=True)
 
         self.assertFalse(controller.handle_interrupt())
+        self.assertFalse(cancel_event.is_set())
+        controller.handle_key("down")
+        controller.handle_key("\r")
         with self.assertRaises(CancellationException):
             node.result()
 
@@ -446,6 +449,9 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         controller.on_session_start(interactive=True)
 
         self.assertFalse(controller.handle_interrupt())
+        self.assertFalse(cancel_event.is_set())
+        controller.handle_key("down")
+        controller.handle_key("\r")
         self.assertTrue(cancel_event.is_set())
         with self.assertRaises(CancellationException):
             node.result()
@@ -502,6 +508,162 @@ class TestSingleTreeConsoleController(unittest.TestCase):
         self.assertIn("q:quit", rendered)
         self.assertNotIn("jk:move", rendered)
         self.assertNotIn("Pg", rendered)
+
+
+class TestCancellationConfirmation(unittest.TestCase):
+    def _single(self, *, interactive: bool = True) -> SingleTreeConsoleController:
+        fn = _make_code_function("running")
+        node = Mock(id=1, cancel_event=threading.Event())
+        node.watch.return_value = _make_view(fn, state=NodeState.Running, update_seqnum=1)
+        controller = SingleTreeConsoleController(ConsoleRender(), node)
+        with patch.object(controller._watch_thread, "start"):
+            controller.on_session_start(interactive=interactive)
+        self.addCleanup(controller.on_session_stop)
+        return controller
+
+    def _tui(self) -> TUI:
+        fn = _make_code_function("running")
+        tui = TUI(Runtime([fn], client_factories={}))
+        self.addCleanup(close_tui_logging, tui.log_path)
+        for index in range(2):
+            cancel_event = threading.Event()
+            tui._runs.append(_RunRecord(
+                name=f"run {index}", fn=fn, node=object(),  # type: ignore[arg-type]
+                renderer=ConsoleRender(cancel_event=cancel_event), cancel_event=cancel_event,
+                latest_view=_make_view(fn, state=NodeState.Running, update_seqnum=1),
+            ))
+        tui._set_selected_run(0)
+        return tui
+
+    @staticmethod
+    def _cancel_events(controller: SingleTreeConsoleController | TUI) -> list[threading.Event]:
+        if isinstance(controller, TUI):
+            return [run.cancel_event for run in controller._runs]
+        return [controller._node.cancel_event]
+
+    def test_confirmation_defaults_to_cancel_and_requires_explicit_authorization(self) -> None:
+        for factory in (self._single, self._tui):
+            with self.subTest(controller=factory.__name__):
+                controller = factory()
+                controller.handle_interrupt()
+                frame = _strip_ansi(controller.render_frame(TerminalSize(100, 24), tick=0))
+                self.assertIn("> Cancel", frame)
+                controller.handle_interrupt()
+                controller.handle_key("C")
+                self.assertTrue(all(not event.is_set() for event in self._cancel_events(controller)))
+                controller.handle_key("\r")
+                self.assertTrue(all(not event.is_set() for event in self._cancel_events(controller)))
+
+                controller.handle_interrupt()
+                controller.handle_key("down")
+                controller.handle_key("escape")
+                controller.handle_interrupt()
+                controller.handle_key("\r")
+                self.assertTrue(all(not event.is_set() for event in self._cancel_events(controller)))
+                self.assertFalse(controller.should_exit())
+
+                controller.handle_interrupt()
+                controller.handle_key("down")
+                controller.handle_interrupt()
+                self.assertTrue(all(not event.is_set() for event in self._cancel_events(controller)))
+                self.assertFalse(controller.handle_key("\r"))
+                self.assertTrue(all(event.is_set() for event in self._cancel_events(controller)))
+                with self.assertRaises(KeyboardInterrupt):
+                    controller.handle_interrupt()
+
+    def test_completion_during_confirmation_keeps_result_and_renders_before_exit(self) -> None:
+        for factory in (self._single, self._tui):
+            with self.subTest(controller=factory.__name__):
+                controller = factory()
+                if isinstance(controller, TUI):
+                    controller._runs = controller._runs[:1]
+                    view = controller._runs[0].latest_view
+                    enqueue = lambda view: controller._event_queue.put(_RunUpdateEvent(0, view))
+                else:
+                    view = controller._latest_view
+                    enqueue = lambda view: controller._queue.put(_ViewEvent(view))
+                assert view is not None
+                completed = replace(
+                    view, state=NodeState.Success, outputs="finished result", ended_at=2.0, update_seqnum=3,
+                )
+                controller.handle_interrupt()
+                enqueue(completed)
+                self.assertTrue(controller.pump_events())
+                enqueue(completed)
+                enqueue(replace(view, update_seqnum=2))
+                self.assertFalse(controller.pump_events())
+                self.assertFalse(controller.handle_interrupt())
+                self.assertIn("Confirm", controller.render_frame(TerminalSize(100, 24), tick=0))
+                self.assertTrue(all(not event.is_set() for event in self._cancel_events(controller)))
+                controller.handle_key("down")
+                self.assertFalse(controller.handle_key("\r"))
+                self.assertFalse(controller.should_exit())
+                frame = _strip_ansi(controller.render_frame(TerminalSize(100, 24), tick=1))
+                self.assertIn("finished result", frame)
+                self.assertTrue(controller.should_exit())
+                if isinstance(controller, SingleTreeConsoleController):
+                    self.assertFalse(controller._node.cancel_event.is_set())
+
+    def test_modal_preserves_launch_form_until_confirmed_and_then_blocks_launches(self) -> None:
+        tui = self._tui()
+        tui._set_selected_run(1)
+        tui._open_launch_form(0)
+        form = tui._form_state
+        assert form is not None
+        form.fields[0].value = "unfinished name"
+        form.cursor = 1
+        size = TerminalSize(100, 24)
+        tui.handle_interrupt()
+        tui.render_frame(size, tick=0)
+        tui.handle_key("z")
+        tui.handle_key("0")
+        tui.handle_mouse(terminal_io.MouseEvent(x=1, y=1, button="left"))
+        tui.handle_key("escape")
+        self.assertIs(tui._form_state, form)
+        self.assertEqual((form.fields[0].value, form.cursor, tui._selected_run), ("unfinished name", 1, 1))
+        self.assertTrue(all(not event.is_set() for event in self._cancel_events(tui)))
+
+        tui.handle_interrupt()
+        tui.handle_key("down")
+        tui.handle_key("\r")
+        self.assertIsNone(tui._form_state)
+        self.assertTrue(all(event.is_set() for event in self._cancel_events(tui)))
+        top_rows, _ = tui._left_pane_heights(size.lines - 1)
+        with patch.object(tui, "_activate_function") as activate:
+            tui.handle_key("0")
+            tui.handle_mouse(terminal_io.MouseEvent(x=1, y=top_rows + 1, button="left"))
+        activate.assert_not_called()
+
+    def test_noninteractive_interrupt_cancels_immediately_then_forces_exit(self) -> None:
+        controller = self._single(interactive=False)
+        self.assertFalse(controller.handle_interrupt())
+        self.assertTrue(controller._node.cancel_event.is_set())
+        with self.assertRaises(KeyboardInterrupt):
+            controller.handle_interrupt()
+
+    def test_shutdown_refresh_and_queued_updates_cannot_regress_terminal_result(self) -> None:
+        tui = self._tui()
+        tui._runs = tui._runs[:1]
+        run = tui._runs[0]
+        run.node = SimpleNamespace(id=1)
+        assert run.latest_view is not None
+        stale = replace(run.latest_view, update_seqnum=2)
+        completed = replace(stale, state=NodeState.Success, outputs="final result", ended_at=2.0, update_seqnum=3)
+        callback = Mock()
+        tui.register_terminal_callback(callback)
+        tui._event_queue.put(_RunUpdateEvent(0, stale))
+        with patch.object(tui.runtime, "get_view", return_value=completed):
+            tui.handle_interrupt()
+            tui.handle_key("down")
+            tui.handle_key("\r")
+        self.assertFalse(tui.pump_events())
+        with patch.object(tui.runtime, "get_view", return_value=stale):
+            with self.assertRaises(KeyboardInterrupt):
+                tui.handle_interrupt()
+        self.assertEqual(run.latest_view, completed)
+        self.assertIn("final result", tui.render_frame(TerminalSize(100, 24), tick=0))
+        self.assertTrue(tui.should_exit())
+        callback.assert_called_once_with({})
 
 
 class TestExceptionNavigationControllers(unittest.TestCase):
@@ -1046,7 +1208,7 @@ class TestTUIState(unittest.TestCase):
 
         self.assertIsNone(tui._form_state)
 
-    def test_first_interrupt_requests_global_cancel_and_waits_for_terminal_update_before_exit(self) -> None:
+    def test_confirmed_interrupt_requests_global_cancel_and_waits_for_terminal_update_before_exit(self) -> None:
         fn = _make_code_function("cancel_me")
         runtime = Runtime([fn], client_factories={})
         tui = TUI(runtime)
@@ -1070,6 +1232,9 @@ class TestTUIState(unittest.TestCase):
         tui._selected_run = 0
 
         self.assertFalse(tui.handle_interrupt())
+        self.assertFalse(cancel_event.is_set())
+        tui.handle_key("down")
+        tui.handle_key("\r")
         self.assertTrue(cancel_event.is_set())
         self.assertFalse(tui.should_exit())
 
@@ -1091,7 +1256,7 @@ class TestTUIState(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             tui.handle_interrupt()
 
-    def test_second_interrupt_makes_final_billing_attempt_before_forced_exit(self) -> None:
+    def test_interrupt_after_confirmation_makes_final_billing_attempt_before_forced_exit(self) -> None:
         fn = _make_code_function("cancel_me")
         runtime = Runtime([fn], client_factories={})
         tui = TUI(runtime)
@@ -1115,6 +1280,8 @@ class TestTUIState(unittest.TestCase):
         ]
 
         self.assertFalse(tui.handle_interrupt())
+        tui.handle_key("down")
+        tui.handle_key("\r")
 
         with patch.object(runtime, "get_view", return_value=_make_view(fn, state=NodeState.Canceled, update_seqnum=2)):
             with self.assertRaises(KeyboardInterrupt):
@@ -3711,7 +3878,7 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.tui._driver.pre_console"), patch(
+        ), patch("netflux.tui._driver.prepare_windows_console_input"), patch("netflux.tui._driver.pre_console"), patch(
             "netflux.tui._driver.restore_console"
         ) as restore_console, patch("netflux.tui._driver.ui_driver"), patch.object(
             ConsoleSessionDriver, loop_name, **loop_args
@@ -3755,7 +3922,7 @@ class TestConsoleSessionDriver(unittest.TestCase):
 
         with patch("sys.stdin.isatty", return_value=True), patch(
             "sys.stdout.isatty", return_value=True
-        ), patch("netflux.tui._driver.pre_console") as pre_console, patch(
+        ), patch("netflux.tui._driver.prepare_windows_console_input"), patch("netflux.tui._driver.pre_console") as pre_console, patch(
             "netflux.tui._driver.restore_console"
         ):
             driver.run(controller)

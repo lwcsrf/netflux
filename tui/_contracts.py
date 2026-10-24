@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Callable, Mapping, Protocol
+from typing import Callable, Literal, Mapping, Protocol
 
 from ..core import NodeState, TokenBill
 from ..providers import Provider
+
+
+InterruptMode = Literal["defer", "ignore", "force"]
 
 
 @dataclass(frozen=True)
@@ -36,7 +39,19 @@ class RightPaneInteractionContext:
 
 
 class SessionController(Protocol):
+    """UI methods run serially on the session thread, never in signal handlers.
+
+    After cancellation is committed, force quit may abandon a callback in flight.
+
+    Background watchers only enqueue immutable snapshots and invoke the wakeup
+    callback; they do not mutate controller or renderer state.
+    """
+
     def set_wakeup(self, wakeup: Callable[[], None]) -> None:
+        ...
+
+    def set_interrupt_mode_callback(self, callback: Callable[[InterruptMode], None]) -> None:
+        """Bind driver policy: defer normally, ignore in modal, force after commit."""
         ...
 
     def on_session_start(self, *, interactive: bool) -> None:
