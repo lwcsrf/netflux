@@ -1,6 +1,7 @@
 from types import SimpleNamespace, MappingProxyType
 from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Union, cast
 import copy
+from json import JSONDecodeError
 from threading import Event
 import time
 import random
@@ -18,6 +19,7 @@ from . import ModelNames, Provider
 import anthropic
 from anthropic.lib.streaming import ParsedMessageStreamEvent
 from anthropic.types import (
+    ErrorType,
     Message, MessageParam,
     RefusalStopDetails,
     Usage,
@@ -115,6 +117,11 @@ OUTPUT_CFG = OutputConfigParam(effort="max")
 CACHE_TTL = "5m"
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
 MAX_STEPS = 768
+# APIStatusError.type is extracted by the SDK from the structured error body,
+# including SSE errors whose HTTP response still has status 200.
+RETRIABLE_ERROR_TYPES: tuple[ErrorType, ...] = (
+    "overloaded_error", "api_error", "rate_limit_error", "timeout_error",
+)
 
 
 class AnthropicAgentNode(AgentNode):
@@ -236,27 +243,39 @@ class AnthropicAgentNode(AgentNode):
                         extra_headers={"anthropic-beta": "thinking-binding-controls-2026-08-01"},
                     ) as stream:
                         # Additional detection of unexpected reasoning discontinuity.
+                        saw_message_start: bool = False
                         for event in stream:
                             self.assert_no_input_transformations(event)
+                            if event.type == "message_start":
+                                saw_message_start = True
+                        # The SDK asserts in `get_final_message()`` if no message_start arrived.
+                        if not saw_message_start:
+                            raise anthropic.APIResponseValidationError(
+                                response=stream.response, body=None,
+                                message="client response message ended before message_start, against protocol.",
+                            )
                         resp = stream.get_final_message()
 
                         # Observed rare corner case: SDK may return a partial streamed Message snapshot with
                         # `stop_reason` still None if the SSE body ends prematurely after normal headers, contradictory
-                        # to SDK docstring for `stop_reason`. Move this case onto the existing retriable connection path.
+                        # to SDK docstring for `stop_reason`. Retry the incomplete response using the same client.
                         if resp.stop_reason is None:
-                            raise anthropic.APIConnectionError(
+                            raise anthropic.APIResponseValidationError(
+                                response=stream.response, body=None,
                                 message="client response message ended with stop_reason=None, against protocol.",
-                                request=stream.response.request,
                             )
                         break
 
                 except (
+                    anthropic.APIResponseValidationError,
                     anthropic.APIConnectionError,
                     anthropic.RateLimitError,
                     anthropic.APIStatusError,
                     httpx2.TransportError,
                     httpx2.HTTPStatusError,
-                    UnicodeDecodeError,
+                    httpx2.DecodingError,
+                    RuntimeError,
+                    ValueError,  # Includes JSONDecodeError and UnicodeDecodeError.
                 ) as e:
                     is_retriable: bool = False
                     is_connection: bool = False
@@ -265,22 +284,41 @@ class AnthropicAgentNode(AgentNode):
                     if isinstance(e, anthropic.RateLimitError):
                         is_retriable = True
                     if isinstance(e, anthropic.APIStatusError):
-                        # WORKAROUND: some HTTP-200 with late overloaded SSE are not `class OverloadedError(APIStatusError)`
-                        # but the SDK is still flagging them as APIStatusError.
-                        if e.status_code in (408, 409, 429) or e.status_code >= 500 or "overloaded" in e.message.lower():
+                        # Also catches RateLimitError, OverloadedError and InternalServerError.
+                        # SSE errors retain HTTP 200, so their exception subclass/status
+                        # alone cannot identify transient API failures.
+                        if (
+                            e.status_code in (408, 409, 429)
+                            or e.status_code >= 500
+                            or e.type in RETRIABLE_ERROR_TYPES
+                            or "overloaded" in e.message.lower()
+                        ):
                             is_retriable = True
                     if isinstance(e, httpx2.HTTPStatusError):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
                     if isinstance(e, httpx2.TransportError) and not isinstance(e, httpx2.ProtocolError):
+                        # Includes raw HTTPX timeouts raised while consuming the stream.
                         is_retriable = True
                         is_connection = True
                     if isinstance(e, (anthropic.APIConnectionError, httpx2.RemoteProtocolError)):
+                        # APIConnectionError includes SDK-wrapped APITimeoutError before streaming.
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, UnicodeDecodeError):
+                    if isinstance(e, anthropic.APIResponseValidationError):
+                        is_retriable = True
+                    if isinstance(e, (JSONDecodeError, UnicodeDecodeError, httpx2.DecodingError)):
                         # Retry if EOF truncates a UTF-8 character or an SSE event contains invalid UTF-8.
+                        # Also retry corrupt SSE JSON or Content-Encoding encountered during
+                        # iteration, outside the SDK's request retry loop.
+                        is_retriable = True
+                    if isinstance(e, RuntimeError) and "Unexpected event order" in str(e):
+                        # Older supported SDKs reject events before message_start.
+                        is_retriable = True
+                    if isinstance(e, ValueError) and "Unable to parse tool parameter JSON" in str(e):
+                        # The SDK wraps jiter's malformed tool input errors in ValueError.
+                        # Other ValueError/RuntimeError failures remain terminal.
                         is_retriable = True
                     
                     if not is_retriable or attempt >= max_attempts:

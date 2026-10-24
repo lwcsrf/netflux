@@ -288,7 +288,7 @@ class OaiAgentNode(AgentNode):
                 self.ctx.post_cancel()
                 return None
             try:
-                response = self.client.responses.create(
+                raw_response = self.client.responses.with_raw_response.create(
                     model=self.model,
                     instructions=self.system_prompt(),
                     input=self.history,
@@ -304,6 +304,13 @@ class OaiAgentNode(AgentNode):
                     stream=False,
                     # Stateless responses include encrypted reasoning by default.
                 )
+                try:
+                    response = raw_response.parse()
+                except json.JSONDecodeError as ex:
+                    # Retain retry headers; JSON errors in hooks remain terminal.
+                    raise openai.APIResponseValidationError(
+                        response=raw_response.http_response, body=ex.doc, message=str(ex),
+                    ) from ex
                 # Failed/incomplete responses also consume tokens. Never replay
                 # their partial output or dispatch their tools when retrying.
                 if response.usage is not None:
@@ -316,7 +323,10 @@ class OaiAgentNode(AgentNode):
                     )
                 self.assert_response_contract(response)
                 return response
-            except (openai.APIConnectionError, openai.APIStatusError) as ex:
+            except (
+                openai.APIConnectionError, openai.APIStatusError,
+                openai.APIResponseValidationError,
+            ) as ex:
                 delay = self.retry_delay(ex, attempt)
                 if delay is None or attempt == MAX_ATTEMPTS:
                     raise
@@ -355,20 +365,28 @@ class OaiAgentNode(AgentNode):
 
     def retry_delay(
         self,
-        error: Union[openai.APIConnectionError, openai.APIStatusError, ResponseError],
+        error: Union[
+            openai.APIConnectionError, openai.APIStatusError,
+            openai.APIResponseValidationError, ResponseError,
+        ],
         attempt: int,
     ) -> Optional[float]:
-        """Retry only whitelisted SDK transport, HTTP, and response failures."""
+        """Retry whitelisted transport, HTTP, response-decoding and response failures."""
         is_retriable = (
             isinstance(error, openai.APIConnectionError)  # Includes APITimeoutError.
             or isinstance(error, openai.APIStatusError)
-            and (error.status_code in (408, 409, 429) or error.status_code >= 500)
+            # Bedrock model failures can reach OpenAI-compatible proxies as HTTP 424.
+            and (error.status_code in (408, 409, 424, 429) or error.status_code >= 500)
+            or isinstance(error, openai.APIResponseValidationError)
+            and 200 <= error.status_code < 300
+            # Retry content-type/JSON failures; schema failures chain Pydantic.
+            and (error.__cause__ is None or isinstance(error.__cause__, json.JSONDecodeError))
             or isinstance(error, ResponseError) and error.code in TRANSIENT_RESPONSE_ERRORS
         )
         if not is_retriable:
             return None
 
-        if isinstance(error, openai.APIStatusError):
+        if isinstance(error, (openai.APIStatusError, openai.APIResponseValidationError)):
             headers = error.response.headers
             if headers.get("x-should-retry") == "false":
                 return None
