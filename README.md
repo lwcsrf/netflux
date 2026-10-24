@@ -537,6 +537,7 @@ This refined example shows:
 * Created with a collection of user-defined `Function`s (hierarchy) that may be invoked directly or indirectly; Author defines `Function`s fully before creating a `Runtime`.
     * `runtime = Runtime(specs: List[Function], client_factories: Mapping[Provider, Callable[[], Any]])`
         * `client_factories` are factory functions that return an instance of the client type expected by each provider.
+            * Each client's underlying `http_client` must be unique to its `Node`. Whenever the factory recreates a provider client, it must also create a new `http_client`.
             * Used in `AgentNode` provider-specific subtypes.
             * Support pluggable configuration and authentication mechanisms unique to the consumer's app.
     * `runtime.invocable_functions -> tuple[Function, ...]`: read-only property exposing all registered `Function`s that may be invoked top-level, in the runtime's registration order (including transitively discovered dependencies).
