@@ -1,10 +1,13 @@
 from typing import Any, Callable, Dict, List, Optional, Union, cast
 from types import MappingProxyType
+from contextlib import suppress
 import copy
 import base64
+from json import JSONDecodeError
 import time
 import random
 from threading import Event
+import httpx
 import httpx2
 from overrides import override
 
@@ -94,6 +97,9 @@ class GeminiAgentNode(AgentNode):
     """
     AgentNode impl for Gemini using `google-genai` SDK typed objects exclusively.
 
+    The provided factory callable should return a genai.Client that uses its own
+    HTTP client, not shared with other Nodes.
+
     - History is List[types.Content]; Parts are types.Part (text, thought, thought_signature, function_call).
     - Parallel function execution; result aggregation.
     - Thought summaries are never stored; signatures are preserved in history and also recorded into Transcript as ThinkingBlockPart.
@@ -167,14 +173,24 @@ class GeminiAgentNode(AgentNode):
         return True
 
     def _close_client(self) -> None:
-        if self.client is None:
+        """
+        - **Factory injects the HTTP client:** `genai.Client.close()` leaves it open, so our cleanup explicitly closes it.
+        - **SDK creates the HTTP client using the supplied settings:** `genai.Client.close()` closes it; our `is_closed` check prevents a second close.
+        """
+        client = self.client
+        if client is None:
             return
-        try:
-            self.client.close()
-        except Exception:
-            pass
-        finally:
-            self.client = None  # type: ignore[assignment]
+        self.client = None  # type: ignore[assignment]
+
+        # Gemini leaves injected HTTP clients open; capture ours before SDK cleanup.
+        http_client: Optional[Union[httpx.Client, httpx2.Client]] = None
+        with suppress(Exception):
+            http_client = client._api_client._httpx_client
+        with suppress(Exception):
+            client.close()
+        with suppress(Exception):
+            if http_client and not http_client.is_closed:
+                http_client.close()
 
     def run(self) -> None:
         try:
@@ -232,9 +248,10 @@ class GeminiAgentNode(AgentNode):
                         config=hop_config,
                     )
 
-                    # Blocked prompts can legitimately return no candidates (different than block during generation).
-                    # Not likely retriable, so raise non-retriable. Very rare in practice.
+                    # Without prompt feedback, missing candidates indicate a malformed response.
+                    # Prompt blocks with feedback remain non-retriable.
                     if not resp.candidates:
+                        force_retry = resp.prompt_feedback is None
                         raise RuntimeError(
                             f"Gemini returned no candidates. Prompt feedback: {resp.prompt_feedback!r}")
                     candidate = resp.candidates[0]
@@ -278,28 +295,40 @@ class GeminiAgentNode(AgentNode):
                 except (
                     genai_errors.APIError,
                     genai_errors.UnknownApiResponseError,
+                    JSONDecodeError,
+                    # The SDK defaults to httpx unless client_factory supplies an httpx2 client.
+                    httpx.HTTPStatusError,
+                    httpx.TransportError,
+                    httpx.DecodingError,
                     httpx2.HTTPStatusError,
                     httpx2.TransportError,
+                    httpx2.DecodingError,
                     RuntimeError,
                 ) as e:
                     # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
                     is_retriable: bool = force_retry
                     is_connection: bool = False
 
-                    if isinstance(e, httpx2.TransportError) and not isinstance(e, httpx2.ProtocolError):
+                    if isinstance(e, (httpx.TransportError, httpx2.TransportError)) and not isinstance(
+                        e, (httpx.ProtocolError, httpx2.ProtocolError,
+                            httpx.UnsupportedProtocol, httpx2.UnsupportedProtocol)
+                    ):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, httpx2.RemoteProtocolError):
+                    if isinstance(e, (
+                        httpx.RemoteProtocolError, httpx2.RemoteProtocolError,
+                        httpx.DecodingError, httpx2.DecodingError,
+                    )):
                         is_retriable = True
                         is_connection = True
-                    if isinstance(e, httpx2.HTTPStatusError):
+                    if isinstance(e, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
                     if isinstance(e, genai_errors.APIError):
                         if e.code in (408, 409, 429) or e.code >= 500:
                             is_retriable = True
-                    if isinstance(e, genai_errors.UnknownApiResponseError):
+                    if isinstance(e, (genai_errors.UnknownApiResponseError, JSONDecodeError)):
                         is_retriable = True
 
                     if not is_retriable or attempt >= max_attempts:
@@ -328,7 +357,7 @@ class GeminiAgentNode(AgentNode):
                         time.sleep(delay)
                     self.ctx.post_update()
 
-                    # Rebuild client on transport errors to reset broken sessions/sockets.
+                    # Rebuild on transport or content-decoding errors to reset broken sessions/sockets.
                     if is_connection:
                         self._close_client()
                         self.client = self.client_factory()
