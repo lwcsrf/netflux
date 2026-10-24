@@ -147,7 +147,7 @@ class TestTUIResultLogging(unittest.TestCase):
             running = _make_view(self.fn, state=NodeState.Running, update_seqnum=node_id)
             self._launch(running, name=f"session {node_id}")
             terminal_views[node_id] = replace(
-                running, state=state, exception=exception, ended_at=1_700_000_005.0
+                running, state=state, exception=exception, ended_at=1_700_000_005.0, update_seqnum=node_id + 3
             )
         self.assertEqual(self._results(), [])
 
@@ -204,8 +204,8 @@ class TestTUIResultLogging(unittest.TestCase):
         second = _make_view(self.fn, state=NodeState.Running, update_seqnum=2)
         self._launch(first, name="unprintable")
         self._launch(second, name="healthy")
-        first_done = replace(first, state=NodeState.Success, outputs=_UnprintableResult(), ended_at=3.0)
-        second_done = replace(second, state=NodeState.Success, outputs="healthy output", ended_at=4.0)
+        first_done = replace(first, state=NodeState.Success, outputs=_UnprintableResult(), ended_at=3.0, update_seqnum=3)
+        second_done = replace(second, state=NodeState.Success, outputs="healthy output", ended_at=4.0, update_seqnum=4)
         self.tui._event_queue.put(_RunUpdateEvent(0, first_done))
         self.tui._event_queue.put(_RunUpdateEvent(1, second_done))
 
@@ -227,8 +227,8 @@ class TestTUIResultLogging(unittest.TestCase):
         self._launch(first, name="first")
         self._launch(second, name="second")
         terminal_views = {
-            1: replace(first, state=NodeState.Success, outputs="first output", ended_at=3.0),
-            2: replace(second, state=NodeState.Success, outputs="second output", ended_at=4.0),
+            1: replace(first, state=NodeState.Success, outputs="first output", ended_at=3.0, update_seqnum=3),
+            2: replace(second, state=NodeState.Success, outputs="second output", ended_at=4.0, update_seqnum=4),
         }
 
         def write_result(*args: object, **kwargs: object) -> None:
@@ -253,12 +253,14 @@ class TestTUIResultLogging(unittest.TestCase):
         self.tui.register_terminal_callback(callback)
         running = _make_view(self.fn, state=NodeState.Running, update_seqnum=1)
         self._launch(running, name="canceled")
-        terminal = replace(running, state=NodeState.Canceled, ended_at=3.0)
+        terminal = replace(running, state=NodeState.Canceled, ended_at=3.0, update_seqnum=2)
 
         with patch.object(self.runtime, "get_view", return_value=terminal), patch(
             "netflux.tui.tui.log_tui_result", side_effect=OSError("log unavailable")
         ):
             self.assertFalse(self.tui.handle_interrupt())
+            self.tui.handle_key("down")
+            self.tui.handle_key("\r")
 
         callback.assert_called_once_with({})
         self.assertTrue(self.tui._runs[0].cancel_event.is_set())

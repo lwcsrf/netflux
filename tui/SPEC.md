@@ -53,6 +53,7 @@ The current implementation is split into:
 - `ConsoleRender`: viewport-scoped single-tree renderer/controller.
 - `TUI`: multi-pane controller.
 - `_controller_helpers`: bottom-bar composition and layout helpers.
+- `_confirmation`: shared cancellation confirmation selection and frame.
 - `_contracts`: small controller/status protocols and dataclasses.
 - `_terminal_io`: terminal setup/restore and low-level input decoding.
 
@@ -88,6 +89,11 @@ Cross-platform support:
 - On POSIX, interactive startup must happen on the process main thread.
 - On POSIX, interactive startup requires the default Python `SIGINT` handler.
 - On Windows, resize notifications and mouse input are enabled through the console input mode.
+- Interactive main-thread sessions defer `SIGINT` to the input loop before confirmation and ignore it in the confirmation screen. After all cancel events are set, physical `Ctrl+C` signals and asynchronous force interrupts are reenabled before terminal callbacks. Forced exit can abandon an in-progress callback or render; terminal cleanup remains protected against repeated interrupts. The previous handler is restored on exit.
+- POSIX sessions temporarily disable the terminal's interrupt character and decode `Ctrl+C` as input, so an accidental press cannot signal foreground child processes before confirmation. Other terminal signal keys keep their existing behavior, and the original terminal attributes are restored on exit.
+- During POSIX terminal cleanup after confirmed cancellation, `NOFLSH` protects screen restoration sequences while Python ignores repeated `Ctrl+C`. Ignoring Python signals alone would still let those presses flush output in the kernel. The session keeps its no-echo settings until the original attributes are restored afterward, without waiting for competing terminal writers to drain.
+- Windows console input disables processed input during the session so ordinary `Ctrl+C` is decoded as an input event; the previous console mode is restored on exit.
+- Both platforms configure terminal interrupt protection before controller startup callbacks. Startup vetoes and failures restore input without entering the alternate screen. Windows native waits remain bounded while a Python SIGINT handler is installed, so external signals are dispatched even when the UI is idle without forcing idle redraws.
 
 Non-interactive handling:
 - `ConsoleRender.run(node)` supports non-interactive stdout/stdin combinations and avoids interactive terminal control behavior when stdout is not a TTY.
@@ -97,6 +103,7 @@ Threading model:
 - terminal writes happen only on the shared driver thread,
 - watcher threads never write to the terminal,
 - watcher threads communicate root updates back to the controller through a thread-safe queue and a wakeup callback,
+- controllers ignore stale or duplicate snapshots so queued updates cannot undo a newer runtime refresh,
 - watcher threads are daemon threads and are not joined during normal shutdown.
 
 ## 3. `ConsoleRender` Tree Rendering Contract
@@ -258,7 +265,7 @@ Standalone key bindings:
 - `a`: collapse enclosing agent
 - `e` / `E`: expand all / collapse all
 - `q` / Escape: leave the post-completion browser only
-- `Ctrl+C`: cooperative cancellation while live
+- `Ctrl+C`: open cancellation confirmation while live
 
 Clipboard-copy feedback:
 - when `c` is available but clipboard copy fails because no Linux clipboard backend is installed, the bottom bar shows an install hint mentioning `wl-copy`, `xclip`, and `xsel`,
@@ -275,8 +282,12 @@ Standalone mouse behavior:
 ### 4.4 Cancel and Exit Semantics
 
 While live:
-- the first `Ctrl+C` sets the root cancel event and keeps the session alive until a terminal update arrives,
-- a later `Ctrl+C` takes the stronger exit path.
+- the first interactive `Ctrl+C` opens the shared confirmation screen described below,
+- confirming sets the root cancel event and keeps the session alive until a terminal update arrives,
+- after confirmation, a later `Ctrl+C` takes the stronger exit path,
+- non-interactive sessions retain immediate cooperative cancellation on the first interrupt and stronger exit on the next.
+
+Interactive confirmation defaults to Cancel and requires explicit navigation followed by Enter to confirm. While the prompt is open, further `Ctrl+C` presses are ignored and work continues. Input queued before the first confirmation frame has been written is discarded, so earlier navigation or Enter cannot authorize cancellation. Dismissing it restores the previous UI state. Leaving the prompt discards pending terminal input, including queued `Ctrl+C`, so modal typeahead cannot become a new interrupt in the resumed mode. On confirmation, physical interrupts are rearmed before this discard while signal handling still ignores interrupts.
 
 After a cooperative cancel request:
 - the final terminal state is still rendered,
@@ -290,6 +301,7 @@ The standalone bottom bar:
 - shows cursor position, selected-root state, and total tree token bill when available,
 - preserves state/status data ahead of shortcut text under narrow widths,
 - shows `^C:cancel` while live and cancelable,
+- shows `^C:force quit` while waiting for confirmed cancellation,
 - shows `q:quit` in terminal browse mode,
 - shows `c` for copyable selected text and `r` for a root outcome (result, error, or cancellation exception).
 
@@ -488,7 +500,7 @@ Current rules:
 - a hidden terminal transition marks the run unread,
 - selecting a different run clears unread on the destination run,
 - navigating away from an unread run does not clear it,
-- if the launch form or the dedicated too-small frame temporarily hides the selected run and that run reaches terminal state, the run becomes automatically unread,
+- if a launch form, cancellation confirmation, or the dedicated too-small frame temporarily hides the selected run and that run reaches terminal state, the run becomes automatically unread,
 - when that same selected run becomes visible again without a selection change, automatic unread clears,
 - manual unread survives temporary hiding and re-showing without a selection change,
 - if a manually unread run reaches terminal while still visible, it remains unread.
@@ -500,9 +512,10 @@ Selected-run cancel:
 - the binding is omitted when the selected run is already terminal.
 
 Session-wide interrupt handling:
-- the first `Ctrl+C` sets the cancel event for every tracked run and keeps the session alive,
+- the first `Ctrl+C` opens the shared confirmation screen, including when no runs exist or all runs have finished,
+- confirming sets the cancel event for every tracked run and keeps the session alive; launch forms close and new launches are disabled during cancellation,
 - once all tracked runs are terminal, the controller exits after rendering the final frame,
-- a second `Ctrl+C` takes the stronger exit path immediately,
+- only a `Ctrl+C` after confirmation takes the stronger exit path,
 - before exiting on either path, the controller makes a best-effort attempt to deliver any pending terminal callbacks.
 
 ### 5.9 Terminal Callback

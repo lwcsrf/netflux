@@ -7,7 +7,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 from ..core import Node, NodeState, NodeView, TerminalNodeStates
-from ._contracts import SelectedTreeStatus, SessionController, TerminalSize
+from ._confirmation import CancelConfirmation
+from ._contracts import InterruptMode, SelectedTreeStatus, SessionController, TerminalSize
 from ._controller_helpers import (
     compose_bottom_bar,
     render_too_small_frame,
@@ -55,10 +56,12 @@ class SingleTreeConsoleController(SessionController):
         self._mode = "live"
         self._exit_after_terminal = False
         self._exit_after_render = False
+        self._cancel_confirmation: CancelConfirmation | None = None
         self._latest_view: NodeView | None = node.watch(as_of_seq=0, timeout=0)
         self._queue: queue.Queue[_ViewEvent] = queue.Queue()
         self._stop_event = threading.Event()
         self._wakeup: Callable[[], None] = lambda: None
+        self._interrupt_mode_callback: Callable[[InterruptMode], None] = lambda _mode: None
         self._watch_thread = threading.Thread(
             target=self._watch_root,
             name=f"netflux-standalone-watch-{node.id}",
@@ -70,6 +73,9 @@ class SingleTreeConsoleController(SessionController):
 
     def set_wakeup(self, wakeup: Callable[[], None]) -> None:
         self._wakeup = wakeup
+
+    def set_interrupt_mode_callback(self, callback: Callable[[InterruptMode], None]) -> None:
+        self._interrupt_mode_callback = callback
 
     def _watch_root(self) -> None:
         prev_seq = 0
@@ -101,6 +107,8 @@ class SingleTreeConsoleController(SessionController):
                 event = self._queue.get_nowait()
             except queue.Empty:
                 break
+            if self._latest_view is not None and event.view.update_seqnum <= self._latest_view.update_seqnum:
+                continue
             changed = True
             self._latest_view = event.view
             self._renderer.assign_view(event.view)
@@ -142,10 +150,11 @@ class SingleTreeConsoleController(SessionController):
             return None
         return self._flash_message
 
-    @staticmethod
-    def _mandatory_shortcuts(status: SelectedTreeStatus) -> list[str]:
+    def _mandatory_shortcuts(self, status: SelectedTreeStatus) -> list[str]:
         if status.state in TerminalNodeStates:
             return ["q:quit"]
+        if self._exit_after_terminal:
+            return ["^C:force quit"]
         if status.can_cancel:
             return ["^C:cancel"]
         return []
@@ -170,6 +179,9 @@ class SingleTreeConsoleController(SessionController):
         self._too_small = standalone_too_small(size)
 
         self._apply_latest_terminal_state()
+
+        if self._cancel_confirmation is not None:
+            return self._cancel_confirmation.render_frame(size)
 
         if self._too_small:
             status = self._status_without_position()
@@ -216,6 +228,14 @@ class SingleTreeConsoleController(SessionController):
         return self._finalize_frame("\n".join([body, f"{bottom_bar}\x1b[K"]))
 
     def handle_key(self, key: str) -> bool:
+        if self._cancel_confirmation is not None:
+            confirmed = self._cancel_confirmation.handle_key(key)
+            if confirmed is not None:
+                self._cancel_confirmation = None
+                if confirmed:
+                    return self._request_cancel()
+                self._interrupt_mode_callback("defer")
+            return False
         if key in ("q", "escape"):
             return self._mode == "browse"
 
@@ -235,6 +255,8 @@ class SingleTreeConsoleController(SessionController):
         return False
 
     def handle_mouse(self, event: object) -> bool:
+        if self._cancel_confirmation is not None:
+            return False
         if self._too_small:
             return False
         button = getattr(event, "button", None)
@@ -248,13 +270,35 @@ class SingleTreeConsoleController(SessionController):
         return False
 
     def handle_interrupt(self) -> bool:
+        if self._cancel_confirmation is not None:
+            return False
+        if self._exit_after_terminal:
+            raise KeyboardInterrupt
         if self._mode != "live":
             return True
 
+        if self._interactive:
+            self._interrupt_mode_callback("ignore")
+            self._cancel_confirmation = CancelConfirmation(title="Cancel this run and quit?")
+            return False
         cancel_event = self._renderer.cancel_event()
-        if cancel_event is not None and not cancel_event.is_set():
+        if cancel_event is not None and cancel_event.is_set():
+            raise KeyboardInterrupt
+        return self._request_cancel()
+
+    def _request_cancel(self) -> bool:
+        if self._mode != "live":
+            # Completion can arrive while the modal hides the result. Render
+            # that result before exiting, with force quit available meanwhile.
+            self._exit_after_render = True
+            self._interrupt_mode_callback("force")
+            return False
+        cancel_event = self._renderer.cancel_event()
+        if cancel_event is not None:
             cancel_event.set()
             self._exit_after_terminal = True
+            self._interrupt_mode_callback("force")
+            self._apply_latest_terminal_state()
             return False
         raise KeyboardInterrupt
 
