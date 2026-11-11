@@ -1298,7 +1298,7 @@ class TestRuntimeProviderInheritance(unittest.TestCase):
         self.enterContext(patch("netflux.runtime.get_AgentNode_impl", side_effect=fake_impl))
         return Runtime(
             [fn],
-            client_factories={Provider.Anthropic: object, Provider.Gemini: object},
+            client_factories={Provider.Anthropic: object, Provider.Gemini: object, Provider.OpenAI: object},
         )
 
     def test_tool_delegation_and_recursion_inherit_per_tree(self) -> None:
@@ -1327,6 +1327,8 @@ class TestRuntimeProviderInheritance(unittest.TestCase):
         )
         for root, provider in ((default_root, Provider.Anthropic), (overridden_root, Provider.Gemini)):
             self.assertEqual(root.result(), " ".join([provider.value] * 4))
+            for node in (root, *root.children, *root.children[-1].children):
+                self.assertIs(node.heritable_model, provider)
         self.assertIs(recursive.default_model, Provider.Anthropic)
         self.assertIs(leaf.default_model, Provider.Anthropic)
 
@@ -1346,12 +1348,23 @@ class TestRuntimeProviderInheritance(unittest.TestCase):
             return node.invoke_tool_function("outer", {}, "outer-use").result()
 
         runtime = self._make_runtime(agent, behavior)
-        agent_root = runtime.invoke(None, agent, {}, provider=Provider.Gemini)
-        self.assertEqual(agent_root.result(), Provider.Gemini.value)
+        for allowed, expected in ((tuple(Provider), Provider.Gemini), ((Provider.Anthropic,), Provider.Anthropic)):
+            with self.subTest(allow_models=allowed):
+                leaf.allow_models = allowed
+                agent_root = runtime.invoke(None, agent, {}, provider=Provider.Gemini)
+                self.assertEqual(agent_root.result(), expected.value)
+                outer_node = agent_root.children[0]
+                inner_node = outer_node.children[0]
+                for node in (agent_root, outer_node, inner_node):
+                    self.assertIs(node.heritable_model, Provider.Gemini)
+                self.assertIs(inner_node.children[0].heritable_model, expected)
+                self.assertIsNone(runtime.get_view(outer_node.id).provider)
         code_root = runtime.invoke(None, outer, {})
         self.assertEqual(code_root.result(), Provider.Anthropic.value)
         self.assertIsNone(runtime.get_view(code_root.id).provider)
-        self.assertIsNone(runtime.get_view(agent_root.children[0].id).provider)
+        self.assertIsNone(code_root.heritable_model)
+        self.assertIsNone(code_root.children[0].heritable_model)
+        self.assertIs(code_root.children[0].children[0].heritable_model, Provider.Anthropic)
 
     def test_explicit_override_is_inherited_by_its_subtree_only(self) -> None:
         leaf = _make_agent_function("leaf")
@@ -1361,7 +1374,9 @@ class TestRuntimeProviderInheritance(unittest.TestCase):
         )
         child = _make_agent_function("child", uses=[wrapper])
         child.default_model = Provider.Gemini
+        child.allow_models = (Provider.Gemini,)
         root = _make_agent_function("root", uses=[child, leaf])
+        root.allow_models = (Provider.Anthropic,)
 
         def behavior(node: AgentNode) -> str:
             if node.agent_fn is leaf:
@@ -1376,8 +1391,20 @@ class TestRuntimeProviderInheritance(unittest.TestCase):
         node = runtime.invoke(None, root, {}, provider=Provider.Gemini, max_agent_levels=3)
         self.assertEqual(node.result(), "Anthropic Gemini")
         self.assertIs(node.children[0].provider, Provider.Anthropic)
+        overridden = node.children[0]
+        wrapper_node = overridden.children[0]
+        for descendant in (overridden, wrapper_node, wrapper_node.children[0]):
+            self.assertIs(descendant.heritable_model, Provider.Anthropic)
+        self.assertIs(node.heritable_model, Provider.Gemini)
+        self.assertIs(node.children[1].heritable_model, Provider.Gemini)
         self.assertIs(child.default_model, Provider.Gemini)
         self.assertIs(leaf.default_model, Provider.Gemini)
+
+        # Use the default when the nearest agent is excluded, even if an older ancestor is allowed.
+        leaf.default_model = Provider.OpenAI
+        leaf.allow_models = (Provider.Gemini, Provider.OpenAI)
+        node = runtime.invoke(None, root, {}, provider=Provider.Gemini, max_agent_levels=3)
+        self.assertEqual(node.result(), "OpenAI Gemini")
 
 
 class TestRuntimeObservability(unittest.TestCase):
