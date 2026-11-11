@@ -216,7 +216,11 @@ class Runtime:
             node = CodeNode(ctx, node_id, fn, inputs, caller, cancel_event, tool_use_id)
 
         elif isinstance(fn, AgentFunction):
-            provider = provider or fn.default_model
+            if provider is None:
+                ancestor = caller
+                while ancestor is not None and not isinstance(ancestor, AgentNode):
+                    ancestor = ancestor.parent
+                provider = ancestor.provider if ancestor is not None else fn.default_model
             if provider not in self._providers:
                 self._providers[provider] = get_AgentNode_impl(provider)
             impl: type[AgentNode] = self._providers[provider]

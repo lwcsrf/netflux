@@ -81,4 +81,4 @@ Run:
 
 `python -m netflux.demos.tui`
 
-Each tree launch chooses its provider in the TUI launch form. For `AgentFunction` roots, the provider field defaults to that `AgentFunction`'s `default_model`; changing it overrides only that top-level invoke.
+Each tree launch chooses its provider in the TUI launch form. For `AgentFunction` roots, the provider field defaults to that `AgentFunction`'s `default_model`; the selected provider is inherited by descendant agents through any intervening code nodes, unless an invocation explicitly overrides it.

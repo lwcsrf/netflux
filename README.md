@@ -578,6 +578,10 @@ This refined example shows:
     * `cancel_event: Optional[Event]`: cooperative cancellation token inherited from the caller unless explicitly overridden by the caller.
 * Methods:
     * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None, max_agent_levels: Optional[int] = None) -> Node`: invoke a `Function` and return the created `Node`.
+        * For `AgentFunction` calls, provider selection follows this precedence:
+            1. An explicit non-`None` `provider=` on this invocation always wins.
+            2. Otherwise, inherit the nearest ancestor `AgentNode`'s actual provider, skipping any number of `CodeNode`s. A child override therefore becomes the provider inherited by its descendants.
+            3. If there is no agent ancestor (a root call or code-only ancestry), use the invoked function's `default_model`.
         * On a top-level invocation, `max_agent_levels` limits the number of `AgentNode`s along any lineage that will be realized in the tree. Descendant invocations inherit the tree's value and do not pass this argument.
             * Only Agent depth is limited: `CodeNode`s do not increase the agent level, and Agent siblings do not share a quota. An Agent invocation beyond the limit raises `MaxAgentLevelExceededException` without creating a `Node`; `CodeFunction` calls remain legal at the boundary. In a multi-tool-call batch, each call is handled independently, so an over-depth Agent call does not prevent a legal Code call in the same batch from succeeding.
             * An Agent exactly at the limit receives a runtime warning in its effective system prompt. Its declared tools remain unchanged.

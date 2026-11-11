@@ -470,7 +470,9 @@ class RunContext:
         Proxy to the Runtime to invoke a Function and create associated Node + edges.
         Returns the created `Node`.
 
-        For AgentFunction calls only, optionally specify `provider` to override the default model.
+        For AgentFunction calls only, a non-None `provider` overrides provider selection.
+        Otherwise, inherit the nearest ancestor AgentNode's provider, skipping CodeNodes,
+        or use the invoked function's `default_model` if there is no agent ancestor.
 
         Provide `cancel_event` to enforce a particular cancellation scope for the child node.
         When omitted, the Runtime inherits the caller's CancelEvent (if any). It is correct
