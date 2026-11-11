@@ -12,7 +12,7 @@ import httpx2
 from overrides import override
 
 from ..core import (
-    Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
+    FunctionArg, Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
     UserTextPart, ModelTextPart, ModelStatusPart, ThinkingBlockPart, ToolUsePart, ToolResultPart,
     TokenUsage,
 )
@@ -616,8 +616,9 @@ class GeminiAgentNode(AgentNode):
         return [types.Tool(function_declarations=decls)] if decls else []
 
     def _make_function_declaration(self, fn: Function) -> types.FunctionDeclaration:
+        args: List[FunctionArg] = self.func_args(fn)
         params_props: Dict[str, types.Schema] = {}
-        for arg in fn.args:
+        for arg in args:
             enum: Union[List[str], None] = None
             if arg.argtype is str and arg.enum is not None:
                 enum = sorted(list(arg.enum))
@@ -626,10 +627,11 @@ class GeminiAgentNode(AgentNode):
                 type=self._gemini_type_for_arg(arg.argtype),
                 description=arg.desc,
                 enum=enum,
+                nullable=True if arg.optional else None,
             )
             params_props[arg.name] = arg_schema
 
-        params_required = [arg.name for arg in fn.args if not arg.optional]
+        params_required = [arg.name for arg in args if not arg.optional]
 
         return types.FunctionDeclaration(
             name=fn.name,
