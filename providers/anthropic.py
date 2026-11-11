@@ -20,7 +20,7 @@ import anthropic
 from anthropic.lib.streaming import ParsedMessageStreamEvent
 from anthropic.types import (
     ErrorType,
-    Message, MessageParam,
+    Message, MessageParam, AssistantMessageParam, ModelParam,
     RefusalStopDetails,
     Usage,
     TextBlock, TextBlockParam, ImageBlockParam,
@@ -153,7 +153,7 @@ class AnthropicAgentNode(AgentNode):
                 "AnthropicAgentNode expected client_factory to return anthropic.Anthropic"
             )
         self.client: anthropic.Anthropic = client
-        self.model = ModelNames[Provider.Anthropic]
+        self.model: ModelParam = ModelNames[Provider.Anthropic]
         self._history: List[MessageParam] = []   # Typed conversation history we replay every turn
         self._tools: List[ToolUnionParam] = self._build_tool_params()
         self._token_usage = TokenUsage()
@@ -438,7 +438,7 @@ class AnthropicAgentNode(AgentNode):
 
             # Append assistant turn to history for strict session replay.
             self._history.append(
-                MessageParam(role="assistant", content=assistant_params)
+                AssistantMessageParam(role="assistant", content=assistant_params)
             )
 
             # Combine this iteration's text into one framework transcript part.
