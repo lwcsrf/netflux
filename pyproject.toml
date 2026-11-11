@@ -4,19 +4,20 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "netflux"
-version = "0.4.4"
+version = "0.4.5"
 maintainers = [
   { name="LW Computational Science Research Foundation" },
 ]
 description = "Framework for authoring custom agentic applications, treating agents as first-class functions."
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
 dependencies = [
+    "httpx>=0.28.1, <1.0.0",
     "httpx2[http2]>=2.7.0, <3.0.0",  # to support most provider SDKs
     "overrides",
     "Pillow>=12.1.0",                # to support `view_image()` built-in
@@ -40,9 +41,9 @@ tui = [
 ]
 
 # Provider-specific dependencies
-anthropic = ["anthropic>=1.17.0, <2.0.0"]
-gemini = ["google-genai>=2.33.0, <3.0.0"]
-openai = ["openai>=3.36.1, <4.0.0"]
+anthropic = ["anthropic>=2.8.0, <3.0.0"]
+gemini = ["google-genai>=3.1.0, <4.0.0"]
+openai = ["openai>=3.49.0, <4.0.0"]
 xai = ["xai-sdk>=1.19.0, <2.0.0"]
 
 # A convenience group to install all provider clients

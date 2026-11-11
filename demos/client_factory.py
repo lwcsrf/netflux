@@ -79,8 +79,6 @@ def gemini_client_factory(): # -> genai.Client
     )
     http_client = httpx2.Client(http2=True, limits=httpx_limits, timeout=httpx_timeout)
     http_options = types.HttpOptions(
-        # Choose api_version if you want only GA endpoints; by default SDK uses v1beta for preview features.
-        # api_version="v1",  # uncomment to pin to stable
         httpx_client=http_client,
         retry_options=sdk_retry,
         # Required in addition to httpx_timeout.
