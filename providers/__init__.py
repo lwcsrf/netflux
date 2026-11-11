@@ -16,7 +16,7 @@ class Provider(Enum):
 ModelNames: Dict[Provider, str] = {
     Provider.OpenAI: "gpt-6-astra",
     Provider.Anthropic: "claude-fable-5-1",
-    Provider.Gemini: "gemini-4-argon",
+    Provider.Gemini: "gemini-4-carbon",
     Provider.xAI: "grok-4.6",
 }
 

@@ -83,7 +83,7 @@ from google.genai import errors as genai_errors
     * Ref: `https://ai.google.dev/gemini-api/docs/generate-content/long-decode`.
 """
 
-MAX_TOKENS = 131_072
+MAX_TOKENS = 262_144
 THINKING_CFG = types.ThinkingConfig(
     thinking_level=types.ThinkingLevel.HIGH,
     # Disable Thought Summaries always: they are not useful, and we don't want to
@@ -121,7 +121,7 @@ class GeminiAgentNode(AgentNode):
         client: genai.Client = cast(genai.Client, client_factory())
         assert isinstance(client, genai.Client), \
             "GeminiAgentNode expected client_factory to return `google.genai.Client`"
-        self.client: genai.Client = client
+        self.client: Optional[genai.Client] = client
         self.model = ModelNames[Provider.Gemini]
         self._history: List[types.Content] = []   # Typed conversation history we replay every turn
         self._tool_call_counter = 0
@@ -180,7 +180,7 @@ class GeminiAgentNode(AgentNode):
         client = self.client
         if client is None:
             return
-        self.client = None  # type: ignore[assignment]
+        self.client = None
 
         # Gemini leaves injected HTTP clients open; capture ours before SDK cleanup.
         http_client: Optional[Union[httpx.Client, httpx2.Client]] = None
@@ -242,6 +242,7 @@ class GeminiAgentNode(AgentNode):
             while True:
                 force_retry: bool = False
                 try:
+                    assert self.client is not None, "Gemini client is closed."
                     resp = self.client.models.generate_content(
                         model=self.model,
                         contents=cast(types.ContentListUnionDict, self._history),
@@ -277,7 +278,7 @@ class GeminiAgentNode(AgentNode):
                         types.FinishReason.SPII,
                         types.FinishReason.MALFORMED_FUNCTION_CALL,
                         types.FinishReason.UNEXPECTED_TOOL_CALL,
-                        "MALFORMED_RESPONSE",  # Not yet exposed by the SDK enum.
+                        types.FinishReason.MALFORMED_RESPONSE,
                     ):
                         # Force retry below. Burn one attempt.
                         force_retry = True
@@ -296,7 +297,7 @@ class GeminiAgentNode(AgentNode):
                     genai_errors.APIError,
                     genai_errors.UnknownApiResponseError,
                     JSONDecodeError,
-                    # The SDK defaults to httpx unless client_factory supplies an httpx2 client.
+                    # The SDK defaults to httpx2; factories may also supply legacy httpx clients.
                     httpx.HTTPStatusError,
                     httpx.TransportError,
                     httpx.DecodingError,
@@ -379,7 +380,7 @@ class GeminiAgentNode(AgentNode):
                 assert candidate.content.role in (None, "model"), (
                     f"Unexpected Gemini response role: {candidate.content.role}")
                 self._check_thoughts_sanity(candidate.content)
-            hop_parts: types.Parts = (candidate.content.parts or []) if candidate.content else []
+            hop_parts: list[types.Part] = (candidate.content.parts or []) if candidate.content else []
 
             if candidate.finish_reason == types.FinishReason.CONTINUATION or (
                 candidate.finish_reason is None and candidate.continuation_token
@@ -404,7 +405,7 @@ class GeminiAgentNode(AgentNode):
 
             # Multi-hop agent cycle is ready to proceed after this final hop.
             pending_parts.extend(hop_parts)
-            parts: types.Parts = pending_parts
+            parts: list[types.Part] = pending_parts
             pending_parts = []
             continuation_token = None
             if not parts:
