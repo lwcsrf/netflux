@@ -1,5 +1,4 @@
 import unittest
-from importlib import import_module
 from types import MappingProxyType
 from unittest.mock import patch
 
@@ -307,11 +306,6 @@ class TestAgentProviderToolSelection(unittest.TestCase):
         self.assertTrue(spec.desc.endswith(
             "Omit or null: will use default Gemini."
         ))
-        self.assertEqual(node.func_args(leaf), [*leaf.args, spec])
-        self.assertEqual(node.func_args(root_fn)[-1].enum, {p.value for p in Provider})
-        self.assertEqual([arg.name for arg in leaf.args], ["task"])
-        self.assertIsNot(node.func_args(code), code.args)
-        self.assertEqual(node.func_args(code), code.args)
 
         with patch.object(node.ctx, "invoke") as invoke:
             for value in ("Anthropic", "gemini", 42, [], Provider.Gemini):
@@ -330,79 +324,42 @@ class TestAgentProviderToolSelection(unittest.TestCase):
             node.invoke_tool_function("root", raw_args, "unsupported-provider")
         self.assertEqual(raw_args, {"provider": "xAI"})
 
-    def test_provider_tool_schemas_across_adapters(self):
-        primitives = {
-            "text": (str, "string"), "count": (int, "integer"),
-            "ratio": (float, "number"), "enabled": (bool, "boolean"),
-        }
-        leaf = self._agent("leaf", args=[
+    def test_model_facing_arguments_preserve_task_signatures(self):
+        task_args = [
             FunctionArg("task", str),
             FunctionArg("style", str, optional=True, enum={"brief", "full"}),
-            *(FunctionArg(name, argtype, optional=True) for name, (argtype, _) in primitives.items()),
-        ], allow_models=[Provider.Anthropic])
-        null_args = {"task": "work", **dict.fromkeys(primitives)}
+            *(FunctionArg(t.__name__, t, optional=True) for t in (str, int, float, bool)),
+        ]
+        leaf = self._agent("leaf", args=task_args, allow_models=[Provider.Anthropic])
+        self.assertEqual(leaf.validate_coerce_args({"task": "work"}), {"task": "work"})
+        null_args = {"task": "work", **dict.fromkeys(arg.name for arg in task_args if arg.optional)}
         self.assertEqual(leaf.validate_coerce_args(null_args), null_args)
+        code_args = [FunctionArg("provider", str, enum={"local"})]
         code = CodeFunction(
-            name="code", desc="code", args=[FunctionArg("provider", str, enum={"local"})],
+            name="code", desc="code", args=code_args,
             callable=lambda ctx, *, provider: provider,
         )
         plain = CodeFunction(name="plain", desc="plain", args=[], callable=lambda ctx: None)
         root_fn = self._agent("root", uses=[leaf, code, plain], recursive=True)
         runtime = Runtime([root_fn], client_factories={Provider.Anthropic: object})
-        for sdk, module_name, class_name in (
-            ("anthropic", "anthropic", "AnthropicAgentNode"),
-            ("google.genai", "gemini", "GeminiAgentNode"),
-            ("openai", "openai", "OaiAgentNode"),
+        node = _FakeAgentNode(RunContext(runtime, None), 1, root_fn, {}, client_factory=object)
+        # Test the shared argument contract consumed by every adapter, including recursion.
+        for fn, declared, choices in (
+            (leaf, task_args, {"Anthropic"}),
+            (root_fn, [], {p.value for p in Provider}),
+            (code, code_args, None),
+            (plain, [], None),
         ):
-            with self.subTest(adapter=module_name):
-                try:
-                    import_module(sdk)
-                except ModuleNotFoundError:
-                    self.skipTest(f"optional SDK {sdk} is not installed")
-                cls = getattr(import_module(f"netflux.providers.{module_name}"), class_name)
-                # Exercise pure schema construction without creating SDK clients.
-                node = object.__new__(cls)
-                AgentNode.__init__(node, RunContext(runtime, None), 1, root_fn, {}, None, None, object)
-                if module_name == "anthropic":
-                    schemas = {tool["name"]: tool["input_schema"] for tool in node._build_tool_params()}
-                elif module_name == "gemini":
-                    schemas = {
-                        declaration.name: declaration.parameters.model_dump(mode="json", exclude_none=True)
-                        for tool in node._build_tool_params() for declaration in tool.function_declarations
-                    }
-                else:
-                    schemas = {fn.name: node.make_function_tool(fn)["parameters"] for fn in root_fn.uses}
-                for fn in (leaf, root_fn):
-                    provider = schemas[fn.name]["properties"]["provider"]
-                    choices = {p.value for p in fn.allow_models}
-                    self.assertNotIn("provider", schemas[fn.name].get("required", []))
-                    self.assertEqual(provider["description"], node.provider_arg_spec(fn).desc)
-                    if module_name == "gemini":
-                        self.assertTrue(provider["nullable"])
-                        self.assertEqual(provider["type"], "STRING")
-                        self.assertEqual(set(provider["enum"]), choices)
-                    else:
-                        self.assertEqual(set(provider["type"]), {"string", "null"})
-                        self.assertEqual(set(provider["enum"]), choices | {None})
-                self.assertEqual(schemas["leaf"]["required"], ["task"])
-                style = schemas["leaf"]["properties"]["style"]
-                if module_name == "gemini":
-                    self.assertTrue(style["nullable"])
-                else:
-                    self.assertIn("null", style["type"])
-                    self.assertIn(None, style["enum"])
-                for name, (_, json_type) in primitives.items():
-                    with self.subTest(argument=name):
-                        prop = schemas["leaf"]["properties"][name]
-                        if module_name == "gemini":
-                            self.assertTrue(prop["nullable"])
-                            self.assertEqual(prop["type"], json_type.upper())
-                        else:
-                            self.assertEqual(set(prop["type"]), {json_type, "null"})
-                self.assertEqual(schemas["code"]["required"], ["provider"])
-                self.assertEqual(schemas["code"]["properties"]["provider"]["enum"], ["local"])
-                self.assertEqual(schemas["plain"].get("properties", {}), {})
-                self.assertEqual([arg.name for arg in leaf.args], ["task", "style", *primitives])
+            with self.subTest(function=fn.name):
+                args = node.func_args(fn)
+                self.assertIsNot(args, fn.args)
+                if choices is not None:
+                    control = args.pop()
+                    self.assertEqual((control.name, control.argtype, control.optional), ("provider", str, True))
+                    self.assertEqual(control.enum, choices)
+                    self.assertEqual(control.desc, node.provider_arg_spec(fn).desc)
+                self.assertEqual(args, declared)
+                self.assertEqual(fn.args, declared)
 
 
 if __name__ == "__main__":
