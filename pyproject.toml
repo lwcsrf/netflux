@@ -43,7 +43,7 @@ tui = [
 # Provider-specific dependencies
 anthropic = ["anthropic>=2.8.0, <3.0.0"]
 gemini = ["google-genai>=3.1.0, <4.0.0"]
-openai = ["openai>=3.36.1, <4.0.0"]
+openai = ["openai>=3.49.0, <4.0.0"]
 xai = ["xai-sdk>=1.19.0, <2.0.0"]
 
 # A convenience group to install all provider clients
