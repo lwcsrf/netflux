@@ -227,6 +227,10 @@ class Function(ABC):
             spec = expect[k]
             coerced[k] = v
 
+            # JSON numbers may decode as ints even for float arguments; exclude bool.
+            if spec.argtype is float and type(v) is int:
+                coerced[k] = float(v)
+
             # Tolerate boolean-like strings.
             if spec.argtype is bool and isinstance(v, str):
                 s = v.strip().lower()
