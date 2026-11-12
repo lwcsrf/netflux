@@ -269,7 +269,7 @@ class TestAgentProviderToolSelection(unittest.TestCase):
                     # Keep core's provider_arg_spec()/func_args() promise consistent with
                     # Runtime.invoke() for omitted/null providers, covering inheritance
                     # and default fallback. Fixed result expectations above guard against
-                    # both implementations agreeing on the wrong provider.
+                    # the shared resolver choosing the wrong provider.
                     behavior = "inherit" if child.parent is root else "use default"
                     self.assertTrue(description.endswith(
                         f"Omit or null: will {behavior} {child.provider.value}."
@@ -358,6 +358,8 @@ class TestAgentProviderToolSelection(unittest.TestCase):
                     self.assertEqual((control.name, control.argtype, control.optional), ("provider", str, True))
                     self.assertEqual(control.enum, choices)
                     self.assertEqual(control.desc, node.provider_arg_spec(fn).desc)
+                    # An allowed caller provider is inherited even when it equals the default.
+                    self.assertTrue(control.desc.endswith("Omit or null: will inherit Anthropic."))
                 self.assertEqual(args, declared)
                 self.assertEqual(fn.args, declared)
 

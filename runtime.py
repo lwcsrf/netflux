@@ -218,9 +218,7 @@ class Runtime:
         elif isinstance(fn, AgentFunction):
             # Order of Priority: explicit provider > caller.heritable_model (if in fn.allow_models) > fn.default_model.
             if provider is None:
-                provider = caller.heritable_model if caller is not None else None
-                if provider is None or provider not in fn.allow_models:
-                    provider = fn.default_model
+                provider = caller.resolve_unspecified_provider(fn) if caller is not None else fn.default_model
             if provider not in self._providers:
                 self._providers[provider] = get_AgentNode_impl(provider)
             impl: type[AgentNode] = self._providers[provider]

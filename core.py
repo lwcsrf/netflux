@@ -726,6 +726,13 @@ class Node(ABC):
             current = current.parent
         return None
 
+    def resolve_unspecified_provider(self, fn: AgentFunction) -> Provider:
+        """Choose a child agent's provider when the caller has not supplied one explicitly."""
+        candidate = self.heritable_model
+        if candidate is not None and candidate in fn.allow_models:
+            return candidate
+        return fn.default_model
+
     @property
     def root_ancestor(self) -> 'Node':
         """Return this node's root ancestor through immutable parent links."""
@@ -983,13 +990,8 @@ class AgentNode(Node):
     def provider_arg_spec(self, fn: AgentFunction) -> FunctionArg:
         """Provider control argument for this callee, including its actual omitted-value behavior."""
         provider_choices = ", ".join(f"{p.value} ({ModelNames[p]})" for p in fn.allow_models)
-        heritable = self.heritable_model
-        if heritable is not None and heritable in fn.allow_models:
-            model = heritable
-            behavior = "inherit"
-        else:
-            model = fn.default_model
-            behavior = "use default"
+        model = self.resolve_unspecified_provider(fn)
+        behavior = "inherit" if model == self.heritable_model else "use default"
         # Inherit only an allowed model; otherwise use fn.default_model,
         # which the AgentFunction ctor already asserted is in fn.allow_models.
         assert model in fn.allow_models
