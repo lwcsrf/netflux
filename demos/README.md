@@ -11,7 +11,7 @@ Create each file and paste your API key as the only line of text. If you use a d
 authentication flow, update the callables in `client_factory.py` before running the demos.
 
 OpenAI, Anthropic, and Gemini have built-in providers, and the client factories are for demo purposes. These can be re-used as real client factories in your app.
-Only the selected provider's SDK and key are needed.
+The puzzle demo requires all three SDKs and keys. Other demos need only the selected provider's SDK and key.
 
 ### Interactive console viewer
 
@@ -23,6 +23,11 @@ the completed tree open for browsing until you quit.
 
 The LLM needs to solve a series of puzzles and can't advance to the next stage until it has solved this stage's puzzle.
 No limits in how many guesses it gets per stage, but it needs to get the correct answer to get the key required to advance to the next stage.
+
+At each stage, the solver calls the same bare `critical_thinker` agent on Gemini,
+OpenAI, and Anthropic, then reconciles their answers and submits its own choice.
+`--provider` selects the top-level solver; its delegates use all three providers.
+This also applies to `puzzle_solver` in the TUI.
 
 The `puzzle` demo also serves the purpose of proving that the provider is capable of a single continuous reasoning chain that envelopes the multi cycles of tool use.
 

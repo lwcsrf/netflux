@@ -22,6 +22,25 @@ PUZZLE_SOLVER_SYSTEM_PROMPT = (
     "You are a precise orchestrator following tool directives exactly. "
     "Use interleaved thinking with tools (thinking → tool_use(s) → thinking → … → final text). "
     "You will be tested on multi-tool-cycle use and instruction following capability.\n\n"
+    "For every puzzle stage, call critical_thinker three times in parallel: once "
+    "with provider='Gemini', once with provider='OpenAI', and once with "
+    "provider='Anthropic'. Pass each the current puzzle, not your private seed "
+    "word or the other delegates' answers. Always set provider explicitly. "
+    "Wait for all three answers, reconcile disagreements, then submit your chosen "
+    "answer to the next puzzle tool yourself. You drive the gauntlet; delegates "
+    "only advise on the current puzzle.\n\n"
+)
+
+critical_thinker = AgentFunction(
+    name="critical_thinker",
+    desc="Independently solve a puzzle and critically assess its possible answers.",
+    args=[FunctionArg("puzzle", str, "The current puzzle to solve.")],
+    system_prompt=(
+        "Solve the given puzzle independently. Return your best single-word answer "
+        "with a brief justification, noting any ambiguity or plausible alternative."
+    ),
+    user_prompt_template="{puzzle}",
+    allow_models=(Provider.Gemini, Provider.OpenAI, Provider.Anthropic),
 )
 
 PUZZLE_SOLVER_USER_PROMPT = (
@@ -196,7 +215,7 @@ def build_interleave_agent(
         args=[],
         system_prompt=PUZZLE_SOLVER_SYSTEM_PROMPT,
         user_prompt_template=PUZZLE_SOLVER_USER_PROMPT,
-        uses=[*tools, status_update],
+        uses=[*tools, critical_thinker, status_update],
     )
     return agent, tools
 
