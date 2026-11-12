@@ -80,5 +80,3 @@ It lets you launch multiple tree roots from one terminal session and switch betw
 Run:
 
 `python -m netflux.demos.tui`
-
-Each tree launch chooses its provider in the TUI launch form. For `AgentFunction` roots, the provider field defaults to that `AgentFunction`'s `default_model`; changing it overrides only that top-level invoke.

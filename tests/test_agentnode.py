@@ -1,4 +1,5 @@
 import unittest
+from types import MappingProxyType
 from unittest.mock import patch
 
 from ..core import (
@@ -9,6 +10,7 @@ from ..core import (
     AgentNode,
     TokenUsage,
     ModelTextPart,
+    ToolUsePart,
     ModelProviderException,
     Continuation,
     TranscriptPosition,
@@ -191,6 +193,176 @@ class TestAgentNodeUtilities(unittest.TestCase):
             self.assertIn("boom", str(mpe.inner_exception))
         finally:
             runtime_mod.get_AgentNode_impl = original_get_impl
+
+class TestAgentProviderToolSelection(unittest.TestCase):
+    @staticmethod
+    def _agent(name, *, args=(), uses=(), recursive=False, allow_models=None,
+               default_model=Provider.Anthropic):
+        return AgentFunction(
+            name=name, desc=name, args=args, system_prompt="system",
+            user_prompt_template="prompt", uses=uses, uses_recursion=recursive,
+            allow_models=allow_models, default_model=default_model,
+        )
+
+    def test_tool_provider_dispatch_preserves_arguments_and_transcript(self):
+        leaf = self._agent(
+            "leaf", args=[FunctionArg("task", str)], allow_models=[Provider.Gemini, Provider.OpenAI],
+            default_model=Provider.OpenAI,
+        )
+        root_fn = self._agent(
+            "root", args=[FunctionArg("task", str)], uses=[leaf], recursive=True,
+            allow_models=[Provider.Anthropic, Provider.Gemini],
+        )
+        records = []
+
+        def fake_impl(selected_provider):
+            class FakeAgentNode(_FakeAgentNode):
+                @property
+                def provider(self):
+                    return selected_provider
+
+                def run(self):
+                    if self.agent_fn is leaf:
+                        output = self.provider.value
+                    else:
+                        calls = [("leaf", {}), ("leaf", {"provider": None})]
+                        if self.parent is None:
+                            calls += [
+                                ("leaf", {"provider": "OpenAI"}),
+                                ("root", {"provider": "Anthropic"}),
+                            ]
+                        outputs = []
+                        for index, (name, extra_args) in enumerate(calls):
+                            raw_args = {"task": str(index), **extra_args}
+                            original = dict(raw_args)
+                            tool_id = f"call-{index}"
+                            part = ToolUsePart(tool_id, name, MappingProxyType(raw_args))
+                            self.transcript.append(part)
+                            description = self.func_args(self.func_map[name])[-1].desc
+                            child = self.invoke_tool_function(name, raw_args, tool_id)
+                            records.append((original, child, part, description))
+                            outputs.append(child.result())
+                        output = " ".join(outputs)
+                    self.transcript.append(ModelTextPart(output))
+                    self.ctx.post_success(output)
+
+            return FakeAgentNode
+
+        with patch("netflux.runtime.get_AgentNode_impl", side_effect=fake_impl):
+            runtime = Runtime(
+                [root_fn],
+                client_factories={Provider.Anthropic: object, Provider.Gemini: object, Provider.OpenAI: object},
+            )
+            root = runtime.invoke(
+                None, root_fn, {"task": "start"}, provider=Provider.Gemini, max_agent_levels=3,
+            )
+            self.assertEqual(root.result(), "Gemini Gemini OpenAI OpenAI OpenAI")
+
+        self.assertEqual(len(records), 6)
+        for original, child, part, description in records:
+            with self.subTest(tool_use_id=child.tool_use_id, parent=child.parent.id):
+                # The transcript mapping aliases the original tool arguments.
+                self.assertEqual(dict(part.args), original)
+                self.assertEqual(child.inputs, {"task": original["task"]})
+                self.assertEqual(child.tool_use_id, part.tool_use_id)
+                if original.get("provider") is None:
+                    # Keep core's provider_arg_spec()/func_args() promise consistent with
+                    # Runtime.invoke() for omitted/null providers, covering inheritance
+                    # and default fallback. Fixed result expectations above guard against
+                    # the shared resolver choosing the wrong provider.
+                    behavior = "inherit" if child.parent is root else "use default"
+                    self.assertTrue(description.endswith(
+                        f"Omit or null: will {behavior} {child.provider.value}."
+                    ))
+        self.assertIs(root.children[-1].provider, Provider.Anthropic)
+
+    def test_provider_spec_validation_and_code_argument_isolation(self):
+        with self.assertRaisesRegex(ValueError, "provider"):
+            self._agent("collision", args=[FunctionArg("provider", str)])
+        for invalid in ([], [Provider.Gemini, "Anthropic"]):
+            with self.subTest(allow_models=invalid), self.assertRaises(ValueError):
+                self._agent("invalid", allow_models=invalid)
+        with self.assertRaises(AssertionError):
+            self._agent("excluded_default", allow_models=[Provider.Gemini])
+        choices = [Provider.Gemini]
+        leaf = self._agent(
+            "leaf", args=[FunctionArg("task", str)], allow_models=choices,
+            default_model=Provider.Gemini,
+        )
+        choices.clear()
+        self.assertEqual(leaf.allow_models, (Provider.Gemini,))
+        code = CodeFunction(
+            name="code", desc="code", args=[FunctionArg("provider", str)],
+            callable=lambda ctx, *, provider: provider,
+        )
+        root_fn = self._agent("root", uses=[leaf, code], recursive=True)
+        runtime = Runtime([root_fn], client_factories={Provider.Anthropic: object})
+        self.assertEqual(root_fn.allow_models, tuple(Provider))
+        with patch("netflux.runtime.get_AgentNode_impl", return_value=_FakeAgentNode), \
+                patch.object(_FakeAgentNode, "start"):
+            node = runtime.invoke(None, root_fn, {})
+        spec = node.provider_arg_spec(leaf)
+        self.assertEqual(spec.enum, {"Gemini"})
+        self.assertTrue(spec.desc.endswith(
+            "Omit or null: will use default Gemini."
+        ))
+
+        with patch.object(node.ctx, "invoke") as invoke:
+            for value in ("Anthropic", "gemini", 42, [], Provider.Gemini):
+                with self.subTest(provider=value):
+                    raw_args = {"task": "work", "provider": value}
+                    with self.assertRaisesRegex(ValueError, "provider"):
+                        node.invoke_tool_function("leaf", raw_args, "invalid")
+                    self.assertEqual(raw_args, {"task": "work", "provider": value})
+                    invoke.assert_not_called()
+            raw_args = {"provider": "ordinary business input"}
+            self.assertIs(node.invoke_tool_function("code", raw_args, "code-use"), invoke.return_value)
+            invoke.assert_called_once_with(code, raw_args, provider=None, tool_use_id="code-use")
+            self.assertEqual(raw_args, {"provider": "ordinary business input"})
+        raw_args = {"provider": "xAI"}
+        with self.assertRaises(NotImplementedError):
+            node.invoke_tool_function("root", raw_args, "unsupported-provider")
+        self.assertEqual(raw_args, {"provider": "xAI"})
+
+    def test_model_facing_arguments_preserve_task_signatures(self):
+        task_args = [
+            FunctionArg("task", str),
+            FunctionArg("style", str, optional=True, enum={"brief", "full"}),
+            *(FunctionArg(t.__name__, t, optional=True) for t in (str, int, float, bool)),
+        ]
+        leaf = self._agent("leaf", args=task_args, allow_models=[Provider.Anthropic])
+        self.assertEqual(leaf.validate_coerce_args({"task": "work"}), {"task": "work"})
+        null_args = {"task": "work", **dict.fromkeys(arg.name for arg in task_args if arg.optional)}
+        self.assertEqual(leaf.validate_coerce_args(null_args), null_args)
+        code_args = [FunctionArg("provider", str, enum={"local"})]
+        code = CodeFunction(
+            name="code", desc="code", args=code_args,
+            callable=lambda ctx, *, provider: provider,
+        )
+        plain = CodeFunction(name="plain", desc="plain", args=[], callable=lambda ctx: None)
+        root_fn = self._agent("root", uses=[leaf, code, plain], recursive=True)
+        runtime = Runtime([root_fn], client_factories={Provider.Anthropic: object})
+        node = _FakeAgentNode(RunContext(runtime, None), 1, root_fn, {}, client_factory=object)
+        # Test the shared argument contract consumed by every adapter, including recursion.
+        for fn, declared, choices in (
+            (leaf, task_args, {"Anthropic"}),
+            (root_fn, [], {p.value for p in Provider}),
+            (code, code_args, None),
+            (plain, [], None),
+        ):
+            with self.subTest(function=fn.name):
+                args = node.func_args(fn)
+                self.assertIsNot(args, fn.args)
+                if choices is not None:
+                    control = args.pop()
+                    self.assertEqual((control.name, control.argtype, control.optional), ("provider", str, True))
+                    self.assertEqual(control.enum, choices)
+                    self.assertEqual(control.desc, node.provider_arg_spec(fn).desc)
+                    # An allowed caller provider is inherited even when it equals the default.
+                    self.assertTrue(control.desc.endswith("Omit or null: will inherit Anthropic."))
+                self.assertEqual(args, declared)
+                self.assertEqual(fn.args, declared)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -632,13 +632,17 @@ class AnthropicAgentNode(AgentNode):
             # Build args spec.
             props: Dict[str, Dict[str, Any]] = {}
             required: List[str] = []
-            for arg in f.args:
+            for arg in self.func_args(f):
+                json_type = self.json_type_for_arg(arg.argtype)
                 arg_schema: Dict[str, Any] = {
-                    "type": self.json_type_for_arg(arg.argtype),
+                    "type": [json_type, "null"] if arg.optional else json_type,
                     "description": arg.desc,
                 }
                 if arg.argtype is str and arg.enum is not None:
-                    arg_schema["enum"] = sorted(list(arg.enum))
+                    enum_values: List[Optional[str]] = list(sorted(arg.enum))
+                    if arg.optional:
+                        enum_values.append(None)
+                    arg_schema["enum"] = enum_values
                 props[arg.name] = arg_schema
 
                 if not arg.optional:

@@ -513,6 +513,9 @@ This refined example shows:
     * subtype must specify: input vars, system prompt, templated user prompt (var substitution). Each var may be given as strings or filepaths (upon instantiation of the agent, files would have to be loaded and then substitution done by the runner infra instead of asking the agent to do it).
     * subtype specifies `uses: List[Function]` — the `Function`s that the agent may invoke.
     * optional `uses_recursion: bool` — when true, the agent includes itself in `uses` for self-invocation.
+    * Framework automatically injects an optional `provider` enum arg into `AgentFunction` signatures, including recursive calls, so an agent caller can explicitly decide which model to use. The callee's `allow_models` limits choices, defaults to all providers, and must include `default_model`.
+    * Omitted or `null` `provider` inherits the caller's provider if allowed; otherwise it uses the callee's `default_model`. The tool description states which. Invalid or unavailable choices produce tool errors.
+    * `provider` is reserved in `AgentFunction.args`, retained in tool-call transcripts, and excluded from task inputs. `NodeView.provider` records the resolved choice. `CodeFunction` arguments are unchanged.
 * `CodeFunction`: can also be invoked by any `Function`.
     * some framework built-in subtypes (`Ensemble`, `ThinkMoreDecorator`).
     * mostly user subtypes to define any plain python functions that do some deterministic logic, intended to be invoked most often by `AgentFunction`s or as the top-level request, to coordinate sub-agents doing sub-tasks.
@@ -578,6 +581,10 @@ This refined example shows:
     * `cancel_event: Optional[Event]`: cooperative cancellation token inherited from the caller unless explicitly overridden by the caller.
 * Methods:
     * `invoke(fn: Function, args: Dict[str, Any], provider: Optional[Provider] = None, cancel_event: Optional[Event] = None, tool_use_id: Optional[str] = None, max_agent_levels: Optional[int] = None) -> Node`: invoke a `Function` and return the created `Node`.
+        * For `AgentFunction` calls, provider selection follows this precedence:
+            1. An explicit non-`None` `provider=` on this invocation always wins.
+            2. Otherwise, inherit the nearest ancestor `AgentNode`'s actual provider, skipping any number of `CodeNode`s, if it is in the invoked function's `allow_models`.
+            3. If there is no agent ancestor (a root call or code-only ancestry), or its provider is excluded, use the invoked function's `default_model`.
         * On a top-level invocation, `max_agent_levels` limits the number of `AgentNode`s along any lineage that will be realized in the tree. Descendant invocations inherit the tree's value and do not pass this argument.
             * Only Agent depth is limited: `CodeNode`s do not increase the agent level, and Agent siblings do not share a quota. An Agent invocation beyond the limit raises `MaxAgentLevelExceededException` without creating a `Node`; `CodeFunction` calls remain legal at the boundary. In a multi-tool-call batch, each call is handled independently, so an over-depth Agent call does not prevent a legal Code call in the same batch from succeeding.
             * An Agent exactly at the limit receives a runtime warning in its effective system prompt. Its declared tools remain unchanged.
@@ -630,6 +637,8 @@ This refined example shows:
     * `state: NodeState`: (Waiting, Running, Success, Error, Canceled) enum
     * `children: List[Node]`: ordered list of child `Function` invocations made by this `Node`.
     * `agent_lineage_level: int`: read-only, computed count of `AgentNode`s in the inclusive lineage from the tree root to this node; `CodeNode`s do not increase or reset it.
+    * `heritable_model: Optional[Provider]`: the candidate model available to pass down to child agents. Returns this agent's own resolved provider, otherwise its nearest agent ancestor's provider, or `None` if there is no agent.
+        * Callee will prefer: explicit provider > caller.heritable_model (if in fn.allow_models) > fn.default_model.
     * External consumers should generally access execution state through `NodeView`
     * For agents, `NodeView.usage` is a deep-copied snapshot and `NodeView.transcript` is an immutable tuple (empty tuple for `CodeNode`).
 
@@ -736,6 +745,9 @@ On every follow-up request, we replay the full provider-native transcript in ori
             * other faults by the remote provider service
 * Accessing `Node.result()` will either return the `Function` output (usually a string) if it was successful, or will raise the `Exception` from that invocation if there is one (similar to Futures in many languages), regardless of the invoked `Function`'s subtype.
 * Provider-specific `AgentNode` subtypes shall implement this contract:
+    * Build tool properties and required-argument lists from `AgentNode.func_args(fn)`, including the injected provider option, using the SDK's ordinary optional/nullable enum support.
+    * When adding framework control arguments, update both `AgentNode.func_args()` to inject their specifications and `AgentNode.invoke_tool_function()` to validate and extract their values, routing them as invocation options rather than task inputs.
+    * Preserve complete original arguments in both native replay and `ToolUsePart.args`, and pass them to `invoke_tool_function()`. Shared dispatch extracts invocation options from a copy before calling `RunContext.invoke()`.
     * When collecting `Function` invocation results from `ctx.invoke(..).result()`, expect the possibility of an `Exception` being raised and always catch it.
         * Pass on a string representation of the `Exception`'s type and message (with details but never too verbose and never with stacktrace) back to the LLM in the regular follow-up tool cycle, and flag the fault if the provider's SDK has an explicit field for that. Some LLMs are fine-tuned to pay attention to the error flag but most will understand the `Exception` string properly anyway especially if the detail is present.
         * Includes `ValueError` for built-in argument type checking (LLM can respond by re-trying).

@@ -907,9 +907,10 @@ class OaiAgentNode(AgentNode):
         token_usage.context_window_out = usage.output_tokens
 
     def make_function_tool(self, fn: Function) -> FunctionToolParam:
+        args = self.func_args(fn)
         properties: Dict[str, PropertySchema] = {}
 
-        for arg in fn.args:
+        for arg in args:
             json_type = self.json_type_for_arg(arg.argtype)
             property_schema = PropertySchema(
                 type=[json_type, "null"] if arg.optional else json_type, description=arg.desc,
@@ -926,7 +927,7 @@ class OaiAgentNode(AgentNode):
 
         schema = ObjectParametersSchema(
             type="object", properties=properties,
-            required=[arg.name for arg in fn.args if not arg.optional], additionalProperties=False,
+            required=[arg.name for arg in args if not arg.optional], additionalProperties=False,
         )
 
         tool = FunctionToolParam(

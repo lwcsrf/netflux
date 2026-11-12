@@ -468,7 +468,7 @@ Submission/parsing rules:
 - every top-level invocation explicitly receives the parsed maximum, including the default value `2`,
 - provider text is parsed case-insensitively against `Provider` names/values before `Runtime.invoke(...)`,
 - a blank provider field, or one matching the function's `default_model`, means no top-level provider override is passed,
-- a selected provider override applies only to the launched root; descendant invokes still use whatever provider/default each caller chooses normally,
+- the selected provider applies to the launched root; inheritance works as per normal framework behavior
 - whitespace-only arg fields are treated as omitted,
 - blank optional arg fields are submitted as explicit `None`,
 - blank required arg fields remain missing and therefore fail top-level validation,

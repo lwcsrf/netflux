@@ -415,12 +415,6 @@ def make_demo_workspace() -> Dict[str, str]:
 def run_perf_optimizer_tree(provider: Optional[Provider] = None) -> Optional[str]:
     ws = make_demo_workspace()
 
-    # Ensure the agents uses the same provider as the top-level optimizer
-    # for the purpose of this simple demo.
-    if provider:
-        perf_optimizer.default_model = provider
-        perf_reasoner.default_model = provider
-
     runtime = Runtime(
         specs=[perf_optimizer, perf_reasoner, perf_profiler, text_editor],
         client_factories=CLIENT_FACTORIES,

@@ -216,7 +216,9 @@ class Runtime:
             node = CodeNode(ctx, node_id, fn, inputs, caller, cancel_event, tool_use_id)
 
         elif isinstance(fn, AgentFunction):
-            provider = provider or fn.default_model
+            # Order of Priority: explicit provider > caller.heritable_model (if in fn.allow_models) > fn.default_model.
+            if provider is None:
+                provider = caller.resolve_unspecified_provider(fn) if caller is not None else fn.default_model
             if provider not in self._providers:
                 self._providers[provider] = get_AgentNode_impl(provider)
             impl: type[AgentNode] = self._providers[provider]

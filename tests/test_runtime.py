@@ -9,7 +9,7 @@ import time
 import unittest
 import weakref
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Union
+from typing import Any, Callable, Iterable, List, Optional, Union
 from unittest.mock import patch
 import multiprocessing as mp
 from multiprocessing.synchronize import Event
@@ -1274,6 +1274,137 @@ class TestRuntimeInvocation(unittest.TestCase):
         self.assertEqual(parent_node.children, [])
         self.assertEqual(observed["agent_inits"], 0)
         self.assertEqual(observed["factory_calls"], 0)
+
+
+class TestRuntimeProviderInheritance(unittest.TestCase):
+    def _make_runtime(self, fn: Function, behavior: Callable[[AgentNode], str]) -> Runtime:
+        def fake_impl(selected_provider: Provider) -> type[AgentNode]:
+            class FakeAgentNode(AgentNode):
+                @property
+                def provider(self) -> Provider:
+                    return selected_provider
+
+                @property
+                def token_usage(self) -> TokenUsage:
+                    return TokenUsage()
+
+                def run(self) -> None:
+                    result = behavior(self)
+                    self.transcript.append(ModelTextPart(text=result))
+                    self.ctx.post_success(result)
+
+            return FakeAgentNode
+
+        self.enterContext(patch("netflux.runtime.get_AgentNode_impl", side_effect=fake_impl))
+        return Runtime(
+            [fn],
+            client_factories={Provider.Anthropic: object, Provider.Gemini: object, Provider.OpenAI: object},
+        )
+
+    def test_tool_delegation_and_recursion_inherit_per_tree(self) -> None:
+        leaf = _make_agent_function("leaf")
+        recursive = AgentFunction(
+            name="recursive", desc="recursive agent", args=[],
+            system_prompt="system", user_prompt_template="prompt",
+            uses=[leaf], uses_recursion=True, default_model=Provider.Anthropic,
+        )
+        rendezvous = threading.Barrier(2)
+
+        def behavior(node: AgentNode) -> str:
+            if node.agent_fn is leaf:
+                return node.provider.value
+            if node.parent is None:
+                rendezvous.wait(timeout=5)
+            result = f"{node.provider.value} {node.invoke_tool_function('leaf', {}, 'leaf-use').result()}"
+            if node.parent is None:
+                result += f" {node.invoke_tool_function('recursive', {}, 'recursive-use').result()}"
+            return result
+
+        runtime = self._make_runtime(recursive, behavior)
+        default_root = runtime.invoke(None, recursive, {}, max_agent_levels=3)
+        overridden_root = runtime.invoke(
+            None, recursive, {}, provider=Provider.Gemini, max_agent_levels=3,
+        )
+        for root, provider in ((default_root, Provider.Anthropic), (overridden_root, Provider.Gemini)):
+            self.assertEqual(root.result(), " ".join([provider.value] * 4))
+            for node in (root, *root.children, *root.children[-1].children):
+                self.assertIs(node.heritable_model, provider)
+        self.assertIs(recursive.default_model, Provider.Anthropic)
+        self.assertIs(leaf.default_model, Provider.Anthropic)
+
+    def test_code_wrappers_inherit_and_code_root_uses_function_default(self) -> None:
+        leaf = _make_agent_function("leaf")
+        inner = _make_code_function(
+            "inner", callable=lambda ctx: ctx.invoke(leaf, {}, provider=None).result(), uses=[leaf],
+        )
+        outer = _make_code_function(
+            "outer", callable=lambda ctx: ctx.invoke(inner, {}).result(), uses=[inner],
+        )
+        agent = _make_agent_function("agent", uses=[outer])
+
+        def behavior(node: AgentNode) -> str:
+            if node.agent_fn is leaf:
+                return node.provider.value
+            return node.invoke_tool_function("outer", {}, "outer-use").result()
+
+        runtime = self._make_runtime(agent, behavior)
+        for allowed, expected in ((tuple(Provider), Provider.Gemini), ((Provider.Anthropic,), Provider.Anthropic)):
+            with self.subTest(allow_models=allowed):
+                leaf.allow_models = allowed
+                agent_root = runtime.invoke(None, agent, {}, provider=Provider.Gemini)
+                self.assertEqual(agent_root.result(), expected.value)
+                outer_node = agent_root.children[0]
+                inner_node = outer_node.children[0]
+                for node in (agent_root, outer_node, inner_node):
+                    self.assertIs(node.heritable_model, Provider.Gemini)
+                self.assertIs(inner_node.children[0].heritable_model, expected)
+                self.assertIsNone(runtime.get_view(outer_node.id).provider)
+        code_root = runtime.invoke(None, outer, {})
+        self.assertEqual(code_root.result(), Provider.Anthropic.value)
+        self.assertIsNone(runtime.get_view(code_root.id).provider)
+        self.assertIsNone(code_root.heritable_model)
+        self.assertIsNone(code_root.children[0].heritable_model)
+        self.assertIs(code_root.children[0].children[0].heritable_model, Provider.Anthropic)
+
+    def test_explicit_override_is_inherited_by_its_subtree_only(self) -> None:
+        leaf = _make_agent_function("leaf")
+        leaf.default_model = Provider.Gemini
+        wrapper = _make_code_function(
+            "wrapper", callable=lambda ctx: ctx.invoke(leaf, {}).result(), uses=[leaf],
+        )
+        child = _make_agent_function("child", uses=[wrapper])
+        child.default_model = Provider.Gemini
+        child.allow_models = (Provider.Gemini,)
+        root = _make_agent_function("root", uses=[child, leaf])
+        root.allow_models = (Provider.Anthropic,)
+
+        def behavior(node: AgentNode) -> str:
+            if node.agent_fn is leaf:
+                return node.provider.value
+            if node.agent_fn is child:
+                return node.invoke_tool_function("wrapper", {}, "wrapper-use").result()
+            overridden = node.ctx.invoke(child, {}, provider=Provider.Anthropic)
+            sibling = node.invoke_tool_function("leaf", {}, "sibling-use")
+            return f"{overridden.result()} {sibling.result()}"
+
+        runtime = self._make_runtime(root, behavior)
+        node = runtime.invoke(None, root, {}, provider=Provider.Gemini, max_agent_levels=3)
+        self.assertEqual(node.result(), "Anthropic Gemini")
+        self.assertIs(node.children[0].provider, Provider.Anthropic)
+        overridden = node.children[0]
+        wrapper_node = overridden.children[0]
+        for descendant in (overridden, wrapper_node, wrapper_node.children[0]):
+            self.assertIs(descendant.heritable_model, Provider.Anthropic)
+        self.assertIs(node.heritable_model, Provider.Gemini)
+        self.assertIs(node.children[1].heritable_model, Provider.Gemini)
+        self.assertIs(child.default_model, Provider.Gemini)
+        self.assertIs(leaf.default_model, Provider.Gemini)
+
+        # Use the default when the nearest agent is excluded, even if an older ancestor is allowed.
+        leaf.default_model = Provider.OpenAI
+        leaf.allow_models = (Provider.Gemini, Provider.OpenAI)
+        node = runtime.invoke(None, root, {}, provider=Provider.Gemini, max_agent_levels=3)
+        self.assertEqual(node.result(), "OpenAI Gemini")
 
 
 class TestRuntimeObservability(unittest.TestCase):

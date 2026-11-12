@@ -8,7 +8,7 @@ import time
 from threading import Event, Lock, Thread
 from overrides import override
 
-from .providers import Provider
+from .providers import ModelNames, Provider
 
 AllowedArgTypeUnion = Union[Type[str], Type[int], Type[float], Type[bool]]
 AllowedArgTypeTuple: tuple[type, ...] = tuple(
@@ -227,6 +227,10 @@ class Function(ABC):
             spec = expect[k]
             coerced[k] = v
 
+            # JSON numbers may decode as ints even for float arguments; exclude bool.
+            if spec.argtype is float and type(v) is int:
+                coerced[k] = float(v)
+
             # Tolerate boolean-like strings.
             if spec.argtype is bool and isinstance(v, str):
                 s = v.strip().lower()
@@ -271,13 +275,14 @@ class AgentFunction(Function):
         uses: Sequence[Function] = (),
         uses_recursion: bool = False,
         default_model: Provider = Provider.Anthropic,
+        allow_models: Optional[Sequence[Provider]] = None,
     ) -> None:
         super().__init__(name, desc, args)
+        self.default_model = default_model
         self.system_prompt = system_prompt
         self.user_prompt_template = user_prompt_template
         self.uses_funcs: List[Function] = list(uses)
         self.uses_recursion = uses_recursion
-        self.default_model = default_model
 
         if uses_recursion and self not in self.uses_funcs:
             self.uses_funcs.append(self)
@@ -287,6 +292,14 @@ class AgentFunction(Function):
         dups = [n for n in set(names) if names.count(n) > 1]
         if dups:
             raise ValueError(f"{name}: duplicate tool names not allowed: {sorted(dups)}")
+
+        # Validate `allow_models`.
+        if any(arg.name == "provider" for arg in self.args):
+            raise ValueError(f"{name}: argument 'provider' is reserved for agent invocation control.")
+        self.allow_models: tuple[Provider, ...] = tuple(Provider) if allow_models is None else tuple(allow_models)
+        if not self.allow_models or any(not isinstance(p, Provider) for p in self.allow_models):
+            raise ValueError(f"{name}: allow_models must be a non-empty sequence of Provider values.")
+        assert self.default_model in self.allow_models, f"{name}: default_model must be in allow_models."
 
     @property
     def uses(self) -> List[Function]:
@@ -470,7 +483,10 @@ class RunContext:
         Proxy to the Runtime to invoke a Function and create associated Node + edges.
         Returns the created `Node`.
 
-        For AgentFunction calls only, optionally specify `provider` to override the default model.
+        For AgentFunction calls only, a non-None `provider` overrides provider selection.
+        Otherwise, inherit the nearest ancestor AgentNode's provider, skipping CodeNodes,
+        if it is in the invoked function's `allow_models`; use its `default_model` when
+        there is no agent ancestor or the inherited candidate is excluded.
 
         Provide `cancel_event` to enforce a particular cancellation scope for the child node.
         When omitted, the Runtime inherits the caller's CancelEvent (if any). It is correct
@@ -696,6 +712,28 @@ class Node(ABC):
         return level
 
     @property
+    def heritable_model(self) -> Optional[Provider]:
+        """Model available to pass down to child agents.
+
+        For an AgentNode, return its own resolved provider. Otherwise, return the nearest
+        agent ancestor's provider, or None if there is no agent in the lineage.
+        Each callee applies its allow_models constraint to decide whether to inherit this candidate.
+        """
+        current: Optional[Node] = self
+        while current is not None:
+            if isinstance(current, AgentNode):
+                return current.provider
+            current = current.parent
+        return None
+
+    def resolve_unspecified_provider(self, fn: AgentFunction) -> Provider:
+        """Choose a child agent's provider when the caller has not supplied one explicitly."""
+        candidate = self.heritable_model
+        if candidate is not None and candidate in fn.allow_models:
+            return candidate
+        return fn.default_model
+
+    @property
     def root_ancestor(self) -> 'Node':
         """Return this node's root ancestor through immutable parent links."""
         current: Node = self
@@ -793,6 +831,9 @@ class AgentNode(Node):
 
     Subclasses must implement `run()` to drive a provider-specific tool loop, and therein
     use the `RunContext` to submit children `Function` calls as a result of tool use.
+
+    Build tool schemas from `func_args(fn)` and dispatch calls through `invoke_tool_function()`.
+    Preserve the original tool arguments, including invocation options, in both transcripts.
     Before returning from `run()`, they should use `self.ctx.post_success()`, `self.ctx.post_exception()`,
     or `self.ctx.post_cancel()`.
 
@@ -886,6 +927,7 @@ class AgentNode(Node):
     @property
     @abstractmethod
     def provider(self) -> Provider:
+        """Return this node's resolved provider."""
         raise NotImplementedError
 
     @override
@@ -945,6 +987,35 @@ class AgentNode(Node):
             return warning
         return f"{self.agent_fn.system_prompt}\n\n{warning}"
 
+    def provider_arg_spec(self, fn: AgentFunction) -> FunctionArg:
+        """Provider control argument for this callee, including its actual omitted-value behavior."""
+        provider_choices = ", ".join(f"{p.value} ({ModelNames[p]})" for p in fn.allow_models)
+        model = self.resolve_unspecified_provider(fn)
+        behavior = "inherit" if model == self.heritable_model else "use default"
+        # Inherit only an allowed model; otherwise use fn.default_model,
+        # which the AgentFunction ctor already asserted is in fn.allow_models.
+        assert model in fn.allow_models
+        return FunctionArg(
+            name="provider",
+            argtype=str,
+            desc=(f"Model provider to use for the agentic function call. Options: {provider_choices}. "
+                  f"Omit or null: will {behavior} {model.value}."),
+            optional=True,
+            enum={p.value for p in fn.allow_models},
+        )
+
+    def func_args(self, fn: Function) -> List[FunctionArg]:
+        """All model-facing arguments to invoke a Function, including both func signature and
+        framework-injected control args, e.g. model selection for an AgentFunction call.
+
+        When adding a control argument, update both this method to inject its specification
+        and invoke_tool_function() to validate, extract, and route its value.
+        """
+        args = list(fn.args)
+        if isinstance(fn, AgentFunction):
+            args.append(self.provider_arg_spec(fn))
+        return args
+
     def invoke_tool_function(
         self, tool_name: str, tool_args: Dict[str, Any], tool_use_id: str,
     ) -> Node:
@@ -953,7 +1024,15 @@ class AgentNode(Node):
                 f"Invoking unknown tool: '{tool_name}'. Tools available: {self.func_map.keys()}")
         fn: Function = self.func_map[tool_name]
 
-        return self.ctx.invoke(fn, tool_args, tool_use_id=tool_use_id)
+        # Re-route injected control arguments for AgentFunction calls.
+        # E.g. non-signature `provider` arg is extracted and used to configure the invoke.
+        args: Dict[str, Any] = dict(tool_args)
+        provider: Provider | None = None
+        if isinstance(fn, AgentFunction):
+            prov = args.pop("provider", None)
+            self.provider_arg_spec(fn).validate_value(prov)
+            provider = Provider(prov) if prov is not None else None
+        return self.ctx.invoke(fn, args, provider=provider, tool_use_id=tool_use_id)
 
     @staticmethod
     def stringify_exception(ex: Exception) -> str:

@@ -252,9 +252,6 @@ def run_stress_tree(
     from .client_factory import CLIENT_FACTORIES
 
     agent = STRESS_AGENTS[mode]
-    if mode == "tree":
-        # Delegates use the definition's default, not the root's provider override.
-        agent.default_model = provider or Provider.Anthropic
     workspace = make_demo_workspace(mode)
     print(f"Workspace: {workspace}")
 
