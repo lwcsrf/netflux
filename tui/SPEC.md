@@ -156,7 +156,16 @@ The rendered tree preserves:
 
 Tool calls behave as follows:
 - if a `ToolUsePart` maps to a real child node, that child subtree is rendered inline at the matching transcript position,
+- linked child previews, argument details, and copying retain invocation controls such as `provider` alongside the child's existing task inputs,
 - if no child node exists, the tool call remains visible as a synthetic expandable function row.
+
+Agent headers show the resolved provider's configured model name after the bold
+function name and before elapsed time, in the same provider color while running
+or terminal and whether expanded or collapsed. Each expanded agent colors only
+its own level of tree lines: incoming child connectors and ancestor continuation
+rails keep their parent's scope color, while the child's inner rail uses its own
+provider color. Code-function scopes and unknown providers retain neutral lines.
+Status, elapsed-time colors, and navigation behavior are unchanged.
 
 For successful `ImageResult` outputs, the expanded `result` block contains two
 plain-text rows: the `ImageResult.status` text first, followed by the literal
