@@ -165,10 +165,6 @@ or terminal and whether expanded or collapsed. Each expanded agent colors only
 its own level of tree lines: incoming child connectors and ancestor continuation
 rails keep their parent's scope color, while the child's inner rail uses its own
 provider color. Code-function scopes and unknown providers retain neutral lines.
-Provider colors use explicit xterm 256-color palette entries on all terminals:
-OpenAI teal (73), Anthropic rose (181), Gemini blue (110), and xAI lavender (146).
-Model names and scope lines emit indexed colors rather than requiring truecolor
-support or relying on terminal RGB approximation.
 Status, elapsed-time colors, and navigation behavior are unchanged.
 
 For successful `ImageResult` outputs, the expanded `result` block contains two
