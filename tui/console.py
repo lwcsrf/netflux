@@ -85,11 +85,13 @@ BG_STATUS_BAR = "\x1b[48;5;238m"
 BG_STATUS_STATE = "\x1b[48;5;24m"
 BG_STATUS_TOKENS = "\x1b[48;5;52m"
 
+# Use the xterm 256-color palette on all terminals, including truecolor ones.
+# Explicit hues keep rose and lavender from being approximated as gray by tmux.
 _PROVIDER_FG = {
-    Provider.OpenAI: "\x1b[38;2;112;167;170m",   # Muted teal, #70A7AA
-    Provider.Anthropic: "\x1b[38;2;191;175;183m", # Rose grey, #BFAFB7
-    Provider.Gemini: "\x1b[38;2;127;150;195m",   # Blue, #7F96C3
-    Provider.xAI: "\x1b[38;2;173;160;193m",      # Lavender, #ADA0C1
+    Provider.OpenAI: "\x1b[38;5;73m",      # Muted teal, #5FAFAF
+    Provider.Anthropic: "\x1b[38;5;181m",  # Rose, #D7AFAF
+    Provider.Gemini: "\x1b[38;5;110m",     # Blue, #87AFD7
+    Provider.xAI: "\x1b[38;5;146m",        # Lavender, #AFAFD7
 }
 
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
