@@ -85,6 +85,13 @@ BG_STATUS_BAR = "\x1b[48;5;238m"
 BG_STATUS_STATE = "\x1b[48;5;24m"
 BG_STATUS_TOKENS = "\x1b[48;5;52m"
 
+_PROVIDER_FG = {
+    Provider.OpenAI: "\x1b[38;2;112;167;170m",   # Muted teal, #70A7AA
+    Provider.Anthropic: "\x1b[38;2;191;175;183m", # Rose grey, #BFAFB7
+    Provider.Gemini: "\x1b[38;2;127;150;195m",   # Blue, #7F96C3
+    Provider.xAI: "\x1b[38;2;173;160;193m",      # Lavender, #ADA0C1
+}
+
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 # Glyphs
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -102,7 +109,6 @@ FUNCTION_GLYPH = "🧰"
 VERT = "│"
 TEE = "├─"
 ELBOW = "└─"
-RAIL = "│  "
 BLANK = "   "
 
 _SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
@@ -147,6 +153,12 @@ def _color(
     if not codes:
         return text
     return "".join(codes) + text + RESET
+
+
+def _provider_color(text: str, provider: Provider | None) -> str:
+    """Use the same provider color for model names and their scope's tree lines."""
+    color = _PROVIDER_FG.get(provider)
+    return f"{color}{text}{RESET}" if color else text
 
 
 def _copy_text_to_clipboard_windows(text: str) -> bool:
@@ -372,7 +384,7 @@ def _output_text(value: Any) -> str:
 
 
 def _format_args(
-    inputs: dict[str, Any],
+    inputs: Mapping[str, Any],
     max_len: int = 800,
     per_val_len: int = 120,
     *,
@@ -1352,10 +1364,15 @@ class ConsoleRender:
         *,
         depth: int = 0,
         anchors: tuple[str, ...] = (),
+        invocation_args: Mapping[str, Any] | None = None,
+        parent_provider: Provider | None = None,
     ) -> None:
         node_start_idx = len(lines)
         key = f"n:{nv.id}"
         is_agent = nv.fn.is_agent()
+        # Retain the existing task-input display, adding invocation controls
+        # (such as provider) that exist only in the originating tool call.
+        display_inputs = nv.inputs if invocation_args is None else {**invocation_args, **nv.inputs}
 
         # Determine expandability
         visible_children = self._visible_children(nv)
@@ -1375,7 +1392,7 @@ class ConsoleRender:
             for p in nv.transcript
         )
         has_usage = nv.usage is not None
-        has_inputs = bool(nv.inputs)
+        has_inputs = bool(display_inputs)
         has_result = _has_output(nv)
         has_error = _has_error(nv) or (
             nv.state is NodeState.Canceled and nv.exception is not None
@@ -1396,7 +1413,7 @@ class ConsoleRender:
         default_collapsed = not is_agent
         collapsed = self._is_collapsed(key, default_collapsed)
 
-        input_texts = _argument_texts(nv.inputs)
+        input_texts = _argument_texts(display_inputs)
         try:
             outcome = _node_outcome_target(nv)
             copy_text = _function_copy_text(
@@ -1425,14 +1442,16 @@ class ConsoleRender:
 
         # Summary / inline content
         if collapsed:
-            parts = self._build_collapsed_summary(nv, has_children, is_agent, input_texts, outcome)
+            parts = self._build_collapsed_summary(
+                nv, has_children, is_agent, display_inputs, input_texts, outcome,
+            )
             if parts:
                 header += f" {_color(' | '.join(parts), dim=True)}"
 
         # Emit header
         if depth > 0:
-            connector = ELBOW + " " if is_last else TEE + " "
-            line_text = f"{prefix}{connector}{header}"
+            connector = _provider_color(ELBOW if is_last else TEE, parent_provider)
+            line_text = f"{prefix}{connector} {header}"
         else:
             # Root node: no connector
             line_text = header
@@ -1469,13 +1488,16 @@ class ConsoleRender:
         # Root (depth 0) uses "" so its children's connectors start at column 0.
         # Non-root nodes extend the prefix with a rail (│) or blank depending on
         # whether the node is the last sibling.
-        child_prefix = "" if depth == 0 else prefix + (BLANK if is_last else RAIL)
+        parent_rail = _provider_color(VERT, parent_provider) + "  "
+        child_prefix = "" if depth == 0 else prefix + (BLANK if is_last else parent_rail)
 
-        # Detail prefix: adds a rail connecting to content below
-        detail_prefix = child_prefix + "│    "
-        content_prefix = child_prefix + "│      "
+        # Color only this scope's rail; ancestor rails retain their own colors.
+        # Keep trailing spaces outside ANSI spans (backoff rows replace two).
+        rail = _provider_color(VERT, nv.provider if is_agent else None)
+        detail_prefix = child_prefix + rail + "    "
+        content_prefix = child_prefix + rail + "      "
 
-        self._emit_arguments(nv, input_texts, detail_prefix, content_prefix, lines, infos)
+        self._emit_arguments(nv, display_inputs, input_texts, detail_prefix, content_prefix, lines, infos)
         if is_agent:
             self._emit_agent_details(
                 nv,
@@ -1545,6 +1567,10 @@ class ConsoleRender:
             f"{type_g} {_color(nv.fn.name, bold=True)}"
         )
 
+        model = ModelNames.get(nv.provider) if nv.fn.is_agent() else None
+        if model:
+            header += f" {_provider_color(model, nv.provider)}"
+
         elapsed = _format_elapsed(nv)
         if elapsed:
             header += elapsed
@@ -1556,13 +1582,14 @@ class ConsoleRender:
         nv: NodeView,
         has_children: bool,
         is_agent: bool,
+        inputs: Mapping[str, Any],
         input_texts: Mapping[str, str | None],
         outcome: _NodeOutcomeTarget | None,
     ) -> list[str]:
         """Return summary fragments for a collapsed node."""
         parts: list[str] = []
-        if is_agent and nv.inputs:
-            args = _format_args(nv.inputs, max_len=100, per_val_len=40, input_texts=input_texts)
+        if is_agent and inputs:
+            args = _format_args(inputs, max_len=100, per_val_len=40, input_texts=input_texts)
             if args:
                 parts.append(args)
         if has_children:
@@ -1573,8 +1600,8 @@ class ConsoleRender:
                 parts.append(f"{n_code_fns} CodeFn")
             if n_agent_fns:
                 parts.append(f"{n_agent_fns} AgentFn")
-        if not is_agent and nv.inputs:
-            args = _format_args(nv.inputs, max_len=80, per_val_len=40, input_texts=input_texts)
+        if not is_agent and inputs:
+            args = _format_args(inputs, max_len=80, per_val_len=40, input_texts=input_texts)
             if args:
                 parts.append(args)
         preview_value = nv.outputs
@@ -2298,6 +2325,7 @@ class ConsoleRender:
                     lines,
                     infos,
                     depth=depth + 1,
+                    parent_provider=nv.provider,
                 )
                 continue
 
@@ -2333,6 +2361,8 @@ class ConsoleRender:
                     infos,
                     depth=depth + 1,
                     anchors=(f"fncall:{nv.id}:{tool_use_id}",),
+                    invocation_args=use_part.args if use_part is not None else None,
+                    parent_provider=nv.provider,
                 )
                 continue
 
@@ -2369,6 +2399,7 @@ class ConsoleRender:
                 lines,
                 infos,
                 depth=depth + 1,
+                parent_provider=nv.provider,
             )
 
         if _has_output(nv) and not has_model_text:
@@ -2405,6 +2436,7 @@ class ConsoleRender:
     def _emit_arguments(
         self,
         nv: NodeView,
+        inputs: Mapping[str, Any],
         input_texts: Mapping[str, str | None],
         detail_prefix: str,
         content_prefix: str,
@@ -2412,7 +2444,7 @@ class ConsoleRender:
         infos: list[LineInfo],
     ) -> None:
         prefix = "aa" if nv.fn.is_agent() else "ca"
-        for arg_name, arg_value in nv.inputs.items():
+        for arg_name, arg_value in inputs.items():
             key = f"{prefix}:{nv.id}:{arg_name}"
             text = input_texts[arg_name]
             if text is None:
