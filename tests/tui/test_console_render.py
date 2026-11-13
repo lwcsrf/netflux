@@ -24,7 +24,7 @@ from ...core import (
     TranscriptPosition,
     ThinkingBlockPart,
 )
-from ...providers import Provider
+from ...providers import ModelNames, Provider
 from ...tui import ConsoleRender
 from ...tui.console import _clipboard_copy_failure_message, _copy_text_to_clipboard
 
@@ -71,6 +71,63 @@ def _event_view(**changes) -> NodeView:
 
 
 class TestConsoleRender(unittest.TestCase):
+    def test_provider_models_and_rails_keep_distinct_colors_in_256_color_output(self) -> None:
+        palette = {}
+        for provider in Provider:
+            for state in (NodeState.Running, NodeState.Success):
+                for collapsed in (False, True):
+                    with self.subTest(provider=provider, state=state, collapsed=collapsed):
+                        renderer = ConsoleRender(follow=False)
+                        renderer._collapse_overrides["n:1"] = collapsed
+                        frame = renderer.render_body(
+                            width=120, height=10, tick=0,
+                            view=_event_view(
+                                provider=provider, state=state, inputs={"count": 1},
+                                started_at=0.0, ended_at=0.0,
+                            ),
+                        )
+                        model_color = re.search(
+                            r"(\x1b\[38;5;(\d+)m)" + re.escape(ModelNames[provider]) + r"\x1b\[0m",
+                            renderer._lines[0],
+                        )
+                        self.assertIsNotNone(model_color, "Model names must use indexed colors")
+                        color, index = model_color.group(1), int(model_color.group(2))
+                        self.assertGreaterEqual(index, 16)
+                        self.assertLessEqual(index, 231)
+                        self.assertNotIn(index, {16, 59, 102, 145, 188, 231}, "Provider hues must not become gray")
+                        self.assertEqual(palette.setdefault(provider, color), color)
+                        self.assertNotIn("\x1b[38;2;", frame)
+                        if not collapsed:
+                            self.assertTrue(renderer._lines[1].startswith(f"{color}│\x1b[0m"))
+        self.assertEqual(len(set(palette.values())), len(Provider))
+
+    def test_nested_provider_rails_retain_parent_color_and_models_use_child_color(self) -> None:
+        grandchild = _event_view(id=4, provider=Provider.xAI, inputs={"count": 4})
+        child = _event_view(
+            id=2, provider=Provider.Anthropic, inputs={"count": 2}, children=(grandchild,),
+        )
+        sibling = _event_view(id=3, provider=Provider.Gemini, inputs={"count": 3})
+        root = _event_view(provider=Provider.OpenAI, children=(child, sibling))
+        renderer = ConsoleRender(follow=False)
+        renderer.render_body(width=120, height=20, view=root, tick=0)
+        rows = {info.key: line for info, line in zip(renderer._line_infos, renderer._lines) if info.key}
+        colors = {}
+        for node in (root, child, sibling, grandchild):
+            match = re.search(
+                r"(\x1b\[38;5;\d+m)" + re.escape(ModelNames[node.provider]) + r"\x1b\[0m",
+                rows[f"n:{node.id}"],
+            )
+            self.assertIsNotNone(match)
+            colors[node.id] = match.group(1)
+
+        root_rail = f"{colors[1]}│\x1b[0m  "
+        self.assertTrue(rows["n:2"].startswith(f"{colors[1]}├─\x1b[0m "))
+        self.assertTrue(rows["n:3"].startswith(f"{colors[1]}└─\x1b[0m "))
+        self.assertTrue(rows["aa:2:count"].startswith(f"{root_rail}{colors[2]}│\x1b[0m"))
+        self.assertTrue(rows["n:4"].startswith(f"{root_rail}{colors[2]}└─\x1b[0m "))
+        self.assertTrue(rows["aa:4:count"].startswith(f"{root_rail}   {colors[4]}│\x1b[0m"))
+        self.assertTrue(rows["aa:3:count"].startswith(f"   {colors[3]}│\x1b[0m"))
+
     def test_retry_headers_fit_narrow_panes_with_a_visible_ellipsis(self) -> None:
         message = "retry 漢字😀 " * 20
         child = _event_view(id=2, intermediate_events=(
