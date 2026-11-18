@@ -162,15 +162,7 @@ class OaiAgentNode(AgentNode):
         self.tools = [self.make_function_tool(fn) for fn in self.agent_fn.uses]
         self.usage = TokenUsage()
 
-        user_text = self.build_user_text()
-        self.transcript.append(UserTextPart(text=user_text))
-
-        self.history.append(EasyInputMessageParam(
-            type="message", role="user",
-            content=[ResponseInputTextParam(type="input_text", text=user_text)],
-        ))
-
-        # Create network resources only after all pure provider setup succeeds.
+        # Create network resources after tool setup succeeds.
         self.client: openai.OpenAI = self.new_client()
         self.client_closed = False
 
@@ -247,11 +239,20 @@ class OaiAgentNode(AgentNode):
             self.close_client()
 
     def run_agent_loop(self) -> None:
-        # Compose after runtime registration and keep stable instructions in the cacheable prefix.
-        self.history.insert(0, EasyInputMessageParam(
-            type="message", role="developer",
-            content=[ResponseInputTextParam(type="input_text", text=self.system_prompt())],
-        ))
+        # Keep stable instructions in the cacheable prefix.
+        user_text = self.build_user_text()
+        self.history.extend([
+            EasyInputMessageParam(
+                type="message", role="developer",
+                content=[ResponseInputTextParam(type="input_text", text=self.system_prompt())],
+            ),
+            EasyInputMessageParam(
+                type="message", role="user",
+                content=[ResponseInputTextParam(type="input_text", text=user_text)],
+            ),
+        ])
+        self.transcript.append(UserTextPart(text=user_text))
+        self.ctx.post_transcript_update()
 
         for _ in range(MAX_STEPS):
             response = self.create_response_with_retry()
