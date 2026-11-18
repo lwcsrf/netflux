@@ -248,12 +248,10 @@ class OaiAgentNode(AgentNode):
 
     def run_agent_loop(self) -> None:
         # Compose after runtime registration and keep stable instructions in the cacheable prefix.
-        instructions = self.system_prompt()
-        if instructions:
-            self.history.insert(0, EasyInputMessageParam(
-                type="message", role="developer",
-                content=[ResponseInputTextParam(type="input_text", text=instructions)],
-            ))
+        self.history.insert(0, EasyInputMessageParam(
+            type="message", role="developer",
+            content=[ResponseInputTextParam(type="input_text", text=self.system_prompt())],
+        ))
 
         for _ in range(MAX_STEPS):
             response = self.create_response_with_retry()
