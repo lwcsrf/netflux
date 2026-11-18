@@ -24,7 +24,7 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -e ".[test,tui]"
+        pip install -e ".[test,tui,openai]"
     
     - name: Run tests
       run: |

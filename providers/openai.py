@@ -421,6 +421,16 @@ class OaiAgentNode(AgentNode):
                 f"{_safe_repr(response.incomplete_details)}."
             )
 
+        # Older SDKs and gateways may omit this diagnostic.
+        input_transformations = getattr(response, "input_transformations", None)
+        if input_transformations:
+            raise OaiResponseError(
+                response,
+                f"OpenAI response {response.id!r} reported input transformations: "
+                f"{_safe_repr(input_transformations)}; "
+                "reasoning continuity cannot be guaranteed."
+            )
+
         if response.previous_response_id is not None:
             raise OaiResponseError(
                 response,
