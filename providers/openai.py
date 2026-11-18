@@ -247,6 +247,14 @@ class OaiAgentNode(AgentNode):
             self.close_client()
 
     def run_agent_loop(self) -> None:
+        # Compose after runtime registration and keep stable instructions in the cacheable prefix.
+        instructions = self.system_prompt()
+        if instructions:
+            self.history.insert(0, EasyInputMessageParam(
+                type="message", role="developer",
+                content=[ResponseInputTextParam(type="input_text", text=instructions)],
+            ))
+
         for _ in range(MAX_STEPS):
             response = self.create_response_with_retry()
             if response is None:
@@ -290,7 +298,6 @@ class OaiAgentNode(AgentNode):
             try:
                 raw_response = self.client.responses.with_raw_response.create(
                     model=self.model,
-                    instructions=self.system_prompt(),
                     input=self.history,
                     tools=self.tools,
                     tool_choice=TOOL_CHOICE,
