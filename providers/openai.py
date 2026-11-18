@@ -240,7 +240,7 @@ class OaiAgentNode(AgentNode):
 
     def run_agent_loop(self) -> None:
         # Keep stable instructions in the cacheable prefix.
-        user_text = self.build_user_text()
+        user_text: str = self.build_user_text()
         self.history.extend([
             EasyInputMessageParam(
                 type="message", role="developer",
