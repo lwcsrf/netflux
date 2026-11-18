@@ -162,15 +162,7 @@ class OaiAgentNode(AgentNode):
         self.tools = [self.make_function_tool(fn) for fn in self.agent_fn.uses]
         self.usage = TokenUsage()
 
-        user_text = self.build_user_text()
-        self.transcript.append(UserTextPart(text=user_text))
-
-        self.history.append(EasyInputMessageParam(
-            type="message", role="user",
-            content=[ResponseInputTextParam(type="input_text", text=user_text)],
-        ))
-
-        # Create network resources only after all pure provider setup succeeds.
+        # Create network resources after tool setup succeeds.
         self.client: openai.OpenAI = self.new_client()
         self.client_closed = False
 
@@ -247,6 +239,21 @@ class OaiAgentNode(AgentNode):
             self.close_client()
 
     def run_agent_loop(self) -> None:
+        # Keep stable instructions in the cacheable prefix.
+        user_text: str = self.build_user_text()
+        self.history.extend([
+            EasyInputMessageParam(
+                type="message", role="developer",
+                content=[ResponseInputTextParam(type="input_text", text=self.system_prompt())],
+            ),
+            EasyInputMessageParam(
+                type="message", role="user",
+                content=[ResponseInputTextParam(type="input_text", text=user_text)],
+            ),
+        ])
+        self.transcript.append(UserTextPart(text=user_text))
+        self.ctx.post_transcript_update()
+
         for _ in range(MAX_STEPS):
             response = self.create_response_with_retry()
             if response is None:
@@ -290,7 +297,6 @@ class OaiAgentNode(AgentNode):
             try:
                 raw_response = self.client.responses.with_raw_response.create(
                     model=self.model,
-                    instructions=self.system_prompt(),
                     input=self.history,
                     tools=self.tools,
                     tool_choice=TOOL_CHOICE,
@@ -399,6 +405,14 @@ class OaiAgentNode(AgentNode):
         return delay + random.uniform(0.0, delay * 0.1)
 
     def assert_response_contract(self, response: Response) -> None:
+        # Reject any reported transformation.
+        if response.input_transformations:
+            raise self.provider_error(
+                f"OpenAI response {response.id!r} reported input transformations: "
+                f"{_safe_repr(response.input_transformations)}; "
+                "reasoning continuity cannot be guaranteed."
+            )
+
         if response.status != "completed":
             raise OaiResponseError(
                 response,

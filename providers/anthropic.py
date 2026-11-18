@@ -112,7 +112,7 @@ from anthropic.types.tool_param import InputSchemaTyped
 
 MAX_TOKENS = 128_000
 THINKING_CFG = ThinkingConfigAdaptiveParam(type="adaptive")
-OUTPUT_CFG = OutputConfigParam(effort="max")
+OUTPUT_CFG: OutputConfigParam = OutputConfigParam(effort="xhigh")
 # 5-minute TTL prompt cache watermark on the latest user request msg (initial + after tool_result).
 CACHE_TTL = "5m"
 # Prevent agent loop runaway. Max tool call + response cycles before giving up.
