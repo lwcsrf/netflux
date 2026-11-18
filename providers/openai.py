@@ -399,6 +399,14 @@ class OaiAgentNode(AgentNode):
         return delay + random.uniform(0.0, delay * 0.1)
 
     def assert_response_contract(self, response: Response) -> None:
+        # Reject any reported transformation.
+        if response.input_transformations:
+            raise self.provider_error(
+                f"OpenAI response {response.id!r} reported input transformations: "
+                f"{_safe_repr(response.input_transformations)}; "
+                "reasoning continuity cannot be guaranteed."
+            )
+
         if response.status != "completed":
             raise OaiResponseError(
                 response,
