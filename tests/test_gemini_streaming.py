@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 
 import httpx2
 
-from ..core import AgentFunction, CodeFunction, Continuation, RetriableException, RunContext
+from ..core import AgentFunction, CodeFunction, Continuation, ModelProviderException, RetriableException, RunContext
 from ..providers import Provider
 from ..runtime import Runtime
 
@@ -112,6 +112,16 @@ class TestGeminiStreaming(unittest.TestCase):
         self.assertEqual(retry.attempt, 0)
         self.assertEqual(node.token_usage.input_tokens_total, 3 + 5 + 8 + 12)
         self.assertEqual(node.token_usage.output_tokens_total, 2 + 2 + 4 + 1)
+
+    def test_prompt_feedback_before_disconnect_stops_without_retry(self):
+        feedback = types.GenerateContentResponsePromptFeedback(block_reason=types.BlockedReason.SAFETY)
+        blocked = types.GenerateContentResponse(prompt_feedback=feedback)
+        with self.assertRaisesRegex(ModelProviderException, "SAFETY"):
+            self.run_streams([
+                [blocked, httpx2.ReadTimeout("stream disconnected")],
+                [chunk(types.Part(text="done"), finish=types.FinishReason.STOP, counts=(1, 1))],
+            ])
+        self.assertEqual(len(self.requests), 1)
 
     def test_consecutive_interruptions_only_count_new_checkpoints(self):
         node = self.run_streams([

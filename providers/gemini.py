@@ -252,8 +252,6 @@ class GeminiAgentNode(AgentNode):
                 # Each retry opens a fresh HTTP stream with its own usage and outcome.
                 request_usage = None
                 checkpoint_usage: Optional[types.GenerateContentResponseUsageMetadata] = None
-                prompt_feedback: Optional[types.GenerateContentResponsePromptFeedback] = None
-                saw_candidate = False
 
                 try:
                     assert self.client is not None, "Gemini client is closed."
@@ -269,11 +267,10 @@ class GeminiAgentNode(AgentNode):
                         if chunk.usage_metadata is not None:
                             request_usage = chunk.usage_metadata
                         if chunk.prompt_feedback is not None:
-                            prompt_feedback = chunk.prompt_feedback
+                            raise RuntimeError(f"Gemini returned prompt feedback: {chunk.prompt_feedback!r}")
                         if not chunk.candidates:
                             continue
 
-                        saw_candidate = True
                         delta = chunk.candidates[0]
                         if delta.finish_reason is not None:
                             finish_reason = delta.finish_reason
@@ -290,13 +287,6 @@ class GeminiAgentNode(AgentNode):
                             continuation_token = token
                             checkpoint_len = len(intrahop_parts_buffer)
                             checkpoint_usage = request_usage
-
-                    # Without prompt feedback, missing candidates indicate a malformed response.
-                    # Prompt blocks with feedback remain non-retriable because they'll repeat.
-                    if not saw_candidate:
-                        force_retry = prompt_feedback is None
-                        raise RuntimeError(
-                            f"Gemini returned no candidates. Prompt feedback: {prompt_feedback!r}")
 
                     # EOF without a finish reason can follow a checkpoint or a partial tool call.
                     if finish_reason is None:
