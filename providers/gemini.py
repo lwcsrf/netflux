@@ -233,16 +233,15 @@ class GeminiAgentNode(AgentNode):
                 self._close_client()
                 return
 
-            hop_config: types.GenerateContentConfig = config.model_copy(
-                update={"continuation_token": continuation_token}
-            )
             intrahop_parts_buffer: list[types.Part] = []
             # Last checkpoint pos: How deep into `intrahop_parts_buffer` we can roll
             # back to on retry (continuation_token accounts for)
             checkpoint_len = 0
 
+            request_usage: Optional[types.GenerateContentResponseUsageMetadata]
             finish_reason: Optional[types.FinishReason] = None
             finish_message: Optional[str] = None
+            finish_has_token = False
 
             max_attempts = 8
             base_delay = 3  # seconds
@@ -251,7 +250,7 @@ class GeminiAgentNode(AgentNode):
             while True:
                 force_retry: bool = False
                 # Each retry opens a fresh HTTP stream with its own usage and outcome.
-                request_usage: Optional[types.GenerateContentResponseUsageMetadata] = None
+                request_usage = None
                 checkpoint_usage: Optional[types.GenerateContentResponseUsageMetadata] = None
                 prompt_feedback: Optional[types.GenerateContentResponsePromptFeedback] = None
                 saw_candidate = False
@@ -261,7 +260,7 @@ class GeminiAgentNode(AgentNode):
                     for chunk in self.client.models.generate_content_stream(
                         model=self.model,
                         contents=cast(types.ContentListUnionDict, self._history),
-                        config=hop_config,
+                        config=config.model_copy(update={"continuation_token": continuation_token}),
                     ):
                         if self.is_cancel_requested():
                             self.ctx.post_cancel()
@@ -279,16 +278,16 @@ class GeminiAgentNode(AgentNode):
                         if delta.finish_reason is not None:
                             finish_reason = delta.finish_reason
                             finish_message = delta.finish_message
-                            continuation_token = delta.continuation_token
+                            finish_has_token = bool(delta.continuation_token)
                         if delta.content:
                             assert delta.content.role in (None, "model"), (
                                 f"Unexpected Gemini response role: {delta.content.role}")
                             intrahop_parts_buffer.extend(delta.content.parts or [])
 
                         token = delta.continuation_token
-                        if (token and token != hop_config.continuation_token
+                        if (token and token != continuation_token
                                 and delta.finish_reason in (None, types.FinishReason.CONTINUATION)):
-                            hop_config.continuation_token = token
+                            continuation_token = token
                             checkpoint_len = len(intrahop_parts_buffer)
                             checkpoint_usage = request_usage
 
@@ -426,7 +425,7 @@ class GeminiAgentNode(AgentNode):
                 raise RuntimeError(f"Gemini exhausted max_output_tokens ({MAX_TOKENS}).")
 
             if finish_reason == types.FinishReason.CONTINUATION:
-                if not continuation_token:
+                if not finish_has_token:
                     raise RuntimeError("Gemini returned CONTINUATION without a continuation token.")
             else:
                 assert finish_reason == types.FinishReason.STOP, (
