@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import h2.exceptions
 from h2.connection import ConnectionInputs, H2ConnectionStateMachine
 import httpcore2
+import httpx
 import httpx2
 
 from ..core import AgentFunction, CodeFunction, Continuation, ModelProviderException, RetriableException, RunContext
@@ -18,7 +19,7 @@ except ModuleNotFoundError as exc:
     raise unittest.SkipTest("Gemini provider tests require google-genai") from exc
 
 from google.genai import errors, types
-from requests.exceptions import ChunkedEncodingError
+import requests.exceptions
 
 from ..providers import gemini
 
@@ -141,20 +142,25 @@ class TestGeminiStreaming(unittest.TestCase):
         self.assertEqual(node.token_usage.input_tokens_total, 2 + 3 + 4)
         self.assertEqual(node.token_usage.output_tokens_total, 1 + 1 + 2)
 
-    def test_chunked_encoding_error_resumes_from_checkpoint(self):
-        disconnect = ChunkedEncodingError("Response ended prematurely")
-        node = self.run_streams([
-            [
-                chunk(types.Part(text="do"), token=b"checkpoint", counts=(2, 1)),
-                chunk(types.Part(text="discard")),
-                disconnect,
-            ],
-            [chunk(types.Part(text="ne"), finish=types.FinishReason.STOP, counts=(3, 1))],
-        ])
-        self.assertEqual([token for token, _ in self.requests], [None, b"checkpoint"])
-        retry, = node.intermediate_events
-        self.assertIsInstance(retry, RetriableException)
-        self.assertIs(retry.exception, disconnect)
+    def test_transport_errors_resume_from_checkpoint(self):
+        for error_type in (
+            httpx.ConnectError, httpx2.ConnectError, requests.exceptions.ConnectionError,
+            httpx.ReadTimeout, httpx2.ReadTimeout, requests.exceptions.ReadTimeout,
+            httpx.RemoteProtocolError, httpx2.RemoteProtocolError, requests.exceptions.ChunkedEncodingError,
+            httpx.DecodingError, httpx2.DecodingError, requests.exceptions.ContentDecodingError,
+        ):
+            with self.subTest(error_type=error_type):
+                disconnect = error_type("Stream interrupted")
+                node = self.run_streams([
+                    [chunk(types.Part(text="do"), token=b"checkpoint", counts=(2, 1)),
+                     chunk(types.Part(text="discard")), disconnect],
+                    [chunk(types.Part(text="ne"), finish=types.FinishReason.STOP, counts=(3, 1))],
+                ])
+                self.assertEqual(self.client_factory.call_count, 2)
+                self.assertEqual([token for token, _ in self.requests], [None, b"checkpoint"])
+                retry, = node.intermediate_events
+                self.assertIsInstance(retry, RetriableException)
+                self.assertIs(retry.exception, disconnect)
 
     def protocol_errors_after_goaway(self, next_input):
         connection = H2ConnectionStateMachine()
@@ -171,29 +177,32 @@ class TestGeminiStreaming(unittest.TestCase):
         return body_error, header_error
 
     def test_goaway_rebuilds_client_and_resumes_from_checkpoint(self):
-        body_error, header_error = self.protocol_errors_after_goaway(ConnectionInputs.RECV_DATA)
-        body_error.args = ("changed h2 message",)  # Only the typed transition identifies this failure.
-        node = self.run_streams([
-            [chunk(types.Part(text="do"), token=b"checkpoint", counts=(2, 1)),
-             chunk(types.Part(text="discard")), body_error],
-            [header_error],
-            [chunk(types.Part(text="ne"), finish=types.FinishReason.STOP, counts=(3, 1))],
-        ])
-        self.assertEqual(self.client_factory.call_count, 3)
-        self.assertEqual([token for token, _ in self.requests], [None, b"checkpoint", b"checkpoint"])
-        self.assertEqual([event.exception for event in node.intermediate_events], [body_error, header_error])
+        for frame in (ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS):
+            with self.subTest(frame=frame):
+                body_error, header_error = self.protocol_errors_after_goaway(frame)
+                body_error.args = ("changed h2 message",)  # Exercise the typed transition.
+                node = self.run_streams([
+                    [chunk(types.Part(text="do"), token=b"checkpoint", counts=(2, 1)),
+                     chunk(types.Part(text="discard")), body_error],
+                    [header_error],
+                    [chunk(types.Part(text="ne"), finish=types.FinishReason.STOP, counts=(3, 1))],
+                ])
+                self.assertEqual(self.client_factory.call_count, 3)
+                self.assertEqual([token for token, _ in self.requests], [None, b"checkpoint", b"checkpoint"])
+                self.assertEqual([event.exception for event in node.intermediate_events], [body_error, header_error])
 
     def test_goaway_exact_message_without_exception_chain(self):
-        message = "Invalid input ConnectionInputs.RECV_DATA in state ConnectionState.CLOSED"
         matches = gemini.GeminiAgentNode._is_http2_goaway_cause
-        for error_type in (h2.exceptions.ProtocolError, httpx2.LocalProtocolError):
-            with self.subTest(error_type=error_type):
-                self.assertTrue(matches(error_type(message)))
-                self.assertFalse(matches(error_type(f"Other error: {message}")))
-        self.assertFalse(matches(RuntimeError(message)))
+        for frame in ("RECV_DATA", "RECV_HEADERS"):
+            message = f"Invalid input ConnectionInputs.{frame} in state ConnectionState.CLOSED"
+            for error_type in (h2.exceptions.ProtocolError, httpx2.LocalProtocolError):
+                with self.subTest(frame=frame, error_type=error_type):
+                    self.assertTrue(matches(error_type(message)))
+                    self.assertFalse(matches(error_type(f"Other error: {message}")))
+            self.assertFalse(matches(RuntimeError(message)))
 
     def test_unrelated_h2_and_local_protocol_errors_are_terminal(self):
-        for error in self.protocol_errors_after_goaway(ConnectionInputs.RECV_HEADERS):
+        for error in self.protocol_errors_after_goaway(ConnectionInputs.SEND_HEADERS):
             with self.subTest(error_type=type(error)):
                 with self.assertRaises(ModelProviderException) as caught:
                     self.run_streams([[error]])

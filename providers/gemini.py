@@ -13,7 +13,7 @@ from h2.connection import ConnectionInputs, ConnectionState
 import httpx
 import httpx2
 from overrides import override
-from requests.exceptions import ChunkedEncodingError
+import requests.exceptions
 
 from ..core import (
     FunctionArg, Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
@@ -86,6 +86,10 @@ from google.genai import errors as genai_errors
       retries can be scoped to the current hop.
     * Ref: `https://ai.google.dev/gemini-api/docs/generate-content/long-decode`.
 """
+
+# vertex mTLS uses `requests` pkg
+_CONNECTION_ERRORS = (httpx.NetworkError, httpx2.NetworkError, requests.exceptions.ConnectionError)
+_TIMEOUT_ERRORS = (httpx.TimeoutException, httpx2.TimeoutException, requests.exceptions.Timeout)
 
 MAX_TOKENS = 262_144
 THINKING_CFG = types.ThinkingConfig(
@@ -329,14 +333,12 @@ class GeminiAgentNode(AgentNode):
                     genai_errors.UnknownApiResponseError,
                     JSONDecodeError,
                     # The SDK defaults to httpx2; factories may also supply legacy httpx clients.
-                    httpx.HTTPStatusError,
-                    httpx.TransportError,
-                    httpx.DecodingError,
-                    httpx2.HTTPStatusError,
-                    httpx2.TransportError,
-                    httpx2.DecodingError,
-                    h2.exceptions.ProtocolError,
-                    ChunkedEncodingError,  # Vertex mTLS uses `requests` lib for synchronous streams.
+                    httpx.HTTPStatusError, httpx2.HTTPStatusError,
+                    *_CONNECTION_ERRORS,
+                    *_TIMEOUT_ERRORS,
+                    httpx.TransportError, httpx2.TransportError,
+                    httpx.DecodingError, httpx2.DecodingError, requests.exceptions.ContentDecodingError,
+                    h2.exceptions.ProtocolError, requests.exceptions.ChunkedEncodingError,
                     RuntimeError,
                 ) as e:
                     # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
@@ -350,9 +352,10 @@ class GeminiAgentNode(AgentNode):
                         is_retriable = True
                         is_connection = True
                     if isinstance(e, (
-                        httpx.RemoteProtocolError, httpx2.RemoteProtocolError,
-                        httpx.DecodingError, httpx2.DecodingError,
-                        ChunkedEncodingError,
+                        *_CONNECTION_ERRORS,
+                        *_TIMEOUT_ERRORS,
+                        httpx.RemoteProtocolError, httpx2.RemoteProtocolError, requests.exceptions.ChunkedEncodingError,
+                        httpx.DecodingError, httpx2.DecodingError, requests.exceptions.ContentDecodingError,
                     )):
                         is_retriable = True
                         is_connection = True
@@ -637,7 +640,8 @@ class GeminiAgentNode(AgentNode):
         """
         if not isinstance(error, (h2.exceptions.ProtocolError, httpx2.LocalProtocolError)):
             return False
-        if str(error) == "Invalid input ConnectionInputs.RECV_DATA in state ConnectionState.CLOSED":
+        frames = (ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS)
+        if any(str(error) == f"Invalid input {frame} in state {ConnectionState.CLOSED}" for frame in frames):
             return True
 
         if isinstance(error, httpx2.LocalProtocolError) and error.__cause__ is not None:
@@ -648,8 +652,8 @@ class GeminiAgentNode(AgentNode):
 
         # h2's state machine keys transitions by (current state, input).
         lookup_error = error.__cause__ or error.__context__
-        return isinstance(lookup_error, KeyError) and lookup_error.args == (
-            (ConnectionState.CLOSED, ConnectionInputs.RECV_DATA),
+        return isinstance(lookup_error, KeyError) and any(
+            lookup_error.args == ((ConnectionState.CLOSED, frame),) for frame in frames
         )
 
     @staticmethod
