@@ -15,6 +15,7 @@ except ModuleNotFoundError as exc:
     raise unittest.SkipTest("Gemini provider tests require google-genai") from exc
 
 from google.genai import types
+from requests.exceptions import ChunkedEncodingError
 
 from ..providers import gemini
 
@@ -135,6 +136,21 @@ class TestGeminiStreaming(unittest.TestCase):
         self.assertEqual([event.attempt for event in node.intermediate_events], [0, 1, 2])
         self.assertEqual(node.token_usage.input_tokens_total, 2 + 3 + 4)
         self.assertEqual(node.token_usage.output_tokens_total, 1 + 1 + 2)
+
+    def test_chunked_encoding_error_resumes_from_checkpoint(self):
+        disconnect = ChunkedEncodingError("Response ended prematurely")
+        node = self.run_streams([
+            [
+                chunk(types.Part(text="do"), token=b"checkpoint", counts=(2, 1)),
+                chunk(types.Part(text="discard")),
+                disconnect,
+            ],
+            [chunk(types.Part(text="ne"), finish=types.FinishReason.STOP, counts=(3, 1))],
+        ])
+        self.assertEqual([token for token, _ in self.requests], [None, b"checkpoint"])
+        retry, = node.intermediate_events
+        self.assertIsInstance(retry, RetriableException)
+        self.assertIs(retry.exception, disconnect)
 
     def test_unfinished_tool_call_without_checkpoint_is_retried(self):
         call = types.Part(function_call=types.FunctionCall(name="uncommitted", args={}))

@@ -11,6 +11,7 @@ from threading import Event
 import httpx
 import httpx2
 from overrides import override
+from requests.exceptions import ChunkedEncodingError
 
 from ..core import (
     FunctionArg, Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
@@ -332,6 +333,7 @@ class GeminiAgentNode(AgentNode):
                     httpx2.HTTPStatusError,
                     httpx2.TransportError,
                     httpx2.DecodingError,
+                    ChunkedEncodingError,  # Vertex mTLS uses `requests` lib for synchronous streams.
                     RuntimeError,
                 ) as e:
                     # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
@@ -347,6 +349,7 @@ class GeminiAgentNode(AgentNode):
                     if isinstance(e, (
                         httpx.RemoteProtocolError, httpx2.RemoteProtocolError,
                         httpx.DecodingError, httpx2.DecodingError,
+                        ChunkedEncodingError,
                     )):
                         is_retriable = True
                         is_connection = True
