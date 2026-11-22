@@ -8,6 +8,8 @@ from json import JSONDecodeError
 import time
 import random
 from threading import Event
+import h2.exceptions
+from h2.connection import ConnectionInputs, ConnectionState
 import httpx
 import httpx2
 from overrides import override
@@ -333,6 +335,7 @@ class GeminiAgentNode(AgentNode):
                     httpx2.HTTPStatusError,
                     httpx2.TransportError,
                     httpx2.DecodingError,
+                    h2.exceptions.ProtocolError,
                     ChunkedEncodingError,  # Vertex mTLS uses `requests` lib for synchronous streams.
                     RuntimeError,
                 ) as e:
@@ -353,12 +356,22 @@ class GeminiAgentNode(AgentNode):
                     )):
                         is_retriable = True
                         is_connection = True
+                    if self._is_http2_goaway_cause(e):
+                        # WORKAROUND: The Gemini SDK fails to propagate HTTP/2 GOAWAY as a retriable stream error.
+                        is_retriable = True
+                        is_connection = True
                     if isinstance(e, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
+                        # WORKAROUND: Gemini was observed to report 499 CANCELLED even when the client did not actually cancel the request
+                        if status_code == 499:
+                            is_retriable = True
                     if isinstance(e, genai_errors.APIError):
                         if e.code in (408, 409, 429) or e.code >= 500:
+                            is_retriable = True
+                        # WORKAROUND: Gemini was observed to report 499 CANCELLED even when the client did not actually cancel the request
+                        if e.code == 499:
                             is_retriable = True
                     if isinstance(e, (genai_errors.UnknownApiResponseError, JSONDecodeError)):
                         is_retriable = True
@@ -614,6 +627,30 @@ class GeminiAgentNode(AgentNode):
         self._close_client()
         raise RuntimeError(f"Gemini agent loop exceeded MAX_STEPS ({MAX_STEPS} model hops) "
                            "without producing a final response.")
+
+    @staticmethod
+    def _is_http2_goaway_cause(error: BaseException | None) -> bool:
+        """Part of workaround for case where Gemini SDK is reporting DATA after GOAWAY as a protocol error.
+
+        During a body read, the SDK exposes h2.exceptions.ProtocolError directly.
+        During a header read, httpcore2 and HTTPX2 each wrap it in their own LocalProtocolError.
+        """
+        if not isinstance(error, (h2.exceptions.ProtocolError, httpx2.LocalProtocolError)):
+            return False
+        if str(error) == "Invalid input ConnectionInputs.RECV_DATA in state ConnectionState.CLOSED":
+            return True
+
+        if isinstance(error, httpx2.LocalProtocolError) and error.__cause__ is not None:
+            core_error = error.__cause__
+            error = core_error.__cause__ or core_error.__context__
+        if not isinstance(error, h2.exceptions.ProtocolError):
+            return False
+
+        # h2's state machine keys transitions by (current state, input).
+        lookup_error = error.__cause__ or error.__context__
+        return isinstance(lookup_error, KeyError) and lookup_error.args == (
+            (ConnectionState.CLOSED, ConnectionInputs.RECV_DATA),
+        )
 
     @staticmethod
     def _compact_hop_parts(parts: list[types.Part]) -> list[types.Part]:
