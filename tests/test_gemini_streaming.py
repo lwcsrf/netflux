@@ -1,6 +1,9 @@
 import unittest
 from unittest.mock import Mock, patch
 
+import h2.exceptions
+from h2.connection import ConnectionInputs, H2ConnectionStateMachine
+import httpcore2
 import httpx2
 
 from ..core import AgentFunction, CodeFunction, Continuation, ModelProviderException, RetriableException, RunContext
@@ -14,7 +17,7 @@ except ModuleNotFoundError as exc:
         raise
     raise unittest.SkipTest("Gemini provider tests require google-genai") from exc
 
-from google.genai import types
+from google.genai import errors, types
 from requests.exceptions import ChunkedEncodingError
 
 from ..providers import gemini
@@ -57,7 +60,8 @@ class TestGeminiStreaming(unittest.TestCase):
             name="agent", desc="", args=[], system_prompt="system", user_prompt_template="prompt",
             uses=list(tools), default_model=Provider.Gemini,
         )
-        runtime = Runtime([agent], client_factories={Provider.Gemini: factory})
+        self.client_factory = Mock(side_effect=factory)
+        runtime = Runtime([agent], client_factories={Provider.Gemini: self.client_factory})
         with patch.object(gemini, "time"):
             node = runtime.invoke(None, agent, {})
             self.assertEqual(node.result(), "done")
@@ -151,6 +155,61 @@ class TestGeminiStreaming(unittest.TestCase):
         retry, = node.intermediate_events
         self.assertIsInstance(retry, RetriableException)
         self.assertIs(retry.exception, disconnect)
+
+    def protocol_errors_after_goaway(self, next_input):
+        connection = H2ConnectionStateMachine()
+        connection.process_input(ConnectionInputs.RECV_GOAWAY)
+        with self.assertRaises(h2.exceptions.ProtocolError) as caught:
+            connection.process_input(next_input)
+        body_error = caught.exception
+
+        # Reproduce the header-read exception chain from HTTPX2's transport.
+        core_error = httpcore2.LocalProtocolError(body_error)
+        core_error.__context__ = body_error
+        header_error = httpx2.LocalProtocolError("wrapped HTTP/2 error")
+        header_error.__cause__ = core_error
+        return body_error, header_error
+
+    def test_goaway_rebuilds_client_and_resumes_from_checkpoint(self):
+        body_error, header_error = self.protocol_errors_after_goaway(ConnectionInputs.RECV_DATA)
+        body_error.args = ("changed h2 message",)  # Only the typed transition identifies this failure.
+        node = self.run_streams([
+            [chunk(types.Part(text="do"), token=b"checkpoint", counts=(2, 1)),
+             chunk(types.Part(text="discard")), body_error],
+            [header_error],
+            [chunk(types.Part(text="ne"), finish=types.FinishReason.STOP, counts=(3, 1))],
+        ])
+        self.assertEqual(self.client_factory.call_count, 3)
+        self.assertEqual([token for token, _ in self.requests], [None, b"checkpoint", b"checkpoint"])
+        self.assertEqual([event.exception for event in node.intermediate_events], [body_error, header_error])
+
+    def test_goaway_exact_message_without_exception_chain(self):
+        message = "Invalid input ConnectionInputs.RECV_DATA in state ConnectionState.CLOSED"
+        matches = gemini.GeminiAgentNode._is_http2_goaway_cause
+        for error_type in (h2.exceptions.ProtocolError, httpx2.LocalProtocolError):
+            with self.subTest(error_type=error_type):
+                self.assertTrue(matches(error_type(message)))
+                self.assertFalse(matches(error_type(f"Other error: {message}")))
+        self.assertFalse(matches(RuntimeError(message)))
+
+    def test_unrelated_h2_and_local_protocol_errors_are_terminal(self):
+        for error in self.protocol_errors_after_goaway(ConnectionInputs.RECV_HEADERS):
+            with self.subTest(error_type=type(error)):
+                with self.assertRaises(ModelProviderException) as caught:
+                    self.run_streams([[error]])
+                self.assertIs(caught.exception.inner_exception, error)
+                self.assertEqual(self.client_factory.call_count, 1)
+                self.assertEqual(len(self.requests), 1)
+
+    def test_upstream_499_retries_from_latest_checkpoint(self):
+        cancelled = errors.ClientError(499, {"error": {"status": "CANCELLED"}})
+        node = self.run_streams([
+            [chunk(types.Part(text="do"), token=b"checkpoint", counts=(2, 1)), cancelled],
+            [chunk(types.Part(text="ne"), finish=types.FinishReason.STOP, counts=(3, 1))],
+        ])
+        self.assertEqual([token for token, _ in self.requests], [None, b"checkpoint"])
+        retry, = node.intermediate_events
+        self.assertIs(retry.exception, cancelled)
 
     def test_unfinished_tool_call_without_checkpoint_is_retried(self):
         call = types.Part(function_call=types.FunctionCall(name="uncommitted", args={}))
