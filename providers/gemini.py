@@ -640,7 +640,7 @@ class GeminiAgentNode(AgentNode):
         """
         if not isinstance(error, (h2.exceptions.ProtocolError, httpx2.LocalProtocolError)):
             return False
-        frames = (ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS)
+        frames = (ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS, ConnectionInputs.RECV_PING)
         if any(str(error) == f"Invalid input {frame} in state {ConnectionState.CLOSED}" for frame in frames):
             return True
 
