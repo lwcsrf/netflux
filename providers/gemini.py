@@ -91,7 +91,7 @@ from google.genai import errors as genai_errors
 _CONNECTION_ERRORS = (httpx.NetworkError, httpx2.NetworkError, requests.exceptions.ConnectionError)
 _TIMEOUT_ERRORS = (httpx.TimeoutException, httpx2.TimeoutException, requests.exceptions.Timeout)
 
-MAX_TOKENS = 262_144
+MAX_TOKENS = 524_288
 THINKING_CFG = types.ThinkingConfig(
     thinking_level=types.ThinkingLevel.HIGH,
     # Disable Thought Summaries always: they are not useful, and we don't want to
@@ -633,14 +633,19 @@ class GeminiAgentNode(AgentNode):
 
     @staticmethod
     def _is_http2_goaway_cause(error: BaseException | None) -> bool:
-        """Part of workaround for case where Gemini SDK is reporting DATA after GOAWAY as a protocol error.
+        """Recognize protocol errors from peer frames received after GOAWAY
+        since the Gemini SDK does not handle GOAWAY properly.
 
         During a body read, the SDK exposes h2.exceptions.ProtocolError directly.
         During a header read, httpcore2 and HTTPX2 each wrap it in their own LocalProtocolError.
         """
         if not isinstance(error, (h2.exceptions.ProtocolError, httpx2.LocalProtocolError)):
             return False
-        frames = (ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS, ConnectionInputs.RECV_PING)
+        frames = (
+            ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS,
+            ConnectionInputs.RECV_PING, ConnectionInputs.RECV_WINDOW_UPDATE,
+            ConnectionInputs.RECV_RST_STREAM,
+        )
         if any(str(error) == f"Invalid input {frame} in state {ConnectionState.CLOSED}" for frame in frames):
             return True
 

@@ -177,7 +177,11 @@ class TestGeminiStreaming(unittest.TestCase):
         return body_error, header_error
 
     def test_goaway_rebuilds_client_and_resumes_from_checkpoint(self):
-        for frame in (ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS, ConnectionInputs.RECV_PING):
+        for frame in (
+            ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS,
+            ConnectionInputs.RECV_PING, ConnectionInputs.RECV_WINDOW_UPDATE,
+            ConnectionInputs.RECV_RST_STREAM,
+        ):
             with self.subTest(frame=frame):
                 body_error, header_error = self.protocol_errors_after_goaway(frame)
                 body_error.args = ("changed h2 message",)  # Exercise the typed transition.
@@ -193,7 +197,7 @@ class TestGeminiStreaming(unittest.TestCase):
 
     def test_goaway_exact_message_without_exception_chain(self):
         matches = gemini.GeminiAgentNode._is_http2_goaway_cause
-        for frame in ("RECV_DATA", "RECV_HEADERS", "RECV_PING"):
+        for frame in ("RECV_DATA", "RECV_HEADERS", "RECV_PING", "RECV_WINDOW_UPDATE", "RECV_RST_STREAM"):
             message = f"Invalid input ConnectionInputs.{frame} in state ConnectionState.CLOSED"
             for error_type in (h2.exceptions.ProtocolError, httpx2.LocalProtocolError):
                 with self.subTest(frame=frame, error_type=error_type):
