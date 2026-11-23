@@ -1,15 +1,19 @@
 from typing import Any, Callable, Dict, List, Optional, Union, cast
 from types import MappingProxyType
 from contextlib import suppress
+from itertools import groupby
 import copy
 import base64
 from json import JSONDecodeError
 import time
 import random
 from threading import Event
+import h2.exceptions
+from h2.connection import ConnectionInputs, ConnectionState
 import httpx
 import httpx2
 from overrides import override
+import requests.exceptions
 
 from ..core import (
     FunctionArg, Node, RunContext, Function, CodeFunction, AgentNode, AgentException,
@@ -83,7 +87,11 @@ from google.genai import errors as genai_errors
     * Ref: `https://ai.google.dev/gemini-api/docs/generate-content/long-decode`.
 """
 
-MAX_TOKENS = 262_144
+# vertex mTLS uses `requests` pkg
+_CONNECTION_ERRORS = (httpx.NetworkError, httpx2.NetworkError, requests.exceptions.ConnectionError)
+_TIMEOUT_ERRORS = (httpx.TimeoutException, httpx2.TimeoutException, requests.exceptions.Timeout)
+
+MAX_TOKENS = 524_288
 THINKING_CFG = types.ThinkingConfig(
     thinking_level=types.ThinkingLevel.HIGH,
     # Disable Thought Summaries always: they are not useful, and we don't want to
@@ -218,7 +226,9 @@ class GeminiAgentNode(AgentNode):
             thinking_config=THINKING_CFG,
             max_output_tokens=MAX_TOKENS,
         )
-        pending_parts: list[types.Part] = []   # To accumulate all parts in multi-hop cycle.
+        multihop_parts_buffer: list[types.Part] = []   # To accumulate all parts in multi-hop cycle.
+        # Covers all generation progress since the last user/tool turn, including prior hops
+        # and the current hop up to the checkpoint or hop boundary where this token was issued.
         continuation_token: Optional[bytes] = None
 
         # Agent loop.
@@ -230,46 +240,79 @@ class GeminiAgentNode(AgentNode):
                 self._close_client()
                 return
 
-            hop_config: types.GenerateContentConfig = config.model_copy(
-                update={"continuation_token": continuation_token}
-            )
-            resp: types.GenerateContentResponse
-            candidate: types.Candidate
+            intrahop_parts_buffer: list[types.Part] = []
+            # Last checkpoint pos: How deep into `intrahop_parts_buffer` we can roll
+            # back to on retry (continuation_token accounts for)
+            checkpoint_len = 0
+
+            request_usage: Optional[types.GenerateContentResponseUsageMetadata]
+            finish_reason: Optional[types.FinishReason] = None
+            finish_message: Optional[str] = None
+            finish_has_token = False
+
             max_attempts = 8
             base_delay = 3  # seconds
             attempt = 1
             # Retry logic.
             while True:
                 force_retry: bool = False
+                # Each retry opens a fresh HTTP stream with its own usage and outcome.
+                request_usage = None
+                checkpoint_usage: Optional[types.GenerateContentResponseUsageMetadata] = None
+
                 try:
                     assert self.client is not None, "Gemini client is closed."
-                    resp = self.client.models.generate_content(
+                    for chunk in self.client.models.generate_content_stream(
                         model=self.model,
                         contents=cast(types.ContentListUnionDict, self._history),
-                        config=hop_config,
-                    )
+                        config=config.model_copy(update={"continuation_token": continuation_token}),
+                    ):
+                        if self.is_cancel_requested():
+                            self.ctx.post_cancel()
+                            self._close_client()
+                            return
+                        if chunk.usage_metadata is not None:
+                            request_usage = chunk.usage_metadata
+                        if chunk.prompt_feedback is not None:
+                            raise RuntimeError(f"Gemini returned prompt feedback: {chunk.prompt_feedback!r}")
+                        if not chunk.candidates:
+                            continue
 
-                    # Without prompt feedback, missing candidates indicate a malformed response.
-                    # Prompt blocks with feedback remain non-retriable.
-                    if not resp.candidates:
-                        force_retry = resp.prompt_feedback is None
-                        raise RuntimeError(
-                            f"Gemini returned no candidates. Prompt feedback: {resp.prompt_feedback!r}")
-                    candidate = resp.candidates[0]
+                        delta = chunk.candidates[0]
+                        if delta.finish_reason is not None:
+                            finish_reason = delta.finish_reason
+                            finish_message = delta.finish_message
+                            finish_has_token = bool(delta.continuation_token)
+                        if delta.content:
+                            assert delta.content.role in (None, "model"), (
+                                f"Unexpected Gemini response role: {delta.content.role}")
+                            intrahop_parts_buffer.extend(delta.content.parts or [])
+
+                        token = delta.continuation_token
+                        if (token and token != continuation_token
+                                and delta.finish_reason in (None, types.FinishReason.CONTINUATION)):
+                            continuation_token = token
+                            checkpoint_len = len(intrahop_parts_buffer)
+                            checkpoint_usage = request_usage
+
+                    # EOF without a finish reason can follow a checkpoint or a partial tool call.
+                    if finish_reason is None:
+                        force_retry = True
+                        raise RuntimeError("Gemini stream ended without a finish_reason.")
 
                     # Todo: Use SDK enum once it's added.
-                    if candidate.finish_reason == "MISSING_THOUGHT_SIGNATURE":
+                    if finish_reason == "MISSING_THOUGHT_SIGNATURE":
                         raise AssertionError(
-                            f"Gemini reported {candidate.finish_reason}; "
+                            f"Gemini reported {finish_reason}; "
                             "our reasoning-continuity protocol assumptions need investigation. "
-                            f"Details: {candidate.finish_message!r}.")
+                            f"Details: {finish_message!r}.")
 
-                    if candidate.finish_reason == types.FinishReason.TOO_MANY_TOOL_CALLS:
-                        raise RuntimeError(f"Unexpected finish_reason: {candidate.finish_reason}.")
+                    if finish_reason == types.FinishReason.TOO_MANY_TOOL_CALLS:
+                        raise RuntimeError(f"Unexpected finish_reason: {finish_reason}.")
 
                     # False positive for safety block or SDK proactively detecting malformed
                     # function call.
-                    if candidate.finish_reason and candidate.finish_reason in (
+                    if finish_reason in (
                         types.FinishReason.SAFETY,
                         types.FinishReason.RECITATION,
                         types.FinishReason.LANGUAGE,
@@ -282,15 +325,7 @@ class GeminiAgentNode(AgentNode):
                     ):
                         # Force retry below. Burn one attempt.
                         force_retry = True
-                        raise RuntimeError(f"Candidate finish_reason is: {candidate.finish_reason}.")
-
-                    # Workaround for an empirical issue solved by retry.
-                    if ((not candidate.content or not candidate.content.parts)
-                            and not candidate.finish_reason
-                            and not candidate.continuation_token):
-                        # Force retry below. Burn one attempt.
-                        force_retry = True
-                        raise RuntimeError(f"Response has no content and no finish_reason and no continuation.")
+                        raise RuntimeError(f"Candidate finish_reason is: {finish_reason}.")
 
                     break
                 except (
@@ -298,12 +333,12 @@ class GeminiAgentNode(AgentNode):
                     genai_errors.UnknownApiResponseError,
                     JSONDecodeError,
                     # The SDK defaults to httpx2; factories may also supply legacy httpx clients.
-                    httpx.HTTPStatusError,
-                    httpx.TransportError,
-                    httpx.DecodingError,
-                    httpx2.HTTPStatusError,
-                    httpx2.TransportError,
-                    httpx2.DecodingError,
+                    httpx.HTTPStatusError, httpx2.HTTPStatusError,
+                    *_CONNECTION_ERRORS,
+                    *_TIMEOUT_ERRORS,
+                    httpx.TransportError, httpx2.TransportError,
+                    httpx.DecodingError, httpx2.DecodingError, requests.exceptions.ContentDecodingError,
+                    h2.exceptions.ProtocolError, requests.exceptions.ChunkedEncodingError,
                     RuntimeError,
                 ) as e:
                     # Retry on rate limits, 5xx responses, and connection/transport issues, or forced from above.
@@ -317,24 +352,44 @@ class GeminiAgentNode(AgentNode):
                         is_retriable = True
                         is_connection = True
                     if isinstance(e, (
-                        httpx.RemoteProtocolError, httpx2.RemoteProtocolError,
-                        httpx.DecodingError, httpx2.DecodingError,
+                        *_CONNECTION_ERRORS,
+                        *_TIMEOUT_ERRORS,
+                        httpx.RemoteProtocolError, httpx2.RemoteProtocolError, requests.exceptions.ChunkedEncodingError,
+                        httpx.DecodingError, httpx2.DecodingError, requests.exceptions.ContentDecodingError,
                     )):
+                        is_retriable = True
+                        is_connection = True
+                    if self._is_http2_goaway_cause(e):
+                        # WORKAROUND: The Gemini SDK fails to propagate HTTP/2 GOAWAY as a retriable stream error.
                         is_retriable = True
                         is_connection = True
                     if isinstance(e, (httpx.HTTPStatusError, httpx2.HTTPStatusError)):
                         status_code = e.response.status_code
                         if status_code in (408, 409, 429) or status_code >= 500:
                             is_retriable = True
+                        # WORKAROUND: Gemini was observed to report 499 CANCELLED even when the client did not actually cancel the request
+                        if status_code == 499:
+                            is_retriable = True
                     if isinstance(e, genai_errors.APIError):
                         if e.code in (408, 409, 429) or e.code >= 500:
+                            is_retriable = True
+                        # WORKAROUND: Gemini was observed to report 499 CANCELLED even when the client did not actually cancel the request
+                        if e.code == 499:
                             is_retriable = True
                     if isinstance(e, (genai_errors.UnknownApiResponseError, JSONDecodeError)):
                         is_retriable = True
 
+                    del intrahop_parts_buffer[checkpoint_len:]
+                    if checkpoint_usage is not None and checkpoint_usage.prompt_token_count is not None:
+                        self._accumulate_usage(checkpoint_usage)
+
                     if not is_retriable or attempt >= max_attempts:
                         self._close_client()
                         raise
+
+                    # A stream can disconnect after yielding its finish reason.
+                    finish_reason = None
+                    finish_message = None
 
                     delay = base_delay * (2 ** (attempt - 1))
                     delay = min(delay, 30)
@@ -372,41 +427,30 @@ class GeminiAgentNode(AgentNode):
                 return
 
             # Incremental token accounting.
-            assert resp.usage_metadata is not None, "Gemini response missing usage metadata"
-            self._accumulate_usage(resp.usage_metadata)
+            assert request_usage is not None, "Gemini response missing usage metadata"
+            self._accumulate_usage(request_usage)
 
-            # Validate each hop before adding its parts to the pending generation.
-            if candidate.content:
-                assert candidate.content.role in (None, "model"), (
-                    f"Unexpected Gemini response role: {candidate.content.role}")
-                self._check_thoughts_sanity(candidate.content)
-            hop_parts: list[types.Part] = (candidate.content.parts or []) if candidate.content else []
+            if finish_reason == types.FinishReason.MAX_TOKENS:
+                raise RuntimeError(f"Gemini exhausted max_output_tokens ({MAX_TOKENS}).")
 
-            if candidate.finish_reason == types.FinishReason.CONTINUATION or (
-                candidate.finish_reason is None and candidate.continuation_token
-            ):
-                if not candidate.continuation_token:
+            if finish_reason == types.FinishReason.CONTINUATION:
+                if not finish_has_token:
                     raise RuntimeError("Gemini returned CONTINUATION without a continuation token.")
-                pending_parts.extend(hop_parts)
-                continuation_token = candidate.continuation_token
-                
-                # Publish the continuation and usage while both transcripts remain buffered.
+            else:
+                assert finish_reason == types.FinishReason.STOP, (
+                    "Expected a completed Gemini generation. "
+                    f"Got: {finish_reason} {finish_message}")
+
+            intrahop_parts_buffer = self._compact_hop_parts(intrahop_parts_buffer)
+            self._check_thoughts_sanity(intrahop_parts_buffer)
+            multihop_parts_buffer.extend(intrahop_parts_buffer)
+            if finish_reason == types.FinishReason.CONTINUATION:
                 self.record_continuation()
                 continue
 
-            if candidate.finish_reason == types.FinishReason.MAX_TOKENS:
-                raise RuntimeError(f"Gemini exhausted max_output_tokens ({MAX_TOKENS}).")
-
-            assert candidate.finish_reason == types.FinishReason.STOP or (
-                candidate.finish_reason is None and any(p.function_call for p in hop_parts)
-            ), (
-                "Expected a completed Gemini generation. "
-                f"Got: {candidate.finish_reason} {candidate.finish_message}")
-
             # Multi-hop agent cycle is ready to proceed after this final hop.
-            pending_parts.extend(hop_parts)
-            parts: list[types.Part] = pending_parts
-            pending_parts = []
+            parts: list[types.Part] = multihop_parts_buffer
+            multihop_parts_buffer = []
             continuation_token = None
             if not parts:
                 self.ctx.post_success(self._final_text())
@@ -448,15 +492,11 @@ class GeminiAgentNode(AgentNode):
 
             # No function calls → finalize with assistant text.
             if not calls:
-                assert candidate.finish_reason == types.FinishReason.STOP, (
+                assert finish_reason == types.FinishReason.STOP, (
                     "Expected finish_reason=STOP when no function calls")
                 self.ctx.post_success(self._final_text())
                 self._close_client()
                 return
-
-            # At this point, there are function calls to process. First, sanity check:
-            assert candidate.finish_reason in (None, types.FinishReason.STOP), (
-                f"Expected finish_reason STOP or None when function calls are present. Got: {candidate.finish_reason}")
 
             # Make sure we check for cancellation right before commencing possibly
             # lengthy sub-tasks.
@@ -591,6 +631,49 @@ class GeminiAgentNode(AgentNode):
         raise RuntimeError(f"Gemini agent loop exceeded MAX_STEPS ({MAX_STEPS} model hops) "
                            "without producing a final response.")
 
+    @staticmethod
+    def _is_http2_goaway_cause(error: BaseException | None) -> bool:
+        """Recognize protocol errors from peer frames received after GOAWAY
+        since the Gemini SDK does not handle GOAWAY properly.
+
+        During a body read, the SDK exposes h2.exceptions.ProtocolError directly.
+        During a header read, httpcore2 and HTTPX2 each wrap it in their own LocalProtocolError.
+        """
+        if not isinstance(error, (h2.exceptions.ProtocolError, httpx2.LocalProtocolError)):
+            return False
+        frames = (
+            ConnectionInputs.RECV_DATA, ConnectionInputs.RECV_HEADERS,
+            ConnectionInputs.RECV_PING, ConnectionInputs.RECV_WINDOW_UPDATE,
+            ConnectionInputs.RECV_RST_STREAM,
+        )
+        if any(str(error) == f"Invalid input {frame} in state {ConnectionState.CLOSED}" for frame in frames):
+            return True
+
+        if isinstance(error, httpx2.LocalProtocolError) and error.__cause__ is not None:
+            core_error = error.__cause__
+            error = core_error.__cause__ or core_error.__context__
+        if not isinstance(error, h2.exceptions.ProtocolError):
+            return False
+
+        # h2's state machine keys transitions by (current state, input).
+        lookup_error = error.__cause__ or error.__context__
+        return isinstance(lookup_error, KeyError) and any(
+            lookup_error.args == ((ConnectionState.CLOSED, frame),) for frame in frames
+        )
+
+    @staticmethod
+    def _compact_hop_parts(parts: list[types.Part]) -> list[types.Part]:
+        """Join adjacent plain text deltas, preserving signed and structured parts verbatim."""
+        compacted: list[types.Part] = []
+        for text_only, run in groupby(
+            parts, key=lambda part: part.text is not None and part.model_fields_set == {"text"}
+        ):
+            if text_only:
+                compacted.append(types.Part.from_text(text="".join(cast(str, part.text) for part in run)))
+            else:
+                compacted.extend(run)
+        return compacted
+
     def _accumulate_usage(self, usage: types.GenerateContentResponseUsageMetadata):
         """For updating TokenUsage after each SDK response in the agent loop."""
         assert usage.prompt_token_count is not None, "Gemini response missing prompt token count"
@@ -643,14 +726,11 @@ class GeminiAgentNode(AgentNode):
             ),
         )
 
-    def _check_thoughts_sanity(self, content: types.Content):
+    def _check_thoughts_sanity(self, parts: list[types.Part]):
         # Ensure empty `thought` text.
         # For Gemini, thoughts are currently hidden. Only thought signatures are used for replay.
         # It would be very ambiguous if we somehow replay partial thoughts, or api behavior changes.
         # This is a sanity check to eliminate any such uncertainty.
-        if not content:
-            return
-        parts = content.parts or []
         for p in parts:
             if p.thought is None:
                 continue
