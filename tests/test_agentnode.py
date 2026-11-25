@@ -206,7 +206,8 @@ class TestAgentProviderToolSelection(unittest.TestCase):
 
     def test_tool_provider_dispatch_preserves_arguments_and_transcript(self):
         leaf = self._agent(
-            "leaf", args=[FunctionArg("task", str)], allow_models=[Provider.Gemini, Provider.OpenAI],
+            "leaf", args=[FunctionArg("task", str), FunctionArg("style", str, optional=True, enum={"Brief"})],
+            allow_models=[Provider.Gemini, Provider.OpenAI],
             default_model=Provider.OpenAI,
         )
         root_fn = self._agent(
@@ -228,9 +229,11 @@ class TestAgentProviderToolSelection(unittest.TestCase):
                         calls = [("leaf", {}), ("leaf", {"provider": None})]
                         if self.parent is None:
                             calls += [
-                                ("leaf", {"provider": "OpenAI"}),
-                                ("root", {"provider": "Anthropic"}),
+                                ("leaf", {"provider": "oPeNaI", "style": "BRIEF"}),
+                                ("root", {"provider": "aNtHrOpIc"}),
                             ]
+                        else:
+                            calls.append(("leaf", {"provider": "gemini"}))
                         outputs = []
                         for index, (name, extra_args) in enumerate(calls):
                             raw_args = {"task": str(index), **extra_args}
@@ -256,14 +259,17 @@ class TestAgentProviderToolSelection(unittest.TestCase):
             root = runtime.invoke(
                 None, root_fn, {"task": "start"}, provider=Provider.Gemini, max_agent_levels=3,
             )
-            self.assertEqual(root.result(), "Gemini Gemini OpenAI OpenAI OpenAI")
+            self.assertEqual(root.result(), "Gemini Gemini OpenAI OpenAI OpenAI Gemini")
 
-        self.assertEqual(len(records), 6)
+        self.assertEqual(len(records), 7)
         for original, child, part, description in records:
             with self.subTest(tool_use_id=child.tool_use_id, parent=child.parent.id):
                 # The transcript mapping aliases the original tool arguments.
                 self.assertEqual(dict(part.args), original)
-                self.assertEqual(child.inputs, {"task": original["task"]})
+                expected_inputs = {"task": original["task"]}
+                if "style" in original:
+                    expected_inputs["style"] = "Brief"
+                self.assertEqual(child.inputs, expected_inputs)
                 self.assertEqual(child.tool_use_id, part.tool_use_id)
                 if original.get("provider") is None:
                     # Keep core's provider_arg_spec()/func_args() promise consistent with
@@ -308,7 +314,7 @@ class TestAgentProviderToolSelection(unittest.TestCase):
         ))
 
         with patch.object(node.ctx, "invoke") as invoke:
-            for value in ("Anthropic", "gemini", 42, [], Provider.Gemini):
+            for value in ("aNtHrOpIc", "unknown", 42, [], Provider.Gemini):
                 with self.subTest(provider=value):
                     raw_args = {"task": "work", "provider": value}
                     with self.assertRaisesRegex(ValueError, "provider"):
@@ -319,10 +325,10 @@ class TestAgentProviderToolSelection(unittest.TestCase):
             self.assertIs(node.invoke_tool_function("code", raw_args, "code-use"), invoke.return_value)
             invoke.assert_called_once_with(code, raw_args, provider=None, tool_use_id="code-use")
             self.assertEqual(raw_args, {"provider": "ordinary business input"})
-        raw_args = {"provider": "xAI"}
+        raw_args = {"provider": "Xai"}
         with self.assertRaises(NotImplementedError):
             node.invoke_tool_function("root", raw_args, "unsupported-provider")
-        self.assertEqual(raw_args, {"provider": "xAI"})
+        self.assertEqual(raw_args, {"provider": "Xai"})
 
     def test_model_facing_arguments_preserve_task_signatures(self):
         task_args = [

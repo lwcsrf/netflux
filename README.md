@@ -507,6 +507,7 @@ This refined example shows:
 
 `Function` is the central abstraction whereby code or agents are both abstracted as merely being kinds of function calls. Specification / metadata describing the agent or code.
 
+* A string `FunctionArg` with an `enum` requires choices with distinct `str.casefold()` values. Framework calls accept any matching case and deliver the declared spelling to the function. [Enum argument validation](docs/case-insensitive-enum-arguments.md)
 * Concrete subtypes must override abstract property `uses() -> List[Function]`, specifying any `Function`s that can be `invoke()`d by the `Function`.
 * `AgentFunction`: can be invoked by any `Function`.
     * user subtypes to define their own agents (could use abstract properties that user must override).

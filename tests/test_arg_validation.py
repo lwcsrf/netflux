@@ -41,6 +41,19 @@ class TestFunctionBaseValidateArgs(unittest.TestCase):
         result = fn.validate_coerce_args({"required": "value"})
         self.assertEqual(result, {"required": "value"})
 
+    def test_enum_input_resolves_to_declared_spelling(self):
+        mode = FunctionArg("mode", str, enum={"Straße", "ReadOnly"})
+        fn = _DummyFunction([mode, FunctionArg("path", str)])
+        for raw, canonical in (("Straße", "Straße"), ("STRASSE", "Straße"), ("rEaDoNlY", "ReadOnly")):
+            with self.subTest(raw=raw):
+                inputs = {"mode": raw, "path": " Mixed/Path "}
+                self.assertIsNone(mode.validate_value(raw))
+                self.assertEqual(fn.validate_coerce_args(inputs), {"mode": canonical, "path": " Mixed/Path "})
+                self.assertEqual(inputs["mode"], raw)
+        for invalid in (" ReadOnly", "ReadOnly ", 42):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(ValueError, "mode"):
+                fn.validate_coerce_args({"mode": invalid, "path": "Mixed/Path"})
+
     def test_validate_coerce_args_coerces_boolean_strings(self):
         """Provide 'true'/'false' strings for a bool arg; expect returned dict with actual bools."""
         fn = _DummyFunction(
@@ -96,6 +109,26 @@ class TestFunctionArgValidation(unittest.TestCase):
                 r"enum values must be strings",
             ):
                 FunctionArg("option", str, enum={"ok", 1})  # type: ignore[arg-type]
+
+    def test_function_arg_rejects_casefold_collisions_at_construction(self):
+        for values in ({"Read", "READ"}, {"Straße", "STRASSE"}):
+            with self.subTest(values=values):
+                with self.assertRaises(ValueError) as caught:
+                    FunctionArg("mode", str, enum=values)
+                message = str(caught.exception)
+                self.assertIn("mode", message)
+                for value in values:
+                    self.assertIn(value, message)
+
+    def test_function_arg_snapshots_enum_options(self):
+        options = {"ReadOnly"}
+        mode = FunctionArg("mode", str, enum=options)
+        options.clear()
+        options.update({"READONLY", "Other"})
+        self.assertEqual(mode.enum, {"ReadOnly"})
+        self.assertEqual(mode.resolve_value("READONLY"), "ReadOnly")
+        with self.assertRaisesRegex(ValueError, "Other"):
+            mode.validate_value("Other")
 
     def test_validate_value_allows_none_when_optional(self):
         """Create optional FunctionArg and call validate_value(None); expect no exception."""

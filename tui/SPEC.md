@@ -481,11 +481,11 @@ Submission/parsing rules:
 - whitespace-only arg fields are treated as omitted,
 - blank optional arg fields are submitted as explicit `None`,
 - blank required arg fields remain missing and therefore fail top-level validation,
-- `str` args preserve the raw entered string when non-blank,
+- free-text `str` args preserve the raw entered string when non-blank,
 - `int` args are parsed with `int(...)`,
 - `float` args are parsed with `float(...)`,
 - `bool` args accept only `true` or `false` (case-insensitive),
-- enum-constrained args must match one of the declared values,
+- enum-constrained args use Unicode case folding to match a declared value and submit its declared spelling,
 - top-level `Runtime.invoke(...)` remains the final authority on validation,
 - top-level validation failures are shown inline in the form and do not create a root node.
 

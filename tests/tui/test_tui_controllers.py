@@ -1858,10 +1858,11 @@ class TestTUIState(unittest.TestCase):
             *,
             count: int,
             flag: bool,
+            mode: str,
             ratio: float | None = None,
         ) -> str:
             return (
-                f"{count}|{flag}|{ratio}|"
+                f"{count}|{flag}|{mode}|{ratio}|"
                 f"{type(count).__name__}|{type(flag).__name__}|{type(ratio).__name__}"
             )
 
@@ -1871,6 +1872,7 @@ class TestTUIState(unittest.TestCase):
             args=[
                 FunctionArg("count", int),
                 FunctionArg("flag", bool),
+                FunctionArg("mode", str, enum={"ReadOnly", "Write"}),
                 FunctionArg("ratio", float, optional=True),
             ],
             callable=typed,
@@ -1883,7 +1885,8 @@ class TestTUIState(unittest.TestCase):
         tui._form_state.fields[0].value = "typed run"
         tui._form_state.fields[2].value = "7"
         tui._form_state.fields[3].value = "false"
-        tui._form_state.fields[4].value = "1.5"
+        tui._form_state.fields[4].value = "rEaDoNlY"
+        tui._form_state.fields[5].value = "1.5"
 
         tui._submit_form()
 
@@ -1891,7 +1894,7 @@ class TestTUIState(unittest.TestCase):
         self.assertEqual(len(tui._runs), 1)
         self.assertEqual(
             tui._runs[0].node.result(),
-            "7|False|1.5|int|bool|float",
+            "7|False|ReadOnly|1.5|int|bool|float",
         )
 
     def test_launch_form_validates_max_agent_levels_inline_then_submits(self) -> None:
