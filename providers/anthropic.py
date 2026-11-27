@@ -14,6 +14,7 @@ from ..core import (
     TokenUsage,
 )
 from ..func_lib import ImageResult, raise_exception, status_update
+from ..func_lib.text_editor_func import TextEditor
 from . import ModelNames, Provider
 
 import anthropic
@@ -491,10 +492,8 @@ class AnthropicAgentNode(AgentNode):
             children: List[Optional[Node]] = []                 # Index to match `tool_uses` 1:1.
             invoke_exceptions: List[Optional[Exception]] = []   # Index to match `tool_uses` 1:1.
             for tu in tool_uses:
-                args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
-
                 try:
-                    children.append(self.invoke_tool_function(tu.name, args, tu.id))
+                    children.append(self._invoke_tool_function(tu))
                     invoke_exceptions.append(None)
                 except Exception as ex:
                     children.append(None)
@@ -723,3 +722,47 @@ class AnthropicAgentNode(AgentNode):
         if py_t is float: return "number"
         if py_t is bool:  return "boolean"
         return "string"  # fallback
+
+    def _invoke_tool_function(self, tu: ToolUseBlock) -> Node:
+        """
+        Thin wrapper around `invoke_tool_function` to intercept special cases:
+        * anthropic's models confuse TextEditor for the classic `str_replace_based_edit_tool`.
+        """
+        name: str = tu.name
+        args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
+        
+        # Sometimes anthropic models confuse TextEditor built-in for the `str_replace_based_edit_tool`
+        # it was modeled after. Accept the alternate name and limited flexibility in difference of
+        # arguments (adapt to ours).
+        if (
+            name == "str_replace_based_edit_tool"
+            and name not in self.func_map
+            and isinstance(self.func_map.get(TextEditor.name), TextEditor)
+        ):
+            name = TextEditor.name
+            args = self._adapt_str_replace_based_edit_tool_args_to_text_editor(args)
+
+        return self.invoke_tool_function(name, args, tu.id)
+
+    @staticmethod
+    def _adapt_str_replace_based_edit_tool_args_to_text_editor(args: Dict[str, Any]) -> Dict[str, Any]:
+        """Adapt `str_replace_based_edit_tool` args to `TextEditor` args, with reasonable flexibility."""
+        local_args: Dict[str, Any] = args.copy()
+        command: object = local_args.get("command")
+        if isinstance(command, str):
+            command = command.casefold()
+
+        view_range: object = local_args.pop("view_range", None)
+        insert_text: object = local_args.pop("insert_text", None)
+        if command == "view" and view_range is not None:
+            bounds: tuple[str, str] = ("view_start_line", "view_end_line")
+            if isinstance(view_range, list) and len(view_range) == 2:
+                for name, line in zip(bounds, view_range):
+                    if local_args.get(name) in (None, "null"):
+                        local_args[name] = line
+            # A malformed partial view should not expand into a full-file read.
+            if all(local_args.get(name) in (None, "null") for name in bounds):
+                raise ValueError("Missing argument: view_start_line or view_end_line for partial view")
+        elif command == "insert" and local_args.get("new_str") is None and isinstance(insert_text, str):
+            local_args["new_str"] = insert_text
+        return local_args
