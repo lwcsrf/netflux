@@ -734,6 +734,7 @@ class AnthropicAgentNode(AgentNode):
         """
         Thin wrapper around `invoke_tool_function` to intercept special cases:
         * anthropic's models confuse TextEditor for the classic `str_replace_based_edit_tool`.
+        * (add further interceptions here as needed)
         """
         name: str = tu.name
         args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
