@@ -1,7 +1,8 @@
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Type, Union, get_args, Mapping
+from functools import cached_property
+from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union, get_args, Mapping
 import inspect
 import logging
 import time
@@ -134,7 +135,7 @@ class FunctionArg:
     argtype: AllowedArgTypeUnion
     desc: str = ""
     optional: bool = False
-    enum: Optional[Set[str]] = None
+    enum: set[str] | frozenset[str] | None = None
 
     def __post_init__(self) -> None:
         """Spec-time validation of declared arg type and (optional) enum constraint."""
@@ -150,26 +151,50 @@ class FunctionArg:
                     f"Arg '{self.name}': enum constraint is only supported for str args."
                 )
 
-            # Ensure non-empty, strings only, unique; store as immutable tuple
-            if not isinstance(self.enum, (set, frozenset)) or len(self.enum) == 0:
+            if not isinstance(self.enum, (set, frozenset)) or not self.enum:
                 raise ValueError(f"Arg '{self.name}': enum must be a set of string literals.")
-            if any(not isinstance(v, str) for v in self.enum):
+            choices = frozenset(self.enum)
+            if any(not isinstance(v, str) for v in choices):
                 raise ValueError(f"Arg '{self.name}': enum values must be strings.")
 
+            object.__setattr__(self, "enum", choices)
+            if len(self._enum_by_casefold) != len(choices):
+                raise ValueError(
+                    f"Arg '{self.name}': enum choices must be unique after casefolding: {sorted(choices)}"
+                )
+
+    @cached_property
+    def _enum_by_casefold(self) -> dict[str, str]:
+        assert self.enum is not None
+        return {choice.casefold(): choice for choice in self.enum}
+
     def validate_value(self, value: Any) -> None:
+        self.resolve_value(value)
+
+    def resolve_value(self, value: Any) -> Any:
+        """Validate a value provided for the argument, and return after acceptable coercions."""
         # Allow None literal only when optional arg.
         if value is None:
             if self.optional:
-                return
+                return None
             raise ValueError(f"Arg '{self.name}' is required and cannot be None")
 
-        # bool is a subclass of int; enforce exact match semantics
+        # JSON numbers may decode as ints even for float arguments; exclude bool.
+        if self.argtype is float and type(value) is int:
+            return float(value)
+
         if self.argtype is bool:
+            # Tolerate boolean-like strings.
+            if isinstance(value, str):
+                s = value.strip().lower()
+                if s == "true" or s == "false":
+                    return (s == "true")
+
             if type(value) is not bool:
                 raise ValueError(
                     f"Arg '{self.name}' expects bool, got {type(value).__name__}"
                 )
-            return
+            return value
 
         if self.argtype is int and type(value) is bool:
             raise ValueError(f"Arg '{self.name}' expects int, got bool")
@@ -183,12 +208,15 @@ class FunctionArg:
             )
 
         # Enum constraint (strings only). Give a model useful feedback for retries.
-        if self.argtype is str and self.enum is not None:
-            if value not in self.enum:
+        if self.enum:
+            canonical = self._enum_by_casefold.get(value.casefold())
+            if canonical is None:
                 allowed = ", ".join(sorted(self.enum))
                 raise ValueError(
                     f"Arg '{self.name}' must be one of: {allowed}; got '{value}'"
                 )
+            return canonical
+        return value
 
 class Function(ABC):
     def __init__(
@@ -205,7 +233,7 @@ class Function(ABC):
         """
         Validate whether an invocation with the given `args` is valid for this Function.
         """
-        expect = {a.name: a for a in self.args}
+        expect: Dict[str, FunctionArg] = {a.name: a for a in self.args}
         unknown = set(args.keys()) - set(expect.keys())
         if unknown:
             raise ValueError(
@@ -220,24 +248,12 @@ class Function(ABC):
             )
 
         # Validate provided values (optional args may be omitted; if explicitly given as None,
-        # `validate_value()` will accept only when optional=True).
-        # Here we can also add light coercion for minor mistakes where it makes sense.
-        coerced: Dict[str, Any] = dict(args)  # copy
-        for k, v in list(args.items()):
-            spec = expect[k]
-            coerced[k] = v
-
-            # JSON numbers may decode as ints even for float arguments; exclude bool.
-            if spec.argtype is float and type(v) is int:
-                coerced[k] = float(v)
-
-            # Tolerate boolean-like strings.
-            if spec.argtype is bool and isinstance(v, str):
-                s = v.strip().lower()
-                if s == "true" or s == "false":
-                    coerced[k] = (s == "true")
-
-            expect[k].validate_value(coerced[k])
+        # `resolve_value()` will accept only when optional=True).
+        # Here we also do light coercion for types where it makes sense.
+        coerced: Dict[str, Any] = {}
+        for arg_name, arg_val in args.items():
+            spec = expect[arg_name]
+            coerced[arg_name] = spec.resolve_value(arg_val)
         return coerced
 
     @property
@@ -1029,8 +1045,7 @@ class AgentNode(Node):
         args: Dict[str, Any] = dict(tool_args)
         provider: Provider | None = None
         if isinstance(fn, AgentFunction):
-            prov = args.pop("provider", None)
-            self.provider_arg_spec(fn).validate_value(prov)
+            prov = self.provider_arg_spec(fn).resolve_value(args.pop("provider", None))
             provider = Provider(prov) if prov is not None else None
         return self.ctx.invoke(fn, args, provider=provider, tool_use_id=tool_use_id)
 
