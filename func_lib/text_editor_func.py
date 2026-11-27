@@ -11,7 +11,7 @@ from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
 
 
 def _split_file_lines(text: str) -> list[str]:
-    """Split only at LF, retaining CRLF and bare CR verbatim."""
+    """Split after each LF and keep every character, including the LF itself."""
     return StringIO(text, newline="\n").readlines()
 
 
