@@ -172,6 +172,9 @@ class FunctionArg:
         assert self.enum is not None
         return {choice.casefold(): choice for choice in self.enum}
 
+    def validate_value(self, value: Any) -> None:
+        self.resolve_value(value)
+
     def resolve_value(self, value: Any) -> Any:
         """Validate a value provided for the argument, and return after acceptable coercions."""
         # Allow None literal only when optional arg.
