@@ -1,5 +1,7 @@
+import math
 import unittest
 from enum import Enum
+from unittest.mock import patch
 
 from ..core import Function, FunctionArg
 
@@ -151,6 +153,54 @@ class TestFunctionArgValidation(unittest.TestCase):
                 resolved = arg.resolve_value(value)
                 self.assertIs(type(resolved), int)
                 self.assertEqual(resolved, expected)
+
+    def test_numeric_strings_resolve_to_the_declared_type(self):
+        cases = [
+            (int, "3", 3),
+            (int, "3.0", 3),
+            (int, " -3.00 ", -3),
+            (int, "3.5e1", 35),
+            (int, "-0.0", 0),
+            (int, "9007199254740993.0", 9007199254740993),
+            (float, "3", 3.0),
+            (float, "3.0", 3.0),
+            (float, "3.5", 3.5),
+            (float, " +3.5e-1 ", 0.35),
+            (float, "Infinity", math.inf),
+            (float, "-Infinity", -math.inf),
+            (float, "Inf", math.inf),
+            (float, "-Inf", -math.inf),
+            (float, "inf", math.inf),
+            (float, "-inf", -math.inf),
+            (float, " +InF ", math.inf),
+        ]
+        for argtype, text, expected in cases:
+            with self.subTest(argtype=argtype, text=text):
+                resolved = FunctionArg("number", argtype).resolve_value(text)
+                self.assertIs(type(resolved), argtype)
+                self.assertEqual(resolved, expected)
+
+    def test_nan_string_resolves_to_float_nan(self):
+        self.assertTrue(math.isnan(FunctionArg("number", float).resolve_value("NaN")))
+
+    def test_numeric_strings_reject_invalid_values(self):
+        invalid_for_both = ["", "3x", '"3"', "true", "3__0"]
+        for argtype, extra in [
+            (int, ["3.5", "3.0000000000000001", "1e-400", "NaN", "Infinity", "-Infinity"]),
+            (float, ["1e400", "-1e400"]),
+        ]:
+            for text in invalid_for_both + extra:
+                with self.subTest(argtype=argtype, text=text):
+                    with self.assertRaisesRegex(ValueError, f"Arg 'number' expects {argtype.__name__}"):
+                        FunctionArg("number", argtype).resolve_value(text)
+
+    def test_integer_string_exponents_respect_digit_limit(self):
+        arg = FunctionArg("count", int)
+        with patch("sys.get_int_max_str_digits", return_value=640):
+            self.assertEqual(arg.resolve_value("1e639"), 10**639)
+            self.assertEqual(arg.resolve_value("0e640"), 0)
+            with self.assertRaisesRegex(ValueError, "Arg 'count' expects int"):
+                arg.resolve_value("1e640")
 
     def test_resolve_value_rejects_fractional_and_nonfinite_floats_for_int_arg(self):
         arg = FunctionArg("count", int)

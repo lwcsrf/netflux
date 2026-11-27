@@ -905,10 +905,8 @@ class TUI(SessionController):
         text = raw.strip()
         if arg.argtype is str:
             value: object = raw
-        elif arg.argtype is int:
-            value = int(text)
-        elif arg.argtype is float:
-            value = float(text)
+        elif arg.argtype in (int, float):
+            value = arg.resolve_value(raw)
         elif arg.argtype is bool:
             normalized = text.lower()
             if normalized == "true":

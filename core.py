@@ -1,10 +1,13 @@
 from abc import abstractmethod, ABC
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from enum import Enum
 from functools import cached_property
 from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union, get_args, Mapping
 import inspect
 import logging
+import math
+import sys
 import time
 from threading import Event, Lock, Thread
 from overrides import override
@@ -175,6 +178,28 @@ class FunctionArg:
     def validate_value(self, value: Any) -> None:
         self.resolve_value(value)
 
+    def _resolve_numeric_string(self, text: str) -> int | float:
+        try:
+            # float() checks Python's numeric string syntax for both target types.
+            parsed = float(text)
+            if self.argtype is float:
+                # float() also returns infinity when finite text such as "1e400" overflows.
+                if not math.isinf(parsed) or text.strip().lower().lstrip("+-") in ("inf", "infinity"):
+                    return parsed
+            if self.argtype is int:
+                # Use the original digits so rounding cannot turn a fraction into an integer.
+                exact = Decimal(text)
+                if exact.is_zero():
+                    return 0
+                if exact.is_finite() and exact == exact.to_integral_value():
+                    # An exponent can expand a short string beyond Python's integer digit limit.
+                    digit_limit = sys.get_int_max_str_digits()
+                    if not digit_limit or exact.adjusted() < digit_limit:
+                        return int(exact)
+        except (ValueError, InvalidOperation):
+            pass
+        raise ValueError(f"Arg '{self.name}' expects {self.argtype.__name__}, got {text!r}")
+
     def resolve_value(self, value: Any) -> Any:
         """Validate a value provided for the argument, and return after acceptable coercions."""
         # Allow None literal only when optional arg.
@@ -188,6 +213,9 @@ class FunctionArg:
             return float(value)
         if self.argtype is int and type(value) is float and value.is_integer():
             return int(value)
+
+        if isinstance(value, str) and self.argtype in (int, float):
+            return self._resolve_numeric_string(value)
 
         if self.argtype is bool:
             # Tolerate boolean-like strings.
