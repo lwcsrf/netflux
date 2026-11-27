@@ -219,7 +219,8 @@ class FunctionArg:
                 return float(value)
             except OverflowError:
                 raise ValueError(f"Arg '{self.name}' expects float, got an integer outside the float range") from None
-        if self.argtype is int and type(value) is float and value.is_integer():
+        # At magnitude 2**53 and above, neighboring integers can round to the same float.
+        if self.argtype is int and type(value) is float and value.is_integer() and abs(value) < 2**53:
             return int(value)
 
         if isinstance(value, str) and self.argtype in (int, float):

@@ -163,6 +163,19 @@ class TestFunctionArgValidation(unittest.TestCase):
                 self.assertIs(type(resolved), int)
                 self.assertEqual(resolved, expected)
 
+    def test_float_to_int_safe_integer_boundaries(self):
+        arg = FunctionArg("count", int)
+        for sign in (1, -1):
+            with self.subTest(sign=sign):
+                safe = sign * (2**53 - 1)
+                self.assertEqual(arg.resolve_value(float(safe)), safe)
+                large_id = sign * (2**53 + 1)
+                self.assertEqual(arg.resolve_value(large_id), large_id)
+                # Decoding the same ID as a float rounds it to the boundary.
+                for value in (float(large_id), float(sign * (2**53 + 2))):
+                    with self.assertRaisesRegex(ValueError, "expects int, got float"):
+                        arg.resolve_value(value)
+
     def test_numeric_strings_resolve_to_the_declared_type(self):
         cases = [
             (int, "3", 3),
