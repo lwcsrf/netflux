@@ -228,7 +228,7 @@ class TestAgentProviderToolSelection(unittest.TestCase):
                         calls = [("leaf", {}), ("leaf", {"provider": None})]
                         if self.parent is None:
                             calls += [
-                                ("leaf", {"provider": "OpenAI"}),
+                                ("leaf", {"provider": "openai"}),
                                 ("root", {"provider": "Anthropic"}),
                             ]
                         outputs = []
@@ -308,7 +308,7 @@ class TestAgentProviderToolSelection(unittest.TestCase):
         ))
 
         with patch.object(node.ctx, "invoke") as invoke:
-            for value in ("Anthropic", "gemini", 42, [], Provider.Gemini):
+            for value in ("Anthropic", "unknown", 42, [], Provider.Gemini):
                 with self.subTest(provider=value):
                     raw_args = {"task": "work", "provider": value}
                     with self.assertRaisesRegex(ValueError, "provider"):
