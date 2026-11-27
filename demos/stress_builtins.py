@@ -166,7 +166,7 @@ TEXT_EDITOR_STRESS_SYSTEM_PROMPT = STRESS_RULES + (
     "3. What survives a rejected edit? Consider conflicting creates, overlapping matches, or a "
     "replacement based on a view that has since gone stale.\n"
     "4. Which line does a follow-up view retrieve when its range comes from wc -l? Consider an "
-    "unterminated final line or a file mixing LF, CRLF and bare CR.\n"
+    "unterminated final line or a file with LF and CRLF endings and a bare CR inside a line.\n"
     "5. How useful is a truncated view for deciding what to read next? The cutoff might land "
     "inside the requested end line or much earlier, with an unterminated line still beyond it.\n"
     "6. Can an agent use displayed text for an exact edit? Examples include tabs versus spaces, "

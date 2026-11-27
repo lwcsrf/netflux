@@ -11,8 +11,8 @@ from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
 
 
 def _split_file_lines(text: str) -> list[str]:
-    """Match the range readers' LF, CRLF, and CR boundaries and preserve each ending."""
-    return StringIO(text, newline="").readlines()
+    """Split only at LF, retaining CRLF and bare CR verbatim."""
+    return StringIO(text, newline="\n").readlines()
 
 
 class TextEditorException(Exception):
@@ -38,7 +38,9 @@ class TextEditor(CodeFunction):
         "Commands:\n"
         "• `view`: View a file or list a directory (single level). "
         "Files show line numbers (format: `number|content`) and you can optionally "
-        "specify a line range. For directories, subdirectories are listed with '/' appended to their names.\n"
+        "specify a line range. Only LF ends a line (including the LF in CRLF). Bare CR is content, "
+        "and a nonempty unterminated final line is counted. "
+        "For directories, subdirectories are listed with '/' appended to their names.\n"
         "List dirs only sparingly to avoid context pollution.\n"
         "Be selective when viewing files to prevent context explosion; use line ranges to limit output.\n"
         "• `str_replace`: Replace exact text in a file (`old_str` → `new_str`). Line numbers are"
@@ -172,7 +174,7 @@ class TextEditor(CodeFunction):
                 if self._needs_truncation(listing):
                     listing = self._truncate_with_inline_warning(listing)
                     notice = "[WARNING: DIRECTORY LISTING TRUNCATED.]"
-                    if listing.endswith(("\r\n", "\n", "\r")):
+                    if listing.endswith("\n"):
                         listing += notice
                     else:
                         listing += "\n" + notice
@@ -532,7 +534,7 @@ class TextEditor(CodeFunction):
         if truncated.endswith("\r\n"):
             truncated = truncated[:-2]
             trailing_break = "\r\n"
-        elif truncated.endswith(("\n", "\r")):
+        elif truncated.endswith("\n"):
             trailing_break = truncated[-1]
             truncated = truncated[:-1]
         return f"{truncated}{warning}{trailing_break}"
@@ -551,7 +553,7 @@ class TextEditor(CodeFunction):
             [WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]
         """
         notice = "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
-        if s.endswith(("\r\n", "\n", "\r")):
+        if s.endswith("\n"):
             return s + notice
         return s + "\n" + notice
 
@@ -602,14 +604,14 @@ class TextEditor(CodeFunction):
         Read text while preserving exact newline characters and unknown bytes.
         - encoding='utf-8', errors='surrogateescape' keeps undecodable bytes round-trippable
           (decoded into U+DC80..U+DCFF) and writes them back as the original bytes.
-        - newline='' preserves CRLF vs LF exactly.
+        - The reader preserves CR and LF exactly.
         """
         if not p.exists():
             raise FileNotFoundError(f"Path not found: {p}")
         if not p.is_file():
             raise TextEditorException(f"Path is not a file: {p}")
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
                 return f.read()
         except PermissionError as exc:
             raise PermissionError(f"while reading '{p}': {exc}") from exc
@@ -720,14 +722,12 @@ class TextEditor(CodeFunction):
         out_len = 0
         was_truncated = False
         last_line = 0
-        lf_count = 0
         omitted_final_line = None
 
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
                 for i, line in enumerate(f, 1):
                     last_line = i
-                    lf_count += line.endswith("\n")  # wc -l counts LF, including the LF in CRLF.
                     if i < start:
                         continue
                     if not was_truncated:
@@ -744,20 +744,12 @@ class TextEditor(CodeFunction):
                             else:
                                 was_truncated = True
                     if i >= end_inclusive:
-                        # Stop at the first LF beyond the requested count. Bound reads for long lines.
-                        tail_line = i + 1
-                        previous_cr = False
+                        # wc -l misses the next line only if the remaining text contains no LF.
                         while chunk := f.readline(64 * 1024):
-                            lf_count += chunk.endswith("\n")
-                            ends_line = chunk.endswith(("\r", "\n"))
-                            # A CRLF split across chunks still ends just one editor line.
-                            if ends_line and not (previous_cr and chunk == "\n"):
-                                tail_line += 1
-                            previous_cr = chunk.endswith("\r")
-                            # EOF confirms this candidate. A later line terminator clears it.
-                            omitted_final_line = tail_line if lf_count == end_inclusive and not ends_line else None
-                            if lf_count > end_inclusive:
+                            if chunk.endswith("\n"):
+                                omitted_final_line = None
                                 break
+                            omitted_final_line = i + 1
                         break
         except PermissionError as exc:
             raise PermissionError(f"while reading '{p}': {exc}") from exc
@@ -780,7 +772,7 @@ class TextEditor(CodeFunction):
         last_line = 0
 
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
                 for i, line in enumerate(f, 1):
                     last_line = i
                     if i < start:

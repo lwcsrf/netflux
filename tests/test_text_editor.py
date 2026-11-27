@@ -47,7 +47,7 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertNotIn("OUTPUT TRUNCATED", output)
 
     def test_displayed_lines_match_view_and_insert_positions(self) -> None:
-        for separator in ("\u2028", "\v", "\u2029"):
+        for separator in ("\r", "\u2028", "\v", "\u2029"):
             with self.subTest(separator=separator), tempfile.TemporaryDirectory() as tmpdir:
                 path = str(Path(tmpdir, "file.txt"))
                 middle = f"B{separator}C\n"
@@ -70,7 +70,7 @@ class TestTextEditorBasicOperations(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir, "file.txt")
             # The lookahead's first 64 KiB ends with CR, and the next read begins with LF.
-            split_crlf = b"a\r" + b"x" * (64 * 1024 - 1) + b"\r\nlast"
+            split_crlf = b"a\n" + b"x" * (64 * 1024 - 1) + b"\r\nlast"
             for data, end, expected in [
                 (b"a\r\nb\r\nc", 2, "1|a\r\n2|b\r\n\n" + warning(3)),
                 (b"a\nb\nc", 1, "1|a\n"),
@@ -78,10 +78,11 @@ class TestTextEditorBasicOperations(unittest.TestCase):
                 (b"a\nb", 2, "1|a\n2|b"),
                 (b"a\nb", -1, "1|a\n2|b"),
                 (b"a\nb", None, "1|a\n2|b"),
-                (b"a\rb\nc", 1, "1|a\r\n" + warning(3)),
-                (b"a\rb\nc", 2, "1|a\r2|b\n"),
-                (b"a\rb\rc\nd", 1, "1|a\r\n" + warning(4)),
-                (split_crlf, 1, "1|a\r\n" + warning(3)),
+                (b"a\rb\nc", 1, "1|a\rb\n\n" + warning(2)),
+                (b"a\rb\nc", 2, "1|a\rb\n2|c"),
+                (b"a\rb\r", 1, "1|a\rb\r"),
+                (b"a\nb\r", 1, "1|a\n\n" + warning(2)),
+                (split_crlf, 1, "1|a\n"),
             ]:
                 with self.subTest(data=data[:32], end=end):
                     path.write_bytes(data)
@@ -91,20 +92,20 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertEqual(self.editor.handle_view(str(path), 1, 1), "1|A\n\n" + warning(2))
             self.assertEqual(self.editor.handle_view(str(path), 2, 2), "2|B\u2028C")
 
-            path.write_bytes(b"abc\n" * 124 + b"x" * 100_000)
+            path.write_bytes(b"a\rc\n" * 124 + b"x" * 100_000)
             for cutoff_line in (124, 2):
                 with self.subTest(cutoff_line=cutoff_line):
-                    limit = (cutoff_line - 1) * len("abc\n") + len("ab")
+                    limit = (cutoff_line - 1) * len("a\rc\n") + len("a\r")
                     self.editor.max_characters = limit
                     output = self.editor.call(
                         self.ctx, command="view", path=str(path), view_start_line=1, view_end_line=124,
                     )
-                    expected = [f"{i}|abc" for i in range(1, cutoff_line)] + [
-                        f"{cutoff_line}|ab[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {limit} CHARACTERS]",
+                    expected = [f"{i}|a\rc" for i in range(1, cutoff_line)] + [
+                        f"{cutoff_line}|a\r[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {limit} CHARACTERS]",
                         "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]",
                         warning(125),
                     ]
-                    self.assertEqual(expected, output.splitlines())
+                    self.assertEqual("\n".join(expected), output)
 
     def test_str_replace_single_match_updates_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -455,7 +456,7 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
     def test_raise_create_conflict_message_on_alternate_success(self) -> None:
         editor = TextEditor()
         p = Path("/original/path.txt")
-        file_text = "line1\nline2\u2028continued\n"
+        file_text = "line1\rcontinued\nline2\u2028continued\n"
 
         # Patch helper to simulate a successful alternate write without touching filesystem.
         with patch.object(
