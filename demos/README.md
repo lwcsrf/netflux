@@ -79,9 +79,10 @@ Run:
 
 ## TUI (`tui.py`)
 
-The puzzle, bash/image stress tests, performance optimizer, and apply-diff demos
-are also available as top-level Functions in the interactive TUI.
+The interactive TUI offers the puzzle, performance optimizer, and apply-diff demos
+along with the bash, image, and text editor stress agents.
 It lets you launch multiple tree roots from one terminal session and switch between their live or completed execution trees.
+Select `text_editor_stress_agent` and leave `workspace` blank for a fresh temporary directory, or enter the absolute path of an existing one.
 
 Run:
 

@@ -238,9 +238,17 @@ CUSTOM_INSTRUCTION_ARGS = [
 text_editor_stress_agent = AgentFunction(
     name="text_editor_stress_agent",
     desc="Stress-tests text_editor edits, range boundaries, truncation, error handling, corner cases.",
-    args=CUSTOM_INSTRUCTION_ARGS,
+    args=[
+        FunctionArg("workspace", str, "Absolute path to a temporary workspace. Leave blank to create one.", optional=True),
+        *CUSTOM_INSTRUCTION_ARGS,
+    ],
     system_prompt=TEXT_EDITOR_STRESS_SYSTEM_PROMPT,
-    user_prompt_template="Run the text editor stress test.\nCustom instruction: {custom_instruction}\n",
+    user_prompt_template=(
+        "Run the text editor stress test.\nWorkspace: {workspace}\n"
+        "If no workspace is supplied, create a fresh temporary directory with bash. "
+        "Use absolute paths inside the workspace for test files and include its path in your report.\n"
+        "Custom instruction: {custom_instruction}\n"
+    ),
     uses=[text_editor, bash, raise_exception, status_update],
 )
 
@@ -297,7 +305,7 @@ def run_stress_tree(
     invoke_args = {
         "custom_instruction": custom_instruction,
     }
-    if mode == "bash":
+    if mode in ("bash", "text_editor"):
         invoke_args["workspace"] = str(workspace)
 
     cwd_save = Path.cwd()

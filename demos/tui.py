@@ -5,7 +5,7 @@ from ..core import Function
 from ..runtime import Runtime
 from ..tui import TUI
 from .apply_diff import apply_diff_patch
-from .stress_builtins import bash_stress_agent, image_stress_agent
+from .stress_builtins import bash_stress_agent, image_stress_agent, text_editor_stress_agent
 from .client_factory import CLIENT_FACTORIES
 from .perf_opt import perf_optimizer
 from .puzzle import INTERLEAVE_AGENT
@@ -17,6 +17,7 @@ ROOT_FUNCTIONS: tuple[Function, ...] = (
     image_stress_agent,
     perf_optimizer,
     apply_diff_patch,
+    text_editor_stress_agent,
 )
 
 class _DemoRuntime(Runtime):
