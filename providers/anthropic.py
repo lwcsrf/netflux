@@ -525,6 +525,13 @@ class AnthropicAgentNode(AgentNode):
                             out_text = result.status
                         else:
                             out_text = str(result)
+
+                        # If `_invoke_tool_function()` made us succeed on a bad func name, warn the model not to repeat.
+                        if tu.name != child.fn.name:
+                            out_text += (
+                                f"\n\n[WARNING: you invoked `{tu.name}` but harness assumed `{child.fn.name}`. "
+                                "This auto-recovered. Follow tools spec more closely."
+                            )
                         is_error = False
                     except Exception as ex:
                         if (
