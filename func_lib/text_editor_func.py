@@ -18,6 +18,11 @@ def _split_file_lines(text: str) -> list[str]:
     return StringIO(text, newline="\n").readlines()
 
 
+def _replace_surrogates(text: str) -> str:
+    """Make filesystem names safe to display in UTF-8 tool results."""
+    return re.sub(r"[\ud800-\udfff]", "\ufffd", text)
+
+
 class TextEditorException(Exception):
     """Raised for business-logic violations in the TextEditor tool."""
 
@@ -58,13 +63,13 @@ class TextEditor(CodeFunction):
         "• `create` → `path` (must not pre-exist), `file_text`.\n"
         "• `insert` → `path`, `insert_line`, `new_str`."
         + dedent(r"""
-            Examples (file before, new_str, insert_line, file after):
-            ("A\nC\n", "B\n", 1, "A\nB\nC\n")
-            ("A", "B\n", 0, "B\nA")
-            ("A\nC", "B", 1, "A\nBC")
-            ("A\n", "B", 1, "A\nB")
-            ("A", "B\n", 1, "AB\n")
-            ("A", "\nB", 1, "A\nB")
+            Examples (file before, insert_line, new_str, file after):
+            ("A\nC\n", 1, "B\n", "A\nB\nC\n")
+            ("A", 0, "B\n", "B\nA")
+            ("A\nC", 1, "B", "A\nBC")
+            ("A\n", 1, "B", "A\nB")
+            ("A", 1, "B\n", "AB\n")
+            ("A", 1, "\nB", "A\nB")
             """)
         + "Absolute paths are recommended to avoid ambiguity.\n"
         "String output:\n"
@@ -96,7 +101,7 @@ class TextEditor(CodeFunction):
         ),
         FunctionArg("view_end_line", int,
                     "When command=view on a file, optional 1-indexed end line (inclusive) for partial view. "
-                    "Use -1 to read to end of file.",
+                    "Use -1 to read to end of file. An end line past EOF returns the available lines with a warning.",
                     optional=True,
         ),
     ]
@@ -164,7 +169,7 @@ class TextEditor(CodeFunction):
     ) -> str:
         p = self._resolve_path(path)
         if not p.exists():
-            raise FileNotFoundError(f"Path not found: {p}")
+            raise FileNotFoundError(_replace_surrogates(f"Path not found: {p}"))
 
         # Directory listing.
         if p.is_dir():
@@ -185,16 +190,16 @@ class TextEditor(CodeFunction):
                         listing += notice
                     else:
                         listing += "\n" + notice
-                return listing
+                return _replace_surrogates(listing)
 
             except PermissionError as exc:
-                raise PermissionError(f"while listing directory '{p}': {exc}") from exc
+                raise PermissionError(_replace_surrogates(f"while listing directory '{p}': {exc}")) from exc
             except OSError as exc:
-                raise OSError(f"while listing directory '{p}': {exc}") from exc
+                raise OSError(_replace_surrogates(f"while listing directory '{p}': {exc}")) from exc
 
         # File view
         if not p.is_file():
-            raise TextEditorException(f"Path is neither directory nor regular file: {p}")
+            raise TextEditorException(_replace_surrogates(f"Path is neither directory nor regular file: {p}"))
         if view_end_line == 0:
             raise TextEditorException("view_end_line cannot be 0; use -1 for end-of-file")
         if view_start_line is not None and view_start_line < 1:
@@ -233,8 +238,6 @@ class TextEditor(CodeFunction):
                 raise TextEditorException("File is empty")
             if start > last_line:
                 raise TextEditorException(f"view_start_line {start} exceeds file line count ({last_line})")
-            if end > last_line:
-                raise TextEditorException(f"view_end_line {end} exceeds file line count ({last_line})")
             if was_truncated:
                 snippet = self._truncate_with_inline_warning(snippet)
             numbered = self._add_line_numbers(snippet, start_at=start)
@@ -246,6 +249,8 @@ class TextEditor(CodeFunction):
             if omitted_final_line is not None:
                 numbered += ("\n[Warning: The file's last line has no terminating newline and is just outside the requested range. "
                              f"Request line {omitted_final_line} explicitly for it.]").upper()
+            if end > last_line:
+                numbered += f"\n[warning: requested end line {end} exceeds the file's last line ({last_line}).]".upper()
             return numbered
         else:
             snippet, last_line, was_truncated = self._read_from_start_stream(p, start)
@@ -724,7 +729,7 @@ class TextEditor(CodeFunction):
         omitted_final_line = None
 
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
+            with p.open("r", encoding="utf-8", errors="replace", newline="\n") as f:
                 for i, line in enumerate(f, 1):
                     last_line = i
                     if i < start:
@@ -751,9 +756,9 @@ class TextEditor(CodeFunction):
                             omitted_final_line = i + 1
                         break
         except PermissionError as exc:
-            raise PermissionError(f"while reading '{p}': {exc}") from exc
+            raise PermissionError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
         except OSError as exc:
-            raise OSError(f"while reading '{p}': {exc}") from exc
+            raise OSError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
 
         return "".join(out_parts), last_line, was_truncated, omitted_final_line
 
@@ -771,7 +776,7 @@ class TextEditor(CodeFunction):
         last_line = 0
 
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
+            with p.open("r", encoding="utf-8", errors="replace", newline="\n") as f:
                 for i, line in enumerate(f, 1):
                     last_line = i
                     if i < start:
@@ -792,9 +797,9 @@ class TextEditor(CodeFunction):
                     if was_truncated:
                         break
         except PermissionError as exc:
-            raise PermissionError(f"while reading '{p}': {exc}") from exc
+            raise PermissionError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
         except OSError as exc:
-            raise OSError(f"while reading '{p}': {exc}") from exc
+            raise OSError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
 
         return "".join(out_parts), last_line, was_truncated
 

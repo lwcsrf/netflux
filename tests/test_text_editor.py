@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import unittest
@@ -46,6 +47,69 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertIn("2|line2\n", output)
             self.assertNotIn("OUTPUT TRUNCATED", output)
 
+    def test_view_replaces_invalid_utf8_in_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes("café\r\n".encode("utf-8") + b"caf\xe9 \xe2\x82\nlast\xff\n")
+            for start, end, expected in (
+                (None, None, "1|café\r\n2|caf\ufffd \ufffd\n3|last\ufffd\n"),
+                (1, 2, "1|café\r\n2|caf\ufffd \ufffd\n"),
+                (2, -1, "2|caf\ufffd \ufffd\n3|last\ufffd\n"),
+            ):
+                with self.subTest(start=start, end=end):
+                    result = self.editor.call(
+                        self.ctx, command="view", path=str(path), view_start_line=start, view_end_line=end,
+                    )
+                    self.assertEqual(result, expected)
+
+    @unittest.skipUnless(os.name == "posix" and os.fsdecode(b"\xff") == "\udcff", "requires byte filenames")
+    def test_directory_view_replaces_surrogates_in_entry_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            (directory / os.fsdecode(b"bad_\xff_dir")).mkdir()
+            (directory / os.fsdecode(b"bad_\xff_file")).touch()
+            result = self.editor.call(self.ctx, command="view", path=tmpdir)
+            self.assertEqual(result, "bad_\ufffd_dir/\nbad_\ufffd_file")
+
+    @unittest.skipUnless(os.name == "posix" and os.fsdecode(b"\xff") == "\udcff", "requires byte filenames")
+    def test_view_missing_symlink_target_has_printable_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link = Path(tmpdir, "link")
+            link.symlink_to(os.fsdecode(b"missing_\xff"))
+            with self.assertRaises(FileNotFoundError) as cm:
+                self.editor.call(self.ctx, command="view", path=str(link))
+            self.assertIn("missing_\ufffd", str(cm.exception))
+
+    def test_edits_preserve_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes(b"old\r\ncaf\xe9 \x80\xff\n")
+            self.editor.call(self.ctx, command="str_replace", path=str(path), old_str="old", new_str="new")
+            self.editor.call(self.ctx, command="insert", path=str(path), insert_line=1, new_str="extra\n")
+            self.assertEqual(path.read_bytes(), b"new\r\nextra\ncaf\xe9 \x80\xff\n")
+
+    def test_view_end_past_eof_returns_available_lines_and_warning(self) -> None:
+        warning = "\n[warning: requested end line 20 exceeds the file's last line (2).]".upper()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            for data, start, expected in (
+                (b"first\r\nlast\r\n", None, "1|first\r\n2|last\r\n" + warning),
+                (b"first\nlast", 2, "2|last" + warning),
+            ):
+                with self.subTest(data=data, start=start):
+                    path.write_bytes(data)
+                    result = self.editor.call(
+                        self.ctx, command="view", path=str(path), view_start_line=start, view_end_line=20,
+                    )
+                    self.assertEqual(expected, result)
+
+    def test_view_start_past_eof_still_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes(b"first\nlast")
+            with self.assertRaisesRegex(TextEditorException, r"view_start_line 3 exceeds file line count \(2\)"):
+                self.editor.call(self.ctx, command="view", path=str(path), view_start_line=3, view_end_line=20)
+
     def test_view_truncation_warnings_for_partial_and_complete_lines(self) -> None:
         incomplete = "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
         omitted = "[WARNING: OUTPUT TRUNCATED. ADDITIONAL LINES OMITTED. RE-SCOPE VIEW RANGE IF NEEDED.]"
@@ -62,6 +126,11 @@ class TestTextEditorBasicOperations(unittest.TestCase):
                 for start, end in ((None, None), (1, 3), (1, -1)):
                     with self.subTest(limit=limit, start=start, end=end):
                         self.assertEqual(self.editor.handle_view(str(path), start, end), expected)
+                with self.subTest(limit=limit, end=20):
+                    self.assertEqual(
+                        self.editor.handle_view(str(path), 1, 20),
+                        expected + "\n[warning: requested end line 20 exceeds the file's last line (3).]".upper(),
+                    )
 
     def test_displayed_lines_match_view_and_insert_positions(self) -> None:
         for separator in ("\r", "\u2028", "\v", "\u2029"):
