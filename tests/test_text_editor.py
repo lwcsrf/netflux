@@ -137,7 +137,7 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             with self.subTest(separator=separator), tempfile.TemporaryDirectory() as tmpdir:
                 path = str(Path(tmpdir, "file.txt"))
                 middle = f"B{separator}C\n"
-                created = self.editor.handle_create(path, f"A\n{middle}D\n")
+                created = self.editor.handle_create(self.ctx, path, f"A\n{middle}D\n")
                 self.assertIn("Successfully wrote 3 lines", created)
                 numbered = ["1|A\n", f"2|{middle}", "3|D\n"]
                 self.assertEqual(self.editor.handle_view(path, None, None), "".join(numbered))
@@ -551,9 +551,9 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
             return_value=(Path("/alternate/path.txt"), None),
         ) as mock_alt:
             with self.assertRaises(FileExistsError) as cm:
-                editor._raise_create_conflict(p, file_text)
+                editor._raise_create_conflict(self.ctx, p, file_text)
 
-        mock_alt.assert_called_once_with(p, file_text)
+        mock_alt.assert_called_once_with(self.ctx, p, file_text)
         msg = str(cm.exception)
         self.assertIn("File already exists:", msg)
         self.assertIn(str(p), msg)
@@ -574,9 +574,9 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
             return_value=(Path("/alternate/path.txt"), alt_exc),
         ) as mock_alt:
             with self.assertRaises(FileExistsError) as cm:
-                editor._raise_create_conflict(p, file_text)
+                editor._raise_create_conflict(self.ctx, p, file_text)
 
-        mock_alt.assert_called_once_with(p, file_text)
+        mock_alt.assert_called_once_with(self.ctx, p, file_text)
         msg = str(cm.exception)
         self.assertIn("File already exists:", msg)
         self.assertIn(str(p), msg)

@@ -142,7 +142,7 @@ class TextEditor(CodeFunction):
         if command == "str_replace":
             return self.handle_str_replace(ctx, path, old_str, new_str)
         if command == "create":
-            return self.handle_create(path, file_text)
+            return self.handle_create(ctx, path, file_text)
         if command == "insert":
             return self.handle_insert(ctx, path, insert_line, new_str)
 
@@ -334,6 +334,7 @@ class TextEditor(CodeFunction):
 
     def handle_create(
         self,
+        ctx: RunContext,
         path: str,
         file_text: Optional[str],
     ) -> str:
@@ -344,7 +345,7 @@ class TextEditor(CodeFunction):
         if p.exists():
             if p.is_dir():
                 raise IsADirectoryError(f"Path is a directory: {p}")
-            self._raise_create_conflict(p, file_text)
+            self._raise_create_conflict(ctx, p, file_text)
 
         # Race-safe create:
         # Use exclusive create ('x') so if another process creates the file between our
@@ -357,10 +358,11 @@ class TextEditor(CodeFunction):
             raise OSError(f"while creating parent directory for '{p}': {exc}") from exc
 
         try:
-            with p.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
-                f.write(file_text)
+            with self._get_file_lock(ctx, p):
+                with p.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                    f.write(file_text)
         except FileExistsError as exc:
-            self._raise_create_conflict(p, file_text, original_exc=exc)
+            self._raise_create_conflict(ctx, p, file_text, original_exc=exc)
         except PermissionError as exc:
             raise PermissionError(f"while creating file '{p}': {exc}") from exc
         except OSError as exc:
@@ -420,6 +422,7 @@ class TextEditor(CodeFunction):
 
     def _raise_create_conflict(
         self,
+        ctx: RunContext,
         p: Path,
         file_text: str,
         original_exc: Optional[Exception] = None,
@@ -433,7 +436,7 @@ class TextEditor(CodeFunction):
         re-send the full file contents as another tool argument when resolving
         path conflicts, which helps avoid unnecessary context bloat.
         """
-        alt_path, alt_exc = self._attempt_alternate_create(p, file_text)
+        alt_path, alt_exc = self._attempt_alternate_create(ctx, p, file_text)
         line_count = len(_split_file_lines(file_text))
 
         if alt_exc is None and alt_path is not None:
@@ -462,6 +465,7 @@ class TextEditor(CodeFunction):
 
     def _attempt_alternate_create(
         self,
+        ctx: RunContext,
         original_path: Path,
         file_text: str,
         max_attempts: int = 5,
@@ -486,8 +490,9 @@ class TextEditor(CodeFunction):
             alt_path = original_path.with_name(name)
 
             try:
-                with alt_path.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
-                    f.write(file_text)
+                with self._get_file_lock(ctx, alt_path):
+                    with alt_path.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
+                        f.write(file_text)
                 return alt_path, None
             except FileExistsError as exc:
                 last_exc = exc
