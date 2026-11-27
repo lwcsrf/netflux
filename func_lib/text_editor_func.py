@@ -759,7 +759,7 @@ class TextEditor(CodeFunction):
 
     def _read_from_start_stream(self, p: Path, start: int) -> tuple[str, int, bool]:
         """
-        Stream from 1-indexed line `start` to EOF.
+        Stream from 1-indexed line `start` until EOF or confirmed truncation.
         Returns (snippet, last_line_seen, truncated_by_max_characters).
         """
         limit = getattr(self, "max_characters", None)
@@ -789,7 +789,8 @@ class TextEditor(CodeFunction):
                                     was_truncated = True
                             else:
                                 was_truncated = True
-                # EOF reached
+                    if was_truncated:
+                        break
         except PermissionError as exc:
             raise PermissionError(f"while reading '{p}': {exc}") from exc
         except OSError as exc:
