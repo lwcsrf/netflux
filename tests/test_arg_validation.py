@@ -44,7 +44,7 @@ class TestFunctionBaseValidateArgs(unittest.TestCase):
     def test_enum_input_resolves_to_declared_spelling(self):
         mode = FunctionArg("mode", str, enum={"Straße"})
         inputs = {"mode": "STRASSE"}
-        self.assertIsNone(mode.validate_value(inputs["mode"]))
+        self.assertEqual(mode.resolve_value(inputs["mode"]), "Straße")
         self.assertEqual(_DummyFunction([mode]).validate_coerce_args(inputs), {"mode": "Straße"})
         self.assertEqual(inputs, {"mode": "STRASSE"})
 
@@ -63,7 +63,7 @@ class TestFunctionBaseValidateArgs(unittest.TestCase):
         self.assertEqual(coerced["flag_false"], False)
 
     def test_validate_coerce_args_rejects_non_boolean_string(self):
-        """Provide a non-coercible string (e.g., 'yes') for bool arg; expect ValueError from validate_value complaining about type."""
+        """An unrecognized boolean string raises ValueError."""
         fn = _DummyFunction([FunctionArg("flag", bool)])
         with self.assertRaisesRegex(
             ValueError,
@@ -115,61 +115,56 @@ class TestFunctionArgValidation(unittest.TestCase):
         declared_choices.add("READONLY")
         self.assertEqual(mode.enum, {"ReadOnly"})
 
-    def test_validate_value_allows_none_when_optional(self):
-        """Create optional FunctionArg and call validate_value(None); expect no exception."""
+    def test_resolve_value_allows_none_when_optional(self):
         arg = FunctionArg("maybe", str, optional=True)
-        arg.validate_value(None)
+        self.assertIsNone(arg.resolve_value(None))
 
-    def test_validate_value_rejects_none_when_required(self):
-        """Create required FunctionArg and call validate_value(None); expect ValueError stating arg is required."""
+    def test_resolve_value_rejects_none_when_required(self):
         arg = FunctionArg("need", str)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'need' is required and cannot be None",
         ):
-            arg.validate_value(None)
+            arg.resolve_value(None)
 
-    def test_validate_value_rejects_incorrect_type(self):
-        """For int arg, pass a float (or for float pass int/bool per exactness rules) and assert ValueError with type detail."""
+    def test_resolve_value_rejects_float_for_int_arg(self):
         arg = FunctionArg("count", int)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'count' expects int, got float",
         ):
-            arg.validate_value(3.14)
+            arg.resolve_value(3.14)
 
-    def test_validate_value_enforces_bool_exact_type(self):
-        """For bool arg, pass 1 (int) -> ValueError; pass True (bool) -> ok. For int/float arg, pass bool -> ValueError."""
+    def test_resolve_value_distinguishes_booleans_from_numbers(self):
         bool_arg = FunctionArg("flag", bool)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'flag' expects bool, got int",
         ):
-            bool_arg.validate_value(1)
-        bool_arg.validate_value(True)
+            bool_arg.resolve_value(1)
+        self.assertIs(bool_arg.resolve_value(True), True)
 
         int_arg = FunctionArg("amount", int)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'amount' expects int, got bool",
         ):
-            int_arg.validate_value(True)
+            int_arg.resolve_value(True)
 
         float_arg = FunctionArg("ratio", float)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'ratio' expects float, got bool",
         ):
-            float_arg.validate_value(False)
+            float_arg.resolve_value(False)
 
-    def test_validate_value_enforces_enum_membership(self):
-        """For str arg with enum, pass a value not in enum and assert ValueError listing allowed values."""
+    def test_resolve_value_enforces_enum_membership(self):
         arg = FunctionArg("mode", str, enum={"read", "write"})
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'mode' must be one of: read, write; got 'delete'",
         ):
-            arg.validate_value("delete")
+            arg.resolve_value("delete")
 
 
 if __name__ == "__main__":
