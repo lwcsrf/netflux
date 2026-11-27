@@ -169,7 +169,7 @@ class FunctionArg:
         return {choice.casefold(): choice for choice in self.enum}
 
     def resolve_value(self, value: Any) -> Any:
-        """Validate the input and return the value to pass to the function."""
+        """Validate a value provided for the argument, and return after acceptable coercions."""
         # Allow None literal only when optional arg.
         if value is None:
             if self.optional:
