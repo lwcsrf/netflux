@@ -153,11 +153,15 @@ class FunctionArg:
 
             if not isinstance(self.enum, (set, frozenset)) or not self.enum:
                 raise ValueError(f"Arg '{self.name}': enum must be a set of string literals.")
-            choices = frozenset(self.enum)
+            # Accomodate Enum object being given for `enum` arg set instead of actual strings
+            choices = [
+                choice.value if isinstance(choice, Enum) and isinstance(choice, str) else choice
+                for choice in self.enum
+            ]
             if any(not isinstance(v, str) for v in choices):
                 raise ValueError(f"Arg '{self.name}': enum values must be strings.")
 
-            object.__setattr__(self, "enum", choices)
+            object.__setattr__(self, "enum", frozenset(choices))
             if len(self._enum_by_casefold) != len(choices):
                 raise ValueError(
                     f"Arg '{self.name}': enum choices must be unique after casefolding: {sorted(choices)}"

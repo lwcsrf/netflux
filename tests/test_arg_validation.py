@@ -1,4 +1,5 @@
 import unittest
+from enum import Enum
 
 from ..core import Function, FunctionArg
 
@@ -107,6 +108,22 @@ class TestFunctionArgValidation(unittest.TestCase):
     def test_function_arg_rejects_casefold_collisions_at_construction(self):
         with self.assertRaisesRegex(ValueError, "unique after casefolding"):
             FunctionArg("mode", str, enum={"Straße", "STRASSE"})
+
+    def test_string_enum_choice_resolves_to_plain_string(self):
+        class Mode(str, Enum):
+            READ_ONLY = "ReadOnly"
+
+        arg = FunctionArg("mode", str, enum={Mode.READ_ONLY})
+        resolved = arg.resolve_value("readonly")
+        self.assertEqual(resolved, "ReadOnly")
+        self.assertIs(type(resolved), str)
+
+    def test_non_string_enum_choice_is_rejected(self):
+        class Mode(Enum):
+            READ_ONLY = "ReadOnly"
+
+        with self.assertRaisesRegex(ValueError, "enum values must be strings"):
+            FunctionArg("mode", str, enum={Mode.READ_ONLY})  # type: ignore[arg-type]
 
     def test_function_arg_stores_immutable_enum_choices(self):
         declared_choices = {"ReadOnly"}
