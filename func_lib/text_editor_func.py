@@ -11,7 +11,10 @@ from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
 
 
 def _split_file_lines(text: str) -> list[str]:
-    """Split after each LF and keep every character, including the LF itself."""
+    """Split after each LF and keep every character, including the LF itself.
+
+    This also works with CRLF line endings.
+    """
     return StringIO(text, newline="\n").readlines()
 
 
