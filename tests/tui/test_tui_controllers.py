@@ -1881,8 +1881,8 @@ class TestTUIState(unittest.TestCase):
         tui._open_launch_form(0)
         assert tui._form_state is not None
         tui._form_state.fields[0].value = "typed run"
-        tui._form_state.fields[2].value = "7"
-        tui._form_state.fields[3].value = "false"
+        tui._form_state.fields[2].value = "7.0"
+        tui._form_state.fields[3].value = "0"
         tui._form_state.fields[4].value = "1.5"
 
         tui._submit_form()

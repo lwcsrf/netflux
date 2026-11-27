@@ -1,4 +1,7 @@
+import math
 import unittest
+from enum import Enum
+from unittest.mock import patch
 
 from ..core import Function, FunctionArg
 
@@ -41,28 +44,29 @@ class TestFunctionBaseValidateArgs(unittest.TestCase):
         result = fn.validate_coerce_args({"required": "value"})
         self.assertEqual(result, {"required": "value"})
 
-    def test_validate_coerce_args_coerces_boolean_strings(self):
-        """Provide 'true'/'false' strings for a bool arg; expect returned dict with actual bools."""
-        fn = _DummyFunction(
-            [
-                FunctionArg("flag_true", bool),
-                FunctionArg("flag_false", bool),
-            ]
-        )
-        coerced = fn.validate_coerce_args(
-            {"flag_true": " True ", "flag_false": "FALSE"}
-        )
-        self.assertEqual(coerced["flag_true"], True)
-        self.assertEqual(coerced["flag_false"], False)
+    def test_enum_input_resolves_to_declared_spelling(self):
+        mode = FunctionArg("mode", str, enum={"Straße"})
+        inputs = {"mode": "STRASSE"}
+        self.assertEqual(mode.resolve_value(inputs["mode"]), "Straße")
+        self.assertEqual(_DummyFunction([mode]).validate_coerce_args(inputs), {"mode": "Straße"})
+        self.assertEqual(inputs, {"mode": "STRASSE"})
 
-    def test_validate_coerce_args_rejects_non_boolean_string(self):
-        """Provide a non-coercible string (e.g., 'yes') for bool arg; expect ValueError from validate_value complaining about type."""
+    def test_validate_coerce_args_returns_actual_booleans(self):
         fn = _DummyFunction([FunctionArg("flag", bool)])
-        with self.assertRaisesRegex(
-            ValueError,
-            r"Arg 'flag' expects bool, got str",
-        ):
-            fn.validate_coerce_args({"flag": "yes"})
+        for expected, values in [
+            (True, [True, "True", "true", " TRUE ", 1, "1"]),
+            (False, [False, "False", "false", " FALSE ", 0, "0"]),
+        ]:
+            for value in values:
+                with self.subTest(value=value):
+                    self.assertIs(fn.validate_coerce_args({"flag": value})["flag"], expected)
+
+    def test_validate_coerce_args_rejects_other_boolean_values(self):
+        fn = _DummyFunction([FunctionArg("flag", bool)])
+        for value in ["yes", "no", "2", 2, -1, 0.0, 1.0]:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, f"Arg 'flag' expects bool, got {type(value).__name__}"):
+                    fn.validate_coerce_args({"flag": value})
 
 
 class TestFunctionArgValidation(unittest.TestCase):
@@ -97,61 +101,159 @@ class TestFunctionArgValidation(unittest.TestCase):
             ):
                 FunctionArg("option", str, enum={"ok", 1})  # type: ignore[arg-type]
 
-    def test_validate_value_allows_none_when_optional(self):
-        """Create optional FunctionArg and call validate_value(None); expect no exception."""
-        arg = FunctionArg("maybe", str, optional=True)
-        arg.validate_value(None)
+    def test_function_arg_rejects_casefold_collisions_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "unique after casefolding"):
+            FunctionArg("mode", str, enum={"Straße", "STRASSE"})
 
-    def test_validate_value_rejects_none_when_required(self):
-        """Create required FunctionArg and call validate_value(None); expect ValueError stating arg is required."""
+    def test_string_enum_choice_resolves_to_plain_string(self):
+        class Mode(str, Enum):
+            READ_ONLY = "ReadOnly"
+
+        arg = FunctionArg("mode", str, enum={Mode.READ_ONLY})
+        resolved = arg.resolve_value("readonly")
+        self.assertEqual(resolved, "ReadOnly")
+        self.assertIs(type(resolved), str)
+
+    def test_non_string_enum_choice_is_rejected(self):
+        class Mode(Enum):
+            READ_ONLY = "ReadOnly"
+
+        with self.assertRaisesRegex(ValueError, "enum values must be strings"):
+            FunctionArg("mode", str, enum={Mode.READ_ONLY})  # type: ignore[arg-type]
+
+    def test_function_arg_stores_immutable_enum_choices(self):
+        declared_choices = {"ReadOnly"}
+        mode = FunctionArg("mode", str, enum=declared_choices)
+        self.assertIsInstance(mode.enum, frozenset)
+        declared_choices.add("READONLY")
+        self.assertEqual(mode.enum, {"ReadOnly"})
+
+    def test_resolve_value_allows_none_when_optional(self):
+        arg = FunctionArg("maybe", str, optional=True)
+        self.assertIsNone(arg.resolve_value(None))
+
+    def test_quoted_null_for_optional_typed_arguments(self):
+        for argtype, enum in [(bool, None), (int, None), (float, None), (str, {"auto"})]:
+            with self.subTest(argtype=argtype):
+                self.assertIsNone(FunctionArg("value", argtype, enum=enum, optional=True).resolve_value("null"))
+                with self.assertRaises(ValueError):
+                    FunctionArg("value", argtype, enum=enum).resolve_value("null")
+
+    def test_optional_strings_preserve_literal_null(self):
+        fn = _DummyFunction([FunctionArg("text", str, optional=True)])
+        for args in [{}, {"text": None}, {"text": "null"}]:
+            with self.subTest(args=args):
+                self.assertEqual(fn.validate_coerce_args(args), args)
+        choice = FunctionArg("mode", str, enum={"Null", "auto"}, optional=True)
+        self.assertEqual(choice.resolve_value("null"), "Null")
+
+    def test_resolve_value_rejects_none_when_required(self):
         arg = FunctionArg("need", str)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'need' is required and cannot be None",
         ):
-            arg.validate_value(None)
+            arg.resolve_value(None)
 
-    def test_validate_value_rejects_incorrect_type(self):
-        """For int arg, pass a float (or for float pass int/bool per exactness rules) and assert ValueError with type detail."""
+    def test_resolve_value_coerces_integral_float_to_int(self):
         arg = FunctionArg("count", int)
-        with self.assertRaisesRegex(
-            ValueError,
-            r"Arg 'count' expects int, got float",
-        ):
-            arg.validate_value(3.14)
+        for value, expected in [(3.0, 3), (-2.0, -2), (-0.0, 0)]:
+            with self.subTest(value=value):
+                resolved = arg.resolve_value(value)
+                self.assertIs(type(resolved), int)
+                self.assertEqual(resolved, expected)
 
-    def test_validate_value_enforces_bool_exact_type(self):
-        """For bool arg, pass 1 (int) -> ValueError; pass True (bool) -> ok. For int/float arg, pass bool -> ValueError."""
-        bool_arg = FunctionArg("flag", bool)
-        with self.assertRaisesRegex(
-            ValueError,
-            r"Arg 'flag' expects bool, got int",
-        ):
-            bool_arg.validate_value(1)
-        bool_arg.validate_value(True)
+    def test_float_to_int_safe_integer_boundaries(self):
+        arg = FunctionArg("count", int)
+        for sign in (1, -1):
+            with self.subTest(sign=sign):
+                safe = sign * (2**53 - 1)
+                self.assertEqual(arg.resolve_value(float(safe)), safe)
+                large_id = sign * (2**53 + 1)
+                self.assertEqual(arg.resolve_value(large_id), large_id)
+                # Decoding the same ID as a float rounds it to the boundary.
+                for value in (float(large_id), float(sign * (2**53 + 2))):
+                    with self.assertRaisesRegex(ValueError, "expects int, got float"):
+                        arg.resolve_value(value)
 
+    def test_numeric_strings_resolve_to_the_declared_type(self):
+        cases = [
+            (int, "3", 3),
+            (int, "3.0", 3),
+            (int, " -3.00 ", -3),
+            (int, "3.5e1", 35),
+            (int, "-0.0", 0),
+            (int, "9007199254740993.0", 9007199254740993),
+            (float, "3", 3.0),
+            (float, "3.0", 3.0),
+            (float, "3.5", 3.5),
+            (float, " +3.5e-1 ", 0.35),
+            (float, "1e-400", 0.0),
+            (float, "Infinity", math.inf),
+            (float, "-Infinity", -math.inf),
+            (float, "Inf", math.inf),
+            (float, "-Inf", -math.inf),
+            (float, "inf", math.inf),
+            (float, "-inf", -math.inf),
+            (float, " +InF ", math.inf),
+        ]
+        for argtype, text, expected in cases:
+            with self.subTest(argtype=argtype, text=text):
+                resolved = FunctionArg("number", argtype).resolve_value(text)
+                self.assertIs(type(resolved), argtype)
+                self.assertEqual(resolved, expected)
+
+    def test_nan_string_resolves_to_float_nan(self):
+        self.assertTrue(math.isnan(FunctionArg("number", float).resolve_value("NaN")))
+
+    def test_numeric_args_reject_invalid_values(self):
+        invalid_for_both = ["", "3x", '"3"', "true", "3__0"]
+        for argtype, extra in [
+            (int, ["3.5", "3.0000000000000001", "1e-400", "NaN", "Infinity", "-Infinity"]),
+            (float, ["1e400", "-1e400", 10**400, -(10**400)]),
+        ]:
+            for value in invalid_for_both + extra:
+                with self.subTest(argtype=argtype, value=value):
+                    with self.assertRaisesRegex(ValueError, f"Arg 'number' expects {argtype.__name__}"):
+                        FunctionArg("number", argtype).resolve_value(value)
+
+    def test_integer_string_exponents_respect_digit_limit(self):
+        arg = FunctionArg("count", int)
+        with patch("sys.get_int_max_str_digits", return_value=640):
+            self.assertEqual(arg.resolve_value("1e639"), 10**639)
+            self.assertEqual(arg.resolve_value("0e640"), 0)
+            with self.assertRaisesRegex(ValueError, "Arg 'count' expects int"):
+                arg.resolve_value("1e640")
+
+    def test_resolve_value_rejects_fractional_and_nonfinite_floats_for_int_arg(self):
+        arg = FunctionArg("count", int)
+        for value in [3.14, float("nan"), float("inf"), float("-inf")]:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, r"Arg 'count' expects int, got float"):
+                    arg.resolve_value(value)
+
+    def test_numeric_args_reject_booleans(self):
         int_arg = FunctionArg("amount", int)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'amount' expects int, got bool",
         ):
-            int_arg.validate_value(True)
+            int_arg.resolve_value(True)
 
         float_arg = FunctionArg("ratio", float)
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'ratio' expects float, got bool",
         ):
-            float_arg.validate_value(False)
+            float_arg.resolve_value(False)
 
-    def test_validate_value_enforces_enum_membership(self):
-        """For str arg with enum, pass a value not in enum and assert ValueError listing allowed values."""
+    def test_resolve_value_enforces_enum_membership(self):
         arg = FunctionArg("mode", str, enum={"read", "write"})
         with self.assertRaisesRegex(
             ValueError,
             r"Arg 'mode' must be one of: read, write; got 'delete'",
         ):
-            arg.validate_value("delete")
+            arg.resolve_value("delete")
 
 
 if __name__ == "__main__":
