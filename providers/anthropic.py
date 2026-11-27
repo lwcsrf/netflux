@@ -530,7 +530,7 @@ class AnthropicAgentNode(AgentNode):
                         if tu.name != child.fn.name:
                             out_text += (
                                 f"\n\n[WARNING: you invoked `{tu.name}` but harness assumed `{child.fn.name}`. "
-                                "This auto-recovered. Follow tools spec more closely."
+                                "This auto-recovered. Follow tools spec more closely.]"
                             )
                         is_error = False
                     except Exception as ex:
