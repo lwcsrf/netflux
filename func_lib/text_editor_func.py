@@ -400,14 +400,17 @@ class TextEditor(CodeFunction):
             mtime_before = self._stat_mtime_ns(p)
             content = self._read_text_preserve_eols(p)
 
-            lines = _split_file_lines(content)
-            n = len(lines)
-            if insert_line > n:
-                raise TextEditorException(f"insert_line {insert_line} is out of range (file has {n} lines)")
-
-            before = "".join(lines[:insert_line])
-            after = "".join(lines[insert_line:])
-            updated = before + new_str + after
+            if insert_line == 0 and content.startswith("\ufeff"):
+                # The three UTF-8 BOM bytes (EF BB BF) decode to one character (U+FEFF).
+                # Keep it at byte zero and use content[1:] for the rest of the text.
+                updated = "\ufeff" + new_str + content[1:]
+            else:
+                lines = _split_file_lines(content)
+                n = len(lines)
+                if insert_line > n:
+                    raise TextEditorException(f"insert_line {insert_line} is out of range (file has {n} lines)")
+                lines.insert(insert_line, new_str)
+                updated = "".join(lines)
 
             # Mid-air guard just before write
             mtime_now = self._stat_mtime_ns(p)

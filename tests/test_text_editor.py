@@ -275,6 +275,17 @@ class TestTextEditorBasicOperations(unittest.TestCase):
                 target.read_text(encoding="utf-8"),
             )
 
+    def test_insert_at_beginning_preserves_utf8_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "t.py"
+            target.write_bytes(b"\xef\xbb\xbfimport sys\n")
+
+            self.editor.call(
+                self.ctx, command="insert", path=str(target), insert_line=0, new_str="import os\n",
+            )
+
+            self.assertEqual(target.read_bytes(), b"\xef\xbb\xbfimport os\nimport sys\n")
+
     def test_insert_line_out_of_range_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
