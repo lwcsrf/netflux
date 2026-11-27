@@ -1,3 +1,4 @@
+from io import StringIO
 from pathlib import Path
 import tempfile
 import os
@@ -7,6 +8,12 @@ from threading import Lock
 from typing import Set, Optional
 
 from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
+
+
+def _split_file_lines(text: str) -> list[str]:
+    """Match the range readers' LF, CRLF, and CR boundaries and preserve each ending."""
+    return StringIO(text, newline="").readlines()
+
 
 class TextEditorException(Exception):
     """Raised for business-logic violations in the TextEditor tool."""
@@ -345,8 +352,7 @@ class TextEditor(CodeFunction):
         except OSError as exc:
             raise OSError(f"while creating file '{p}': {exc}") from exc
 
-        # Count lines consistently with other operations (treat each newline-terminated chunk as a line)
-        line_count = len(file_text.splitlines(keepends=True))
+        line_count = len(_split_file_lines(file_text))
         return f"Successfully wrote {line_count} lines to new file: {p}."
 
     def handle_insert(
@@ -378,7 +384,7 @@ class TextEditor(CodeFunction):
             mtime_before = self._stat_mtime_ns(p)
             content = self._read_text_preserve_eols(p)
 
-            lines = content.splitlines(keepends=True)
+            lines = _split_file_lines(content)
             n = len(lines)
             if insert_line > n:
                 raise TextEditorException(f"insert_line {insert_line} is out of range (file has {n} lines)")
@@ -414,7 +420,7 @@ class TextEditor(CodeFunction):
         path conflicts, which helps avoid unnecessary context bloat.
         """
         alt_path, alt_exc = self._attempt_alternate_create(p, file_text)
-        line_count = len(file_text.splitlines(keepends=True))
+        line_count = len(_split_file_lines(file_text))
 
         if alt_exc is None and alt_path is not None:
             err = FileExistsError(
@@ -559,8 +565,7 @@ class TextEditor(CodeFunction):
         """
         if not s:
             return s
-        # Preserve original EOLs by keeping ends when splitting.
-        parts = s.splitlines(keepends=True)
+        parts = _split_file_lines(s)
         return "".join(f"{i}|{line}" for i, line in enumerate(parts, start=start_at))
 
     def _stat_mtime_ns(self, p: Path) -> Optional[int]:

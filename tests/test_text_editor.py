@@ -46,6 +46,18 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertIn("2|line2\n", output)
             self.assertNotIn("OUTPUT TRUNCATED", output)
 
+    def test_unicode_line_separator_is_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = str(Path(tmpdir, "file.txt"))
+            created = self.editor.handle_create(path, "A\u2028B\nC")
+            self.assertIn("Successfully wrote 2 lines", created)
+            self.assertEqual(self.editor.handle_view(path, None, None), "1|A\u2028B\n2|C")
+            self.assertEqual(self.editor.handle_view(path, 2, 2), "2|C")
+            self.assertEqual(self.editor.handle_view(path, 2, -1), "2|C")
+
+            self.editor.handle_insert(self.ctx, path, 1, "X\n")
+            self.assertEqual(Path(path).read_bytes(), "A\u2028B\nX\nC".encode("utf-8"))
+
     def test_view_warns_only_when_explicit_end_matches_wc_l_and_omits_final_line(self) -> None:
         def warning(line: int) -> str:
             return ("[Warning: The file's last line has no terminating newline and is just outside the requested range. "
