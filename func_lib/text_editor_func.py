@@ -12,8 +12,7 @@ from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
 
 def _split_file_lines(text: str) -> list[str]:
     """Split after each LF and keep every character, including the LF itself.
-
-    This also works with CRLF line endings.
+    Works with CRLF line endings also. Use this same method everywhere.
     """
     return StringIO(text, newline="\n").readlines()
 
@@ -41,9 +40,7 @@ class TextEditor(CodeFunction):
         "Commands:\n"
         "• `view`: View a file or list a directory (single level). "
         "Files show line numbers (format: `number|content`) and you can optionally "
-        "specify a line range. Only LF ends a line (including the LF in CRLF). Bare CR is content, "
-        "and a nonempty unterminated final line is counted. "
-        "For directories, subdirectories are listed with '/' appended to their names.\n"
+        "specify a line range. For directories, subdirs are listed with '/' appended to their names.\n"
         "List dirs only sparingly to avoid context pollution.\n"
         "Be selective when viewing files to prevent context explosion; use line ranges to limit output.\n"
         "• `str_replace`: Replace exact text in a file (`old_str` → `new_str`). Line numbers are"
@@ -570,6 +567,7 @@ class TextEditor(CodeFunction):
         """
         if not s:
             return s
+        # Preserve original EOLs by keeping ends when splitting.
         parts = _split_file_lines(s)
         return "".join(f"{i}|{line}" for i, line in enumerate(parts, start=start_at))
 
@@ -607,7 +605,7 @@ class TextEditor(CodeFunction):
         Read text while preserving exact newline characters and unknown bytes.
         - encoding='utf-8', errors='surrogateescape' keeps undecodable bytes round-trippable
           (decoded into U+DC80..U+DCFF) and writes them back as the original bytes.
-        - The reader preserves CR and LF exactly.
+        - The reader preserves LF and CRLF exactly.
         """
         if not p.exists():
             raise FileNotFoundError(f"Path not found: {p}")
