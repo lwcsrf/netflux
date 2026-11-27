@@ -4,6 +4,7 @@ import tempfile
 import os
 import re
 import secrets
+from textwrap import dedent
 from threading import Lock
 from typing import Set, Optional
 
@@ -51,15 +52,21 @@ class TextEditor(CodeFunction):
         "• `view` → `path` (absolute or relative; file or directory). Optional: `view_start_line`, `view_end_line`. "
         "Examples (files only): (view_start_line=1, view_end_line=1) shows only the first line; "
         "(view_start_line=10, view_end_line=20) shows lines 10 through 20; "
-        "set view_end_line=-1 to read through the last line."
+        "set view_end_line=-1 to read through the last line. "
         f"Truncation will occur after {max_characters} characters, with it clearly noted in the returned text.\n"
         "• `str_replace` → `path`, `old_str`, `new_str` (requires *exact* match including whitespace/indentation).\n"
         "• `create` → `path` (must not pre-exist), `file_text`.\n"
-        "• `insert` → `path`, `insert_line`, `new_str`. "
-        "Examples: `insert_line=0` inserts at the beginning of the file; "
-        "`insert_line=1` inserts *after* the very first line (starting on the second line); "
-        "`insert_line=30` inserts *after* the first 30 lines.\n"
-        "Absolute paths are recommended to avoid ambiguity.\n"
+        "• `insert` → `path`, `insert_line`, `new_str`."
+        + dedent(r"""
+            Examples (file before, new_str, insert_line, file after):
+            ("A\nC\n", "B\n", 1, "A\nB\nC\n")
+            ("A", "B\n", 0, "B\nA")
+            ("A\nC", "B", 1, "A\nBC")
+            ("A\n", "B", 1, "A\nB")
+            ("A", "B\n", 1, "AB\n")
+            ("A", "\nB", 1, "A\nB")
+            """)
+        + "Absolute paths are recommended to avoid ambiguity.\n"
         "String output:\n"
         "• Success confirmation (create, insert, str_replace)\n"
         "• Content requested (view)\n"
@@ -75,12 +82,12 @@ class TextEditor(CodeFunction):
         # Command-specific parameters (globally optional; validated per command at runtime):
         FunctionArg("old_str", str, "Text to replace when command=str_replace (must match exactly).",
                     optional=True),
-        FunctionArg("new_str", str, "Replacement text for `str_replace` (can be empty str); or inserted text for `insert`.",
+        FunctionArg("new_str", str, "Replacement text for `str_replace` (can be empty str); or inserted text for `insert` (trailing newline isn't auto-added).",
                     optional=True),
         FunctionArg("file_text", str, "Full file contents when command=create.",
                     optional=True),
         FunctionArg("insert_line", int,
-                    "1-indexed line number *after* which to insert when command=insert."
+                    "1-indexed line number *after* which to insert when command=insert. "
                     "Use 0 to insert at the start of the file.",
                     optional=True),
         FunctionArg("view_start_line", int,
