@@ -41,6 +41,13 @@ class TestFunctionBaseValidateArgs(unittest.TestCase):
         result = fn.validate_coerce_args({"required": "value"})
         self.assertEqual(result, {"required": "value"})
 
+    def test_enum_input_resolves_to_declared_spelling(self):
+        mode = FunctionArg("mode", str, enum={"Straße"})
+        inputs = {"mode": "STRASSE"}
+        self.assertIsNone(mode.validate_value(inputs["mode"]))
+        self.assertEqual(_DummyFunction([mode]).validate_coerce_args(inputs), {"mode": "Straße"})
+        self.assertEqual(inputs, {"mode": "STRASSE"})
+
     def test_validate_coerce_args_coerces_boolean_strings(self):
         """Provide 'true'/'false' strings for a bool arg; expect returned dict with actual bools."""
         fn = _DummyFunction(
@@ -96,6 +103,17 @@ class TestFunctionArgValidation(unittest.TestCase):
                 r"enum values must be strings",
             ):
                 FunctionArg("option", str, enum={"ok", 1})  # type: ignore[arg-type]
+
+    def test_function_arg_rejects_casefold_collisions_at_construction(self):
+        with self.assertRaisesRegex(ValueError, "unique after casefolding"):
+            FunctionArg("mode", str, enum={"Straße", "STRASSE"})
+
+    def test_function_arg_stores_immutable_enum_choices(self):
+        declared_choices = {"ReadOnly"}
+        mode = FunctionArg("mode", str, enum=declared_choices)
+        self.assertIsInstance(mode.enum, frozenset)
+        declared_choices.add("READONLY")
+        self.assertEqual(mode.enum, {"ReadOnly"})
 
     def test_validate_value_allows_none_when_optional(self):
         """Create optional FunctionArg and call validate_value(None); expect no exception."""
