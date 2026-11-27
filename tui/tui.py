@@ -920,9 +920,6 @@ class TUI(SessionController):
         else:
             raise ValueError(f"Unsupported arg type: {arg.argtype}")
 
-        if arg.enum is not None and value not in arg.enum:
-            allowed = ", ".join(sorted(arg.enum))
-            raise ValueError(f"Arg '{arg.name}' must be one of: {allowed}")
         return value
 
     @staticmethod
