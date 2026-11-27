@@ -46,17 +46,21 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertIn("2|line2\n", output)
             self.assertNotIn("OUTPUT TRUNCATED", output)
 
-    def test_unicode_line_separator_is_content(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = str(Path(tmpdir, "file.txt"))
-            created = self.editor.handle_create(path, "A\u2028B\nC")
-            self.assertIn("Successfully wrote 2 lines", created)
-            self.assertEqual(self.editor.handle_view(path, None, None), "1|A\u2028B\n2|C")
-            self.assertEqual(self.editor.handle_view(path, 2, 2), "2|C")
-            self.assertEqual(self.editor.handle_view(path, 2, -1), "2|C")
+    def test_displayed_lines_match_view_and_insert_positions(self) -> None:
+        for separator in ("\u2028", "\v", "\u2029"):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as tmpdir:
+                path = str(Path(tmpdir, "file.txt"))
+                middle = f"B{separator}C\n"
+                created = self.editor.handle_create(path, f"A\n{middle}D\n")
+                self.assertIn("Successfully wrote 3 lines", created)
+                numbered = ["1|A\n", f"2|{middle}", "3|D\n"]
+                self.assertEqual(self.editor.handle_view(path, None, None), "".join(numbered))
+                for i, line in enumerate(numbered, 1):
+                    self.assertEqual(self.editor.handle_view(path, i, i), line)
+                self.assertEqual(self.editor.handle_view(path, 2, -1), "".join(numbered[1:]))
 
-            self.editor.handle_insert(self.ctx, path, 1, "X\n")
-            self.assertEqual(Path(path).read_bytes(), "A\u2028B\nX\nC".encode("utf-8"))
+                self.editor.handle_insert(self.ctx, path, 2, "X\n")
+                self.assertEqual(Path(path).read_bytes(), f"A\n{middle}X\nD\n".encode("utf-8"))
 
     def test_view_warns_only_when_explicit_end_matches_wc_l_and_omits_final_line(self) -> None:
         def warning(line: int) -> str:
@@ -82,6 +86,10 @@ class TestTextEditorBasicOperations(unittest.TestCase):
                 with self.subTest(data=data[:32], end=end):
                     path.write_bytes(data)
                     self.assertEqual(expected, self.editor.handle_view(str(path), None, end))
+
+            path.write_bytes("A\nB\u2028C".encode("utf-8"))
+            self.assertEqual(self.editor.handle_view(str(path), 1, 1), "1|A\n\n" + warning(2))
+            self.assertEqual(self.editor.handle_view(str(path), 2, 2), "2|B\u2028C")
 
             path.write_bytes(b"abc\n" * 124 + b"x" * 100_000)
             for cutoff_line in (124, 2):
@@ -447,7 +455,7 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
     def test_raise_create_conflict_message_on_alternate_success(self) -> None:
         editor = TextEditor()
         p = Path("/original/path.txt")
-        file_text = "line1\nline2\n"
+        file_text = "line1\nline2\u2028continued\n"
 
         # Patch helper to simulate a successful alternate write without touching filesystem.
         with patch.object(
