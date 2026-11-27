@@ -210,7 +210,10 @@ class FunctionArg:
 
         # JSON numbers can be parsed as int where arg expects float, or vice versa. Weed out the legal cases
         if self.argtype is float and type(value) is int:
-            return float(value)
+            try:
+                return float(value)
+            except OverflowError:
+                raise ValueError(f"Arg '{self.name}' expects float, got an integer outside the float range") from None
         if self.argtype is int and type(value) is float and value.is_integer():
             return int(value)
 

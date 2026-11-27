@@ -166,6 +166,7 @@ class TestFunctionArgValidation(unittest.TestCase):
             (float, "3.0", 3.0),
             (float, "3.5", 3.5),
             (float, " +3.5e-1 ", 0.35),
+            (float, "1e-400", 0.0),
             (float, "Infinity", math.inf),
             (float, "-Infinity", -math.inf),
             (float, "Inf", math.inf),
@@ -183,16 +184,16 @@ class TestFunctionArgValidation(unittest.TestCase):
     def test_nan_string_resolves_to_float_nan(self):
         self.assertTrue(math.isnan(FunctionArg("number", float).resolve_value("NaN")))
 
-    def test_numeric_strings_reject_invalid_values(self):
+    def test_numeric_args_reject_invalid_values(self):
         invalid_for_both = ["", "3x", '"3"', "true", "3__0"]
         for argtype, extra in [
             (int, ["3.5", "3.0000000000000001", "1e-400", "NaN", "Infinity", "-Infinity"]),
-            (float, ["1e400", "-1e400"]),
+            (float, ["1e400", "-1e400", 10**400, -(10**400)]),
         ]:
-            for text in invalid_for_both + extra:
-                with self.subTest(argtype=argtype, text=text):
+            for value in invalid_for_both + extra:
+                with self.subTest(argtype=argtype, value=value):
                     with self.assertRaisesRegex(ValueError, f"Arg 'number' expects {argtype.__name__}"):
-                        FunctionArg("number", argtype).resolve_value(text)
+                        FunctionArg("number", argtype).resolve_value(value)
 
     def test_integer_string_exponents_respect_digit_limit(self):
         arg = FunctionArg("count", int)
