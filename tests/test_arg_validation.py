@@ -144,13 +144,20 @@ class TestFunctionArgValidation(unittest.TestCase):
         ):
             arg.resolve_value(None)
 
-    def test_resolve_value_rejects_float_for_int_arg(self):
+    def test_resolve_value_coerces_integral_float_to_int(self):
         arg = FunctionArg("count", int)
-        with self.assertRaisesRegex(
-            ValueError,
-            r"Arg 'count' expects int, got float",
-        ):
-            arg.resolve_value(3.14)
+        for value, expected in [(3.0, 3), (-2.0, -2), (-0.0, 0)]:
+            with self.subTest(value=value):
+                resolved = arg.resolve_value(value)
+                self.assertIs(type(resolved), int)
+                self.assertEqual(resolved, expected)
+
+    def test_resolve_value_rejects_fractional_and_nonfinite_floats_for_int_arg(self):
+        arg = FunctionArg("count", int)
+        for value in [3.14, float("nan"), float("inf"), float("-inf")]:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, r"Arg 'count' expects int, got float"):
+                    arg.resolve_value(value)
 
     def test_resolve_value_distinguishes_booleans_from_numbers(self):
         bool_arg = FunctionArg("flag", bool)

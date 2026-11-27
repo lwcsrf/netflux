@@ -183,9 +183,11 @@ class FunctionArg:
                 return None
             raise ValueError(f"Arg '{self.name}' is required and cannot be None")
 
-        # JSON numbers may decode as ints even for float arguments; exclude bool.
+        # JSON numbers can be parsed as int where arg expects float, or vice versa. Weed out the legal cases
         if self.argtype is float and type(value) is int:
             return float(value)
+        if self.argtype is int and type(value) is float and value.is_integer():
+            return int(value)
 
         if self.argtype is bool:
             # Tolerate boolean-like strings.
