@@ -228,6 +228,7 @@ class TestAgentProviderToolSelection(unittest.TestCase):
                         calls = [("leaf", {}), ("leaf", {"provider": None})]
                         if self.parent is None:
                             calls += [
+                                ("leaf", {"provider": "null"}),
                                 ("leaf", {"provider": "openai"}),
                                 ("root", {"provider": "Anthropic"}),
                             ]
@@ -256,16 +257,16 @@ class TestAgentProviderToolSelection(unittest.TestCase):
             root = runtime.invoke(
                 None, root_fn, {"task": "start"}, provider=Provider.Gemini, max_agent_levels=3,
             )
-            self.assertEqual(root.result(), "Gemini Gemini OpenAI OpenAI OpenAI")
+            self.assertEqual(root.result(), "Gemini Gemini Gemini OpenAI OpenAI OpenAI")
 
-        self.assertEqual(len(records), 6)
+        self.assertEqual(len(records), 7)
         for original, child, part, description in records:
             with self.subTest(tool_use_id=child.tool_use_id, parent=child.parent.id):
                 # The transcript mapping aliases the original tool arguments.
                 self.assertEqual(dict(part.args), original)
                 self.assertEqual(child.inputs, {"task": original["task"]})
                 self.assertEqual(child.tool_use_id, part.tool_use_id)
-                if original.get("provider") is None:
+                if original.get("provider") in (None, "null"):
                     # Keep core's provider_arg_spec()/func_args() promise consistent with
                     # Runtime.invoke() for omitted/null providers, covering inheritance
                     # and default fallback. Fixed result expectations above guard against

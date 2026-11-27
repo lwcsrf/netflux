@@ -51,28 +51,22 @@ class TestFunctionBaseValidateArgs(unittest.TestCase):
         self.assertEqual(_DummyFunction([mode]).validate_coerce_args(inputs), {"mode": "Straße"})
         self.assertEqual(inputs, {"mode": "STRASSE"})
 
-    def test_validate_coerce_args_coerces_boolean_strings(self):
-        """Provide 'true'/'false' strings for a bool arg; expect returned dict with actual bools."""
-        fn = _DummyFunction(
-            [
-                FunctionArg("flag_true", bool),
-                FunctionArg("flag_false", bool),
-            ]
-        )
-        coerced = fn.validate_coerce_args(
-            {"flag_true": " True ", "flag_false": "FALSE"}
-        )
-        self.assertEqual(coerced["flag_true"], True)
-        self.assertEqual(coerced["flag_false"], False)
-
-    def test_validate_coerce_args_rejects_non_boolean_string(self):
-        """An unrecognized boolean string raises ValueError."""
+    def test_validate_coerce_args_returns_actual_booleans(self):
         fn = _DummyFunction([FunctionArg("flag", bool)])
-        with self.assertRaisesRegex(
-            ValueError,
-            r"Arg 'flag' expects bool, got str",
-        ):
-            fn.validate_coerce_args({"flag": "yes"})
+        for expected, values in [
+            (True, [True, "True", "true", " TRUE ", 1, "1"]),
+            (False, [False, "False", "false", " FALSE ", 0, "0"]),
+        ]:
+            for value in values:
+                with self.subTest(value=value):
+                    self.assertIs(fn.validate_coerce_args({"flag": value})["flag"], expected)
+
+    def test_validate_coerce_args_rejects_other_boolean_values(self):
+        fn = _DummyFunction([FunctionArg("flag", bool)])
+        for value in ["yes", "no", "2", 2, -1, 0.0, 1.0]:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, f"Arg 'flag' expects bool, got {type(value).__name__}"):
+                    fn.validate_coerce_args({"flag": value})
 
 
 class TestFunctionArgValidation(unittest.TestCase):
@@ -137,6 +131,21 @@ class TestFunctionArgValidation(unittest.TestCase):
     def test_resolve_value_allows_none_when_optional(self):
         arg = FunctionArg("maybe", str, optional=True)
         self.assertIsNone(arg.resolve_value(None))
+
+    def test_quoted_null_for_optional_typed_arguments(self):
+        for argtype, enum in [(bool, None), (int, None), (float, None), (str, {"auto"})]:
+            with self.subTest(argtype=argtype):
+                self.assertIsNone(FunctionArg("value", argtype, enum=enum, optional=True).resolve_value("null"))
+                with self.assertRaises(ValueError):
+                    FunctionArg("value", argtype, enum=enum).resolve_value("null")
+
+    def test_optional_strings_preserve_literal_null(self):
+        fn = _DummyFunction([FunctionArg("text", str, optional=True)])
+        for args in [{}, {"text": None}, {"text": "null"}]:
+            with self.subTest(args=args):
+                self.assertEqual(fn.validate_coerce_args(args), args)
+        choice = FunctionArg("mode", str, enum={"Null", "auto"}, optional=True)
+        self.assertEqual(choice.resolve_value("null"), "Null")
 
     def test_resolve_value_rejects_none_when_required(self):
         arg = FunctionArg("need", str)
@@ -210,15 +219,7 @@ class TestFunctionArgValidation(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, r"Arg 'count' expects int, got float"):
                     arg.resolve_value(value)
 
-    def test_resolve_value_distinguishes_booleans_from_numbers(self):
-        bool_arg = FunctionArg("flag", bool)
-        with self.assertRaisesRegex(
-            ValueError,
-            r"Arg 'flag' expects bool, got int",
-        ):
-            bool_arg.resolve_value(1)
-        self.assertIs(bool_arg.resolve_value(True), True)
-
+    def test_numeric_args_reject_booleans(self):
         int_arg = FunctionArg("amount", int)
         with self.assertRaisesRegex(
             ValueError,

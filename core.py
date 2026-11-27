@@ -208,6 +208,11 @@ class FunctionArg:
                 return None
             raise ValueError(f"Arg '{self.name}' is required and cannot be None")
 
+        # A quoted JSON null can stand for None only when it isn't a valid string value.
+        if self.optional and isinstance(value, str) and value == "null":
+            if self.argtype is not str or (self.enum is not None and "null" not in self._enum_by_casefold):
+                return None
+
         # JSON numbers can be parsed as int where arg expects float, or vice versa. Weed out the legal cases
         if self.argtype is float and type(value) is int:
             try:
@@ -221,17 +226,17 @@ class FunctionArg:
             return self._resolve_numeric_string(value)
 
         if self.argtype is bool:
-            # Tolerate boolean-like strings.
+            if type(value) is bool:
+                return value
+            if type(value) is int and value in (0, 1):
+                return bool(value)
             if isinstance(value, str):
-                s = value.strip().lower()
-                if s == "true" or s == "false":
-                    return (s == "true")
-
-            if type(value) is not bool:
-                raise ValueError(
-                    f"Arg '{self.name}' expects bool, got {type(value).__name__}"
-                )
-            return value
+                token = value.strip().lower()
+                if token in ("true", "1"):
+                    return True
+                if token in ("false", "0"):
+                    return False
+            raise ValueError(f"Arg '{self.name}' expects bool, got {type(value).__name__}")
 
         if self.argtype is int and type(value) is bool:
             raise ValueError(f"Arg '{self.name}' expects int, got bool")

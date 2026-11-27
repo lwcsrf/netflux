@@ -784,7 +784,7 @@ class TUI(SessionController):
                     if field.optional:
                         parsed_args[field.arg.name] = None
                     continue
-                parsed_args[field.arg.name] = self._parse_arg(field.arg, raw)
+                parsed_args[field.arg.name] = field.arg.resolve_value(raw)
         except ValueError as exc:
             self._form_state.error = str(exc)
             return
@@ -898,26 +898,6 @@ class TUI(SessionController):
             raise ValueError(error) from None
         if not 0 <= value <= _TUI_MAX_AGENT_LEVELS:
             raise ValueError(error)
-        return value
-
-    @staticmethod
-    def _parse_arg(arg: FunctionArg, raw: str) -> object:
-        text = raw.strip()
-        if arg.argtype is str:
-            value: object = raw
-        elif arg.argtype in (int, float):
-            value = arg.resolve_value(raw)
-        elif arg.argtype is bool:
-            normalized = text.lower()
-            if normalized == "true":
-                value = True
-            elif normalized == "false":
-                value = False
-            else:
-                raise ValueError(f"Arg '{arg.name}' expects bool text 'true' or 'false'.")
-        else:
-            raise ValueError(f"Unsupported arg type: {arg.argtype}")
-
         return value
 
     @staticmethod
