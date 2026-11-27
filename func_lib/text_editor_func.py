@@ -516,28 +516,20 @@ class TextEditor(CodeFunction):
 
     def _truncate_with_inline_warning(self, s: str) -> str:
         """
-        Truncate `s` at the limit and append the inline truncation warning on the last line.
+        Truncate `s` at the limit and mark the last line inline only if it is incomplete.
 
         Example before numbering:
             "    if x < calcu[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER ...]"
 
-        Call only when truncation happened (or is about to happen) so the warning suffix is applied
-        exactly once. The function defensively trims to the limit in case the caller has not already
-        done so.
+        Call only when truncation happened (or is about to happen).
         """
         lim = self.max_characters
         if lim is None or lim <= 0:
             return s
-        warning = f"[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {lim} CHARACTERS]"
-        truncated = s[:lim] if self._needs_truncation(s) else s
-        trailing_break = ""
-        if truncated.endswith("\r\n"):
-            truncated = truncated[:-2]
-            trailing_break = "\r\n"
-        elif truncated.endswith("\n"):
-            trailing_break = truncated[-1]
-            truncated = truncated[:-1]
-        return f"{truncated}{warning}{trailing_break}"
+        truncated = s[:lim]
+        if truncated.endswith("\n"):
+            return truncated
+        return f"{truncated}[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {lim} CHARACTERS]"
 
     def _append_post_numbering_truncation_notice(self, s: str) -> str:
         """
@@ -552,10 +544,9 @@ class TextEditor(CodeFunction):
             34|    if x < calcu[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER ...]
             [WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]
         """
-        notice = "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
         if s.endswith("\n"):
-            return s + notice
-        return s + "\n" + notice
+            return s + "[WARNING: OUTPUT TRUNCATED. ADDITIONAL LINES OMITTED. RE-SCOPE VIEW RANGE IF NEEDED.]"
+        return s + "\n[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
 
     def _add_line_numbers(self, s: str, *, start_at: int = 1) -> str:
         """

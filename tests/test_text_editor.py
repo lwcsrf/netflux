@@ -46,6 +46,23 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertIn("2|line2\n", output)
             self.assertNotIn("OUTPUT TRUNCATED", output)
 
+    def test_view_truncation_warnings_for_partial_and_complete_lines(self) -> None:
+        incomplete = "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
+        omitted = "[WARNING: OUTPUT TRUNCATED. ADDITIONAL LINES OMITTED. RE-SCOPE VIEW RANGE IF NEEDED.]"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes(b"first\r\nsecond\nthird\n")
+            for limit, expected in (
+                (3, "1|fir[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER 3 CHARACTERS]\n" + incomplete),
+                (6, "1|first\r[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER 6 CHARACTERS]\n" + incomplete),
+                (7, "1|first\r\n" + omitted),
+                (14, "1|first\r\n2|second\n" + omitted),
+            ):
+                self.editor.max_characters = limit
+                for start, end in ((None, None), (1, 3), (1, -1)):
+                    with self.subTest(limit=limit, start=start, end=end):
+                        self.assertEqual(self.editor.handle_view(str(path), start, end), expected)
+
     def test_displayed_lines_match_view_and_insert_positions(self) -> None:
         for separator in ("\r", "\u2028", "\v", "\u2029"):
             with self.subTest(separator=separator), tempfile.TemporaryDirectory() as tmpdir:
