@@ -14,6 +14,7 @@ from ..core import (
     TokenUsage,
 )
 from ..func_lib import ImageResult, raise_exception, status_update
+from ..func_lib.text_editor_func import TextEditor
 from . import ModelNames, Provider
 
 import anthropic
@@ -491,10 +492,8 @@ class AnthropicAgentNode(AgentNode):
             children: List[Optional[Node]] = []                 # Index to match `tool_uses` 1:1.
             invoke_exceptions: List[Optional[Exception]] = []   # Index to match `tool_uses` 1:1.
             for tu in tool_uses:
-                args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
-
                 try:
-                    children.append(self.invoke_tool_function(tu.name, args, tu.id))
+                    children.append(self._invoke_tool_function(tu))
                     invoke_exceptions.append(None)
                 except Exception as ex:
                     children.append(None)
@@ -526,6 +525,13 @@ class AnthropicAgentNode(AgentNode):
                             out_text = result.status
                         else:
                             out_text = str(result)
+
+                        # If `_invoke_tool_function()` made us succeed on a bad func name, warn the model not to repeat.
+                        if tu.name != child.fn.name:
+                            out_text += (
+                                f"\n\n[WARNING: you invoked `{tu.name}` but harness assumed `{child.fn.name}`. "
+                                "This auto-recovered. Follow tools spec more closely.]"
+                            )
                         is_error = False
                     except Exception as ex:
                         if (
@@ -723,3 +729,23 @@ class AnthropicAgentNode(AgentNode):
         if py_t is float: return "number"
         if py_t is bool:  return "boolean"
         return "string"  # fallback
+
+    def _invoke_tool_function(self, tu: ToolUseBlock) -> Node:
+        """
+        Thin wrapper around `invoke_tool_function` to intercept special cases:
+        * anthropic's models confuse TextEditor for the classic `str_replace_based_edit_tool`.
+        * (add further interceptions here as needed)
+        """
+        name: str = tu.name
+        args: Dict[str, Any] = cast(Dict[str, Any], tu.input or {})
+
+        # Sometimes anthropic models confuse TextEditor built-in for the `str_replace_based_edit_tool`
+        # it was modeled after. Accept the alternate name and let TextEditor validate the arguments.
+        if (
+            name == "str_replace_based_edit_tool"
+            and name not in self.func_map
+            and isinstance(self.func_map.get(TextEditor.name), TextEditor)
+        ):
+            name = TextEditor.name
+
+        return self.invoke_tool_function(name, args, tu.id)
