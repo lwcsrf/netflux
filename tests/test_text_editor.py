@@ -46,6 +46,46 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertIn("2|line2\n", output)
             self.assertNotIn("OUTPUT TRUNCATED", output)
 
+    def test_view_warns_only_when_explicit_end_matches_wc_l_and_omits_final_line(self) -> None:
+        def warning(line: int) -> str:
+            return ("[Warning: The final line has no terminating newline and is outside the requested range. "
+                    f"Request line {line} for it.]").upper()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            # The lookahead's first 64 KiB ends with CR, and the next read begins with LF.
+            split_crlf = b"a\r" + b"x" * (64 * 1024 - 1) + b"\r\nlast"
+            for data, end, expected in [
+                (b"a\r\nb\r\nc", 2, "1|a\r\n2|b\r\n\n" + warning(3)),
+                (b"a\nb\nc", 1, "1|a\n"),
+                (b"a\nb\nc\n", 2, "1|a\n2|b\n"),
+                (b"a\nb", 2, "1|a\n2|b"),
+                (b"a\nb", -1, "1|a\n2|b"),
+                (b"a\nb", None, "1|a\n2|b"),
+                (b"a\rb\nc", 1, "1|a\r\n" + warning(3)),
+                (b"a\rb\nc", 2, "1|a\r2|b\n"),
+                (b"a\rb\rc\nd", 1, "1|a\r\n" + warning(4)),
+                (split_crlf, 1, "1|a\r\n" + warning(3)),
+            ]:
+                with self.subTest(data=data[:32], end=end):
+                    path.write_bytes(data)
+                    self.assertEqual(expected, self.editor.handle_view(str(path), None, end))
+
+            path.write_bytes(b"abc\n" * 124 + b"x" * 100_000)
+            for cutoff_line in (124, 2):
+                with self.subTest(cutoff_line=cutoff_line):
+                    limit = (cutoff_line - 1) * len("abc\n") + len("ab")
+                    self.editor.max_characters = limit
+                    output = self.editor.call(
+                        self.ctx, command="view", path=str(path), view_start_line=1, view_end_line=124,
+                    )
+                    expected = [f"{i}|abc" for i in range(1, cutoff_line)] + [
+                        f"{cutoff_line}|ab[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {limit} CHARACTERS]",
+                        "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]",
+                        warning(125),
+                    ]
+                    self.assertEqual(expected, output.splitlines())
+
     def test_str_replace_single_match_updates_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)

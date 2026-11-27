@@ -208,7 +208,7 @@ class TextEditor(CodeFunction):
 
         # Stream when end is bounded; otherwise stream to EOF from start.
         if end != -1:
-            snippet, last_line, was_truncated = self._read_range_stream(p, start, end)
+            snippet, last_line, was_truncated, omitted_final_line = self._read_range_stream(p, start, end)
             # Validate against actual file length observed during streaming
             if last_line == 0:
                 # Empty file
@@ -224,6 +224,12 @@ class TextEditor(CodeFunction):
             numbered = self._add_line_numbers(snippet, start_at=start)
             if was_truncated:
                 numbered = self._append_post_numbering_truncation_notice(numbered)
+
+            # Courtesy warning for a case that trips up LLMs when they use `wc -l` to count
+            # lines and then request a range that excludes the unterminated final line.
+            if omitted_final_line is not None:
+                numbered += ("\n[Warning: The file's last line has no terminating newline and is just outside the requested range. "
+                             f"Request line {omitted_final_line} explicitly for it.]").upper()
             return numbered
         else:
             snippet, last_line, was_truncated = self._read_from_start_stream(p, start)
@@ -694,10 +700,10 @@ class TextEditor(CodeFunction):
         """Heuristic: detect if `text` appears to include line numbers from the view output."""
         return bool(TextEditor._LINE_NUMBER_PATTERN.search(text))
 
-    def _read_range_stream(self, p: Path, start: int, end_inclusive: int) -> tuple[str, int, bool]:
+    def _read_range_stream(self, p: Path, start: int, end_inclusive: int) -> tuple[str, int, bool, Optional[int]]:
         """
         Stream only the requested 1-indexed inclusive [start, end_inclusive] lines.
-        Returns (snippet, last_line_seen, truncated_by_max_characters).
+        Returns (snippet, last_line_seen, truncated_by_max_characters, omitted_final_line).
 
         We enforce self.max_characters during streaming to avoid large allocations, but
         continue reading (without appending) until end_inclusive to validate bounds.
@@ -709,11 +715,14 @@ class TextEditor(CodeFunction):
         out_len = 0
         was_truncated = False
         last_line = 0
+        lf_count = 0
+        omitted_final_line = None
 
         try:
             with p.open("r", encoding="utf-8", errors="surrogateescape", newline="") as f:
                 for i, line in enumerate(f, 1):
                     last_line = i
+                    lf_count += line.endswith("\n")  # wc -l counts LF, including the LF in CRLF.
                     if i < start:
                         continue
                     if not was_truncated:
@@ -730,13 +739,27 @@ class TextEditor(CodeFunction):
                             else:
                                 was_truncated = True
                     if i >= end_inclusive:
+                        # Stop at the first LF beyond the requested count. Bound reads for long lines.
+                        tail_line = i + 1
+                        previous_cr = False
+                        while chunk := f.readline(64 * 1024):
+                            lf_count += chunk.endswith("\n")
+                            ends_line = chunk.endswith(("\r", "\n"))
+                            # A CRLF split across chunks still ends just one editor line.
+                            if ends_line and not (previous_cr and chunk == "\n"):
+                                tail_line += 1
+                            previous_cr = chunk.endswith("\r")
+                            # EOF confirms this candidate. A later line terminator clears it.
+                            omitted_final_line = tail_line if lf_count == end_inclusive and not ends_line else None
+                            if lf_count > end_inclusive:
+                                break
                         break
         except PermissionError as exc:
             raise PermissionError(f"while reading '{p}': {exc}") from exc
         except OSError as exc:
             raise OSError(f"while reading '{p}': {exc}") from exc
 
-        return "".join(out_parts), last_line, was_truncated
+        return "".join(out_parts), last_line, was_truncated, omitted_final_line
 
     def _read_from_start_stream(self, p: Path, start: int) -> tuple[str, int, bool]:
         """
