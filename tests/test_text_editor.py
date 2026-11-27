@@ -48,8 +48,8 @@ class TestTextEditorBasicOperations(unittest.TestCase):
 
     def test_view_warns_only_when_explicit_end_matches_wc_l_and_omits_final_line(self) -> None:
         def warning(line: int) -> str:
-            return ("[Warning: The final line has no terminating newline and is outside the requested range. "
-                    f"Request line {line} for it.]").upper()
+            return ("[Warning: The file's last line has no terminating newline and is just outside the requested range. "
+                    f"Request line {line} explicitly for it.]").upper()
 
         with tempfile.TemporaryDirectory() as tmpdir:
             path = Path(tmpdir, "file.txt")

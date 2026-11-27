@@ -62,10 +62,11 @@ Run:
 
 ### Built-in Stress Tests (`stress_builtins.py`)
 
-Choose one of three test modes: `bash`, `image`, or `tree`.
+Choose from `bash`, `image`, `text_editor`, and `tree`.
 
 - `bash`: runs a relatively bare `AgentFunction` whose role is to stress-test the built-in `bash` tool that covers a superset of how any agent might use the function.
 - `image`: inspect an existing asset, refine an SVG through at least ten visual revisions that require using `view_image` of the rasterized SVG, exercise downsizing and re-encoding of a large image, then derive more probes after looking at the `view_image` source and try them.
+- In `text_editor` mode the agent designs its own editing probes. Examples include routine file revisions, ambiguous replacements, mixed line endings, and a truncated view that misses an unterminated final line.
 - `tree`: recursively delegate with a three-agent-level limit and relay evidence of the deepest-level warning and rejected fourth level invocation attempt.
 
 Optionally, pass `--custom-instruction` to steer the run toward a narrower behavior or failure mode you want to probe. Only `tree` exposes an agent as a function, and does so recursively, and its delegates use the selected provider too.
@@ -74,7 +75,7 @@ The script creates a disposable workspace, changes into it before invoking the a
 
 Run:
 
-`python -m netflux.demos.stress_builtins {bash,image,tree} --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
+`python -m netflux.demos.stress_builtins {bash,image,text_editor,tree} --provider={openai,anthropic,gemini} [--custom-instruction "..."]`
 
 ## TUI (`tui.py`)
 
