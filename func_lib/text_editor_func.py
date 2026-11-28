@@ -317,6 +317,15 @@ class TextEditor(CodeFunction):
                     f"Found {count} matches for replacement text. "
                     "Provide more context to make it unique.")
 
+            if "\ufffd" in old_str:
+                # Decode the original bytes as view does. One malformed sequence can display as one U+FFFD.
+                displayed = content.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+                if self._count_overlapping(displayed, old_str) > 1:
+                    raise TextEditorException(
+                        "Replacement is ambiguous because invalid UTF-8 also displays in `view` as '�'. "
+                        "No changes were made."
+                    )
+
             updated = content.replace(old_str, new_str, 1)
 
             # Mid-air guard just before write
