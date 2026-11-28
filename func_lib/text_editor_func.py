@@ -682,7 +682,7 @@ class TextEditor(CodeFunction):
           1) create temp file in same directory
           2) write with utf-8 + surrogateescape, fsync
           3) set permissions:
-             - existing file: preserve original mode
+             - existing file: preserve original mode and, when possible, group
              - new file: apply 0666 & ~umask (typical default; commonly 0644)
           4) os.replace to destination
           5) fsync parent directory (POSIX durability)
@@ -708,6 +708,12 @@ class TextEditor(CodeFunction):
             # Permissions: preserve when overwriting; otherwise use 0666 & ~umask for new files
             try:
                 st = p.stat()
+                if os.name == "posix":
+                    try:
+                        if os.stat(tmp_path).st_gid != st.st_gid:
+                            os.chown(tmp_path, -1, st.st_gid)
+                    except (OSError, AttributeError, NotImplementedError) as exc:
+                        logging.getLogger(__name__).debug("Could not preserve group %d for %r: %s", st.st_gid, p, exc)
                 os.chmod(tmp_path, st.st_mode)  # existing file: preserve
             except FileNotFoundError:
                 # New file: set default permissions like 0666 masked by current umask
