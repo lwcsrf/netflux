@@ -831,6 +831,8 @@ class OaiAgentNode(AgentNode):
                     out_text = AgentNode.stringify_exception(ex)
                     is_error = True
 
+            out_text = self.escape_tool_result_surrogates(out_text)
+
             # Add func response to netflux transcript.
             # Status updates only get single `ModelStatusPart`, already injected.
             if not self.is_valid_status_update(pending.item.name, pending.args):

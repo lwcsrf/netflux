@@ -1093,6 +1093,11 @@ class AgentNode(Node):
         return self.ctx.invoke(fn, args, provider=provider, tool_use_id=tool_use_id)
 
     @staticmethod
+    def escape_tool_result_surrogates(text: str) -> str:
+        """Escape lone surrogates (e.g. from POSIX paths) before a provider encodes the result."""
+        return text.encode("utf-8", errors="backslashreplace").decode("utf-8")
+
+    @staticmethod
     def stringify_exception(ex: Exception) -> str:
         """Convert an exception to a single-line string with its type and message.
         Subtypes can use this to ensure adherence to the prescribed contract:

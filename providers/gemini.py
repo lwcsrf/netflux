@@ -582,6 +582,8 @@ class GeminiAgentNode(AgentNode):
                         out_text = AgentNode.stringify_exception(ex)
                         is_error = True
 
+                out_text = self.escape_tool_result_surrogates(out_text)
+
                 # Transcript result in common framework types.
                 if not self.is_valid_status_update(fc):
                     self.transcript.append(
