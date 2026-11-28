@@ -94,7 +94,7 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             path = Path(tmpdir, "file.txt")
             for data, start, expected in (
                 (b"first\r\nlast\r\n", None, "1|first\r\n2|last\r\n" + warning),
-                (b"first\nlast", 2, "2|last" + warning),
+                (b"first\nlast", 2, "2|last\n[WARNING: There is no trailing LF on the final line]" + warning),
             ):
                 with self.subTest(data=data, start=start):
                     path.write_bytes(data)
@@ -149,6 +149,8 @@ class TestTextEditorBasicOperations(unittest.TestCase):
                 self.assertEqual(Path(path).read_bytes(), f"A\n{middle}X\nD\n".encode("utf-8"))
 
     def test_view_warns_only_when_explicit_end_matches_wc_l_and_omits_final_line(self) -> None:
+        no_lf = "\n[WARNING: There is no trailing LF on the final line]"
+
         def warning(line: int) -> str:
             return ("[Warning: The file's last line has no terminating newline and is just outside the requested range. "
                     f"Request line {line} explicitly for it.]").upper()
@@ -161,12 +163,12 @@ class TestTextEditorBasicOperations(unittest.TestCase):
                 (b"a\r\nb\r\nc", 2, "1|a\r\n2|b\r\n\n" + warning(3)),
                 (b"a\nb\nc", 1, "1|a\n"),
                 (b"a\nb\nc\n", 2, "1|a\n2|b\n"),
-                (b"a\nb", 2, "1|a\n2|b"),
-                (b"a\nb", -1, "1|a\n2|b"),
-                (b"a\nb", None, "1|a\n2|b"),
+                (b"a\nb", 2, "1|a\n2|b" + no_lf),
+                (b"a\nb", -1, "1|a\n2|b" + no_lf),
+                (b"a\nb", None, "1|a\n2|b" + no_lf),
                 (b"a\rb\nc", 1, "1|a\rb\n\n" + warning(2)),
-                (b"a\rb\nc", 2, "1|a\rb\n2|c"),
-                (b"a\rb\r", 1, "1|a\rb\r"),
+                (b"a\rb\nc", 2, "1|a\rb\n2|c" + no_lf),
+                (b"a\rb\r", 1, "1|a\rb\r" + no_lf),
                 (b"a\nb\r", 1, "1|a\n\n" + warning(2)),
                 (split_crlf, 1, "1|a\n"),
             ]:
@@ -176,7 +178,7 @@ class TestTextEditorBasicOperations(unittest.TestCase):
 
             path.write_bytes("A\nB\u2028C".encode("utf-8"))
             self.assertEqual(self.editor.handle_view(str(path), 1, 1), "1|A\n\n" + warning(2))
-            self.assertEqual(self.editor.handle_view(str(path), 2, 2), "2|B\u2028C")
+            self.assertEqual(self.editor.handle_view(str(path), 2, 2), "2|B\u2028C" + no_lf)
 
             path.write_bytes(b"a\rc\n" * 124 + b"x" * 100_000)
             for cutoff_line in (124, 2):

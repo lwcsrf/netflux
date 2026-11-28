@@ -216,6 +216,7 @@ class TextEditor(CodeFunction):
         if view_end_line is not None and view_end_line < -1:
             raise TextEditorException(f"view_end_line must be -1 or >= 1 (received {view_end_line})")
 
+        no_trailing_lf = "\n[WARNING: There is no trailing LF on the final line]"
         # No range + full file (subject to truncation)
         if view_start_line is None and view_end_line is None:
             # Stream for full-file views to avoid large allocations; preserve prior output semantics.
@@ -225,6 +226,8 @@ class TextEditor(CodeFunction):
             numbered = self._add_line_numbers(snippet)
             if was_truncated:
                 numbered = self._append_post_numbering_truncation_notice(numbered)
+            elif snippet and not snippet.endswith("\n"):
+                numbered += no_trailing_lf
             return numbered
 
         # Normalize range
@@ -252,6 +255,8 @@ class TextEditor(CodeFunction):
             numbered = self._add_line_numbers(snippet, start_at=start)
             if was_truncated:
                 numbered = self._append_post_numbering_truncation_notice(numbered)
+            elif not snippet.endswith("\n"):
+                numbered += no_trailing_lf
 
             # Courtesy warning for a case that trips up LLMs when they use `wc -l` to count
             # lines and then request a range that excludes the unterminated final line.
@@ -275,6 +280,9 @@ class TextEditor(CodeFunction):
             numbered = self._add_line_numbers(snippet, start_at=start)
             if was_truncated:
                 numbered = self._append_post_numbering_truncation_notice(numbered)
+            elif not snippet.endswith("\n"):
+                # Not truncated, thus we must have reached EOF. So this is testing newline on last line.
+                numbered += no_trailing_lf
             return numbered
 
     def handle_str_replace(

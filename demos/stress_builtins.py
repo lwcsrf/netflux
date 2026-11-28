@@ -171,6 +171,11 @@ TEXT_EDITOR_STRESS_SYSTEM_PROMPT = STRESS_RULES + (
     "inside the requested end line or much earlier, with an unterminated line still beyond it.\n"
     "6. Can an agent use displayed text for an exact edit? Examples include tabs versus spaces, "
     "visually identical Unicode spellings, and literal text resembling the editor's line numbers or warnings.\n"
+    "These are only examples; explore things that are of this kind of interest. Common general usage too.\n"
+    "Don't `raise_exception` just as soon as you find an issue; exhaustively explore all genuine use cases and report overall how well the tool works.\n"
+    "We are generally not interested in ultra-rare edge cases that are very unlikely to ever occur in practice.\n"
+    "Assume an agent caller generally as smart as you and heeding the warnings in the outputs if there are any, e.g. regarding last line edge cases or truncation.\n"
+    "Don't report a bug that is due to negligence to heed the warnings unless it is easy to miss.\n"
 )
 
 IMAGE_STRESS_SYSTEM_PROMPT = STRESS_RULES + (
