@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from ..core import AgentFunction, FunctionArg, NodeState, Provider
-from ..func_lib import bash, raise_exception, status_update, view_image
+from ..func_lib import bash, raise_exception, status_update, text_editor, view_image
 from ..runtime import Runtime
 from ..tui import ConsoleRender
 
@@ -155,6 +155,29 @@ STRESS_RULES = (
     f"On a clear malfunction, call `{raise_exception.name}` with a concise reproducer and observations.\n\n"
 )
 
+TEXT_EDITOR_STRESS_SYSTEM_PROMPT = STRESS_RULES + (
+    "Design your own stress test for text_editor. Choose cases that reflect real editing work "
+    "as well as unusual inputs. Follow up on what you observe. Bash is available for independent "
+    "checks of the files on disk. Here are some questions you could explore.\n"
+    "1. How well do create, view, insert and str_replace work together when revising a file? "
+    "Consider finding it in a nested directory, moving a paragraph, or deleting a repeated heading.\n"
+    "2. Which line does a range or insertion point refer to at the edges of a file? Empty files, "
+    "single-line files and runs of blank lines make good examples.\n"
+    "3. What survives a rejected edit? Consider conflicting creates, overlapping matches, or a "
+    "replacement based on a view that has since gone stale.\n"
+    "4. Which line does a follow-up view retrieve when its range comes from wc -l? Consider an "
+    "unterminated final line or a file with LF and CRLF endings and a bare CR inside a line.\n"
+    "5. How useful is a truncated view for deciding what to read next? The cutoff might land "
+    "inside the requested end line or much earlier, with an unterminated line still beyond it.\n"
+    "6. Can an agent use displayed text for an exact edit? Examples include tabs versus spaces, "
+    "visually identical Unicode spellings, and literal text resembling the editor's line numbers or warnings.\n"
+    "These are only examples; explore things that are of this kind of interest. Common general usage too.\n"
+    "Don't `raise_exception` just as soon as you find an issue; exhaustively explore all genuine use cases and report overall how well the tool works.\n"
+    "We are generally not interested in ultra-rare edge cases that are very unlikely to ever occur in practice.\n"
+    "Assume an agent caller generally as smart as you and heeding the warnings in the outputs if there are any, e.g. regarding last line edge cases or truncation.\n"
+    "Don't report a bug that is due to negligence to heed the warnings unless it is easy to miss.\n"
+)
+
 IMAGE_STRESS_SYSTEM_PROMPT = STRESS_RULES + (
     "Stress-test the built-in view_image using bash to create and rasterize your own SVGs. "
     "Complete these stages in order; do not read view_image source until stage 4.\n"
@@ -217,6 +240,23 @@ CUSTOM_INSTRUCTION_ARGS = [
     FunctionArg("custom_instruction", str, "Optional override of the stress-test goal.", optional=True),
 ]
 
+text_editor_stress_agent = AgentFunction(
+    name="text_editor_stress_agent",
+    desc="Stress-tests text_editor edits, range boundaries, truncation, error handling, corner cases.",
+    args=[
+        FunctionArg("workspace", str, "Absolute path to a temporary workspace. Leave blank to create one.", optional=True),
+        *CUSTOM_INSTRUCTION_ARGS,
+    ],
+    system_prompt=TEXT_EDITOR_STRESS_SYSTEM_PROMPT,
+    user_prompt_template=(
+        "Run the text editor stress test.\nWorkspace: {workspace}\n"
+        "If no workspace is supplied, create a fresh temporary directory with bash. "
+        "Use absolute paths inside the workspace for test files and include its path in your report.\n"
+        "Custom instruction: {custom_instruction}\n"
+    ),
+    uses=[text_editor, bash, raise_exception, status_update],
+)
+
 image_stress_agent = AgentFunction(
     name="image_stress_agent",
     desc="Stress-tests view_image through SVG revisions, large-image conversion and source-guided probes.",
@@ -236,7 +276,12 @@ tree_stress_agent = AgentFunction(
     uses_recursion=True,
 )
 
-STRESS_AGENTS = {"bash": bash_stress_agent, "image": image_stress_agent, "tree": tree_stress_agent}
+STRESS_AGENTS = {
+    "bash": bash_stress_agent,
+    "image": image_stress_agent,
+    "text_editor": text_editor_stress_agent,
+    "tree": tree_stress_agent,
+}
 
 
 def make_demo_workspace(mode: str) -> Path:
@@ -265,7 +310,7 @@ def run_stress_tree(
     invoke_args = {
         "custom_instruction": custom_instruction,
     }
-    if mode == "bash":
+    if mode in ("bash", "text_editor"):
         invoke_args["workspace"] = str(workspace)
 
     cwd_save = Path.cwd()
@@ -316,7 +361,7 @@ def run_stress_tree(
 
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Stress-test built-in bash, image viewing or recursive agent trees.",
+        description="Stress-test built-in bash, image viewing, text editing tools, or recursive agent trees.",
     )
     parser.add_argument("mode", choices=STRESS_AGENTS, help="Choose the stress test to run.")
     parser.add_argument(

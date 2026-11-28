@@ -1,12 +1,36 @@
+from contextlib import ExitStack
+from io import StringIO
 from pathlib import Path
 import tempfile
+import logging
 import os
 import re
 import secrets
+from textwrap import dedent
 from threading import Lock
 from typing import Set, Optional
 
 from ..core import FunctionArg, CodeFunction, RunContext, SessionScope
+
+
+def _split_file_lines(text: str) -> list[str]:
+    """Split after each LF and keep every character, including the LF itself.
+    Works with CRLF line endings also. Use this same method everywhere.
+    """
+    return StringIO(text, newline="\n").readlines()
+
+
+def _replace_surrogates(text: str) -> str:
+    """Make filesystem names safe to display in UTF-8 tool results."""
+    return re.sub(r"[\ud800-\udfff]", "\ufffd", text)
+
+
+def _remove_create_temp(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logging.getLogger(__name__).warning("Could not remove temporary file %r after create", path, exc_info=True)
+
 
 class TextEditorException(Exception):
     """Raised for business-logic violations in the TextEditor tool."""
@@ -31,7 +55,7 @@ class TextEditor(CodeFunction):
         "Commands:\n"
         "• `view`: View a file or list a directory (single level). "
         "Files show line numbers (format: `number|content`) and you can optionally "
-        "specify a line range. For directories, subdirectories are listed with '/' appended to their names.\n"
+        "specify a line range. For directories, subdirs are listed with '/' appended to their names.\n"
         "List dirs only sparingly to avoid context pollution.\n"
         "Be selective when viewing files to prevent context explosion; use line ranges to limit output.\n"
         "• `str_replace`: Replace exact text in a file (`old_str` → `new_str`). Line numbers are"
@@ -42,15 +66,21 @@ class TextEditor(CodeFunction):
         "• `view` → `path` (absolute or relative; file or directory). Optional: `view_start_line`, `view_end_line`. "
         "Examples (files only): (view_start_line=1, view_end_line=1) shows only the first line; "
         "(view_start_line=10, view_end_line=20) shows lines 10 through 20; "
-        "set view_end_line=-1 to read through the last line."
+        "set view_end_line=-1 to read through the last line. "
         f"Truncation will occur after {max_characters} characters, with it clearly noted in the returned text.\n"
         "• `str_replace` → `path`, `old_str`, `new_str` (requires *exact* match including whitespace/indentation).\n"
         "• `create` → `path` (must not pre-exist), `file_text`.\n"
-        "• `insert` → `path`, `insert_line`, `new_str`. "
-        "Examples: `insert_line=0` inserts at the beginning of the file; "
-        "`insert_line=1` inserts *after* the very first line (starting on the second line); "
-        "`insert_line=30` inserts *after* the first 30 lines.\n"
-        "Absolute paths are recommended to avoid ambiguity.\n"
+        "• `insert` → `path`, `insert_line`, `new_str`."
+        + dedent(r"""
+            Examples (file before, insert_line, new_str, file after):
+            ("A\nC\n", 1, "B\n", "A\nB\nC\n")
+            ("A", 0, "B\n", "B\nA")
+            ("A\nC", 1, "B", "A\nBC")
+            ("A\n", 1, "B", "A\nB")
+            ("A", 1, "B\n", "AB\n")
+            ("A", 1, "\nB", "A\nB")
+            """)
+        + "Absolute paths are recommended to avoid ambiguity.\n"
         "String output:\n"
         "• Success confirmation (create, insert, str_replace)\n"
         "• Content requested (view)\n"
@@ -66,12 +96,12 @@ class TextEditor(CodeFunction):
         # Command-specific parameters (globally optional; validated per command at runtime):
         FunctionArg("old_str", str, "Text to replace when command=str_replace (must match exactly).",
                     optional=True),
-        FunctionArg("new_str", str, "Replacement text for `str_replace` (can be empty str); or inserted text for `insert`.",
+        FunctionArg("new_str", str, "Replacement text for `str_replace` (can be empty str); or inserted text for `insert` (trailing newline isn't auto-added).",
                     optional=True),
         FunctionArg("file_text", str, "Full file contents when command=create.",
                     optional=True),
         FunctionArg("insert_line", int,
-                    "1-indexed line number *after* which to insert when command=insert."
+                    "1-indexed line number *after* which to insert when command=insert. "
                     "Use 0 to insert at the start of the file.",
                     optional=True),
         FunctionArg("view_start_line", int,
@@ -80,7 +110,7 @@ class TextEditor(CodeFunction):
         ),
         FunctionArg("view_end_line", int,
                     "When command=view on a file, optional 1-indexed end line (inclusive) for partial view. "
-                    "Use -1 to read to end of file.",
+                    "Use -1 to read to end of file. An end line past EOF returns the available lines with a warning.",
                     optional=True,
         ),
     ]
@@ -121,7 +151,7 @@ class TextEditor(CodeFunction):
         if command == "str_replace":
             return self.handle_str_replace(ctx, path, old_str, new_str)
         if command == "create":
-            return self.handle_create(path, file_text)
+            return self.handle_create(ctx, path, file_text)
         if command == "insert":
             return self.handle_insert(ctx, path, insert_line, new_str)
 
@@ -148,7 +178,7 @@ class TextEditor(CodeFunction):
     ) -> str:
         p = self._resolve_path(path)
         if not p.exists():
-            raise FileNotFoundError(f"Path not found: {p}")
+            raise FileNotFoundError(_replace_surrogates(f"Path not found: {p}"))
 
         # Directory listing.
         if p.is_dir():
@@ -165,20 +195,20 @@ class TextEditor(CodeFunction):
                 if self._needs_truncation(listing):
                     listing = self._truncate_with_inline_warning(listing)
                     notice = "[WARNING: DIRECTORY LISTING TRUNCATED.]"
-                    if listing.endswith(("\r\n", "\n", "\r")):
+                    if listing.endswith("\n"):
                         listing += notice
                     else:
                         listing += "\n" + notice
-                return listing
+                return _replace_surrogates(listing)
 
             except PermissionError as exc:
-                raise PermissionError(f"while listing directory '{p}': {exc}") from exc
+                raise PermissionError(_replace_surrogates(f"while listing directory '{p}': {exc}")) from exc
             except OSError as exc:
-                raise OSError(f"while listing directory '{p}': {exc}") from exc
+                raise OSError(_replace_surrogates(f"while listing directory '{p}': {exc}")) from exc
 
         # File view
         if not p.is_file():
-            raise TextEditorException(f"Path is neither directory nor regular file: {p}")
+            raise TextEditorException(_replace_surrogates(f"Path is neither directory nor regular file: {p}"))
         if view_end_line == 0:
             raise TextEditorException("view_end_line cannot be 0; use -1 for end-of-file")
         if view_start_line is not None and view_start_line < 1:
@@ -186,6 +216,7 @@ class TextEditor(CodeFunction):
         if view_end_line is not None and view_end_line < -1:
             raise TextEditorException(f"view_end_line must be -1 or >= 1 (received {view_end_line})")
 
+        no_trailing_lf = "\n[WARNING: There is no trailing LF on the final line]"
         # No range + full file (subject to truncation)
         if view_start_line is None and view_end_line is None:
             # Stream for full-file views to avoid large allocations; preserve prior output semantics.
@@ -195,6 +226,8 @@ class TextEditor(CodeFunction):
             numbered = self._add_line_numbers(snippet)
             if was_truncated:
                 numbered = self._append_post_numbering_truncation_notice(numbered)
+            elif snippet and not snippet.endswith("\n"):
+                numbered += no_trailing_lf
             return numbered
 
         # Normalize range
@@ -208,7 +241,7 @@ class TextEditor(CodeFunction):
 
         # Stream when end is bounded; otherwise stream to EOF from start.
         if end != -1:
-            snippet, last_line, was_truncated = self._read_range_stream(p, start, end)
+            snippet, last_line, was_truncated, omitted_final_line = self._read_range_stream(p, start, end)
             # Validate against actual file length observed during streaming
             if last_line == 0:
                 # Empty file
@@ -217,13 +250,21 @@ class TextEditor(CodeFunction):
                 raise TextEditorException("File is empty")
             if start > last_line:
                 raise TextEditorException(f"view_start_line {start} exceeds file line count ({last_line})")
-            if end > last_line:
-                raise TextEditorException(f"view_end_line {end} exceeds file line count ({last_line})")
             if was_truncated:
                 snippet = self._truncate_with_inline_warning(snippet)
             numbered = self._add_line_numbers(snippet, start_at=start)
             if was_truncated:
                 numbered = self._append_post_numbering_truncation_notice(numbered)
+            elif not snippet.endswith("\n"):
+                numbered += no_trailing_lf
+
+            # Courtesy warning for a case that trips up LLMs when they use `wc -l` to count
+            # lines and then request a range that excludes the unterminated final line.
+            if omitted_final_line is not None:
+                numbered += ("\n[Warning: The file's last line has no terminating newline and is just outside the requested range. "
+                             f"Request line {omitted_final_line} explicitly for it.]").upper()
+            if end > last_line:
+                numbered += f"\n[warning: requested end line {end} exceeds the file's last line ({last_line}).]".upper()
             return numbered
         else:
             snippet, last_line, was_truncated = self._read_from_start_stream(p, start)
@@ -239,6 +280,9 @@ class TextEditor(CodeFunction):
             numbered = self._add_line_numbers(snippet, start_at=start)
             if was_truncated:
                 numbered = self._append_post_numbering_truncation_notice(numbered)
+            elif not snippet.endswith("\n"):
+                # Not truncated, thus we must have reached EOF. So this is testing newline on last line.
+                numbered += no_trailing_lf
             return numbered
 
     def handle_str_replace(
@@ -260,16 +304,16 @@ class TextEditor(CodeFunction):
                 "If intention was to delete `old_str`, use empty string for `new_str`.")
 
         p = self._resolve_path(path)
-        if not p.exists():
-            raise FileNotFoundError(f"Path not found: {p}")
-        if p.is_dir():
-            raise IsADirectoryError(f"Path is a directory: {p}")
-        if not p.is_file():
-            raise TextEditorException(f"Path is not a regular file: {p}")
-
         lock = self._get_file_lock(ctx, p)
         lock.acquire()
         try:
+            if not p.exists():
+                raise FileNotFoundError(f"Path not found: {p}")
+            if p.is_dir():
+                raise IsADirectoryError(f"Path is a directory: {p}")
+            if not p.is_file():
+                raise TextEditorException(f"Path is not a regular file: {p}")
+
             # Mid-air guard: record mtime before we read
             mtime_before = self._stat_mtime_ns(p)
             content = self._read_text_preserve_eols(p)
@@ -290,6 +334,15 @@ class TextEditor(CodeFunction):
                     f"Found {count} matches for replacement text. "
                     "Provide more context to make it unique.")
 
+            if "\ufffd" in old_str:
+                # Decode the original bytes as view does. One malformed sequence can display as one U+FFFD.
+                displayed = content.encode("utf-8", errors="surrogateescape").decode("utf-8", errors="replace")
+                if self._count_overlapping(displayed, old_str) > 1:
+                    raise TextEditorException(
+                        "Replacement is ambiguous because invalid UTF-8 also displays in `view` as '�'. "
+                        "No changes were made."
+                    )
+
             updated = content.replace(old_str, new_str, 1)
 
             # Mid-air guard just before write
@@ -307,6 +360,7 @@ class TextEditor(CodeFunction):
 
     def handle_create(
         self,
+        ctx: RunContext,
         path: str,
         file_text: Optional[str],
     ) -> str:
@@ -317,11 +371,8 @@ class TextEditor(CodeFunction):
         if p.exists():
             if p.is_dir():
                 raise IsADirectoryError(f"Path is a directory: {p}")
-            self._raise_create_conflict(p, file_text)
+            self._raise_create_conflict(ctx, p, file_text)
 
-        # Race-safe create:
-        # Use exclusive create ('x') so if another process creates the file between our
-        # existence check and the open, the OS raises FileExistsError and we don't overwrite.
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError as exc:
@@ -330,17 +381,16 @@ class TextEditor(CodeFunction):
             raise OSError(f"while creating parent directory for '{p}': {exc}") from exc
 
         try:
-            with p.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
-                f.write(file_text)
+            with self._get_file_lock(ctx, p):
+                self._try_atomic_create(p, file_text)
         except FileExistsError as exc:
-            self._raise_create_conflict(p, file_text, original_exc=exc)
+            self._raise_create_conflict(ctx, p, file_text, original_exc=exc)
         except PermissionError as exc:
             raise PermissionError(f"while creating file '{p}': {exc}") from exc
         except OSError as exc:
             raise OSError(f"while creating file '{p}': {exc}") from exc
 
-        # Count lines consistently with other operations (treat each newline-terminated chunk as a line)
-        line_count = len(file_text.splitlines(keepends=True))
+        line_count = len(_split_file_lines(file_text))
         return f"Successfully wrote {line_count} lines to new file: {p}."
 
     def handle_insert(
@@ -358,28 +408,31 @@ class TextEditor(CodeFunction):
             raise TextEditorException("Missing argument: new_str")
 
         p = self._resolve_path(path)
-        if not p.exists():
-            raise FileNotFoundError(f"Path not found: {p}")
-        if p.is_dir():
-            raise IsADirectoryError(f"Path is a directory: {p}")
-        if not p.is_file():
-            raise TextEditorException(f"Path is not a regular file: {p}")
-
         lock = self._get_file_lock(ctx, p)
         lock.acquire()
         try:
+            if not p.exists():
+                raise FileNotFoundError(f"Path not found: {p}")
+            if p.is_dir():
+                raise IsADirectoryError(f"Path is a directory: {p}")
+            if not p.is_file():
+                raise TextEditorException(f"Path is not a regular file: {p}")
+
             # Mid-air guard: record mtime before we read
             mtime_before = self._stat_mtime_ns(p)
             content = self._read_text_preserve_eols(p)
 
-            lines = content.splitlines(keepends=True)
-            n = len(lines)
-            if insert_line > n:
-                raise TextEditorException(f"insert_line {insert_line} is out of range (file has {n} lines)")
-
-            before = "".join(lines[:insert_line])
-            after = "".join(lines[insert_line:])
-            updated = before + new_str + after
+            if insert_line == 0 and content.startswith("\ufeff"):
+                # The three UTF-8 BOM bytes (EF BB BF) decode to one character (U+FEFF).
+                # Keep it at byte zero and use content[1:] for the rest of the text.
+                updated = "\ufeff" + new_str + content[1:]
+            else:
+                lines = _split_file_lines(content)
+                n = len(lines)
+                if insert_line > n:
+                    raise TextEditorException(f"insert_line {insert_line} is out of range (file has {n} lines)")
+                lines.insert(insert_line, new_str)
+                updated = "".join(lines)
 
             # Mid-air guard just before write
             mtime_now = self._stat_mtime_ns(p)
@@ -394,6 +447,7 @@ class TextEditor(CodeFunction):
 
     def _raise_create_conflict(
         self,
+        ctx: RunContext,
         p: Path,
         file_text: str,
         original_exc: Optional[Exception] = None,
@@ -407,8 +461,8 @@ class TextEditor(CodeFunction):
         re-send the full file contents as another tool argument when resolving
         path conflicts, which helps avoid unnecessary context bloat.
         """
-        alt_path, alt_exc = self._attempt_alternate_create(p, file_text)
-        line_count = len(file_text.splitlines(keepends=True))
+        alt_path, alt_exc = self._attempt_alternate_create(ctx, p, file_text)
+        line_count = len(_split_file_lines(file_text))
 
         if alt_exc is None and alt_path is not None:
             err = FileExistsError(
@@ -436,6 +490,7 @@ class TextEditor(CodeFunction):
 
     def _attempt_alternate_create(
         self,
+        ctx: RunContext,
         original_path: Path,
         file_text: str,
         max_attempts: int = 5,
@@ -460,18 +515,51 @@ class TextEditor(CodeFunction):
             alt_path = original_path.with_name(name)
 
             try:
-                with alt_path.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
-                    f.write(file_text)
+                with self._get_file_lock(ctx, alt_path):
+                    self._try_atomic_create(alt_path, file_text)
                 return alt_path, None
             except FileExistsError as exc:
                 last_exc = exc
-                continue
             except PermissionError as exc:
                 return alt_path, PermissionError(f"while creating alternate file '{alt_path}': {exc}")
             except OSError as exc:
                 return alt_path, OSError(f"while creating alternate file '{alt_path}': {exc}")
 
         return alt_path, last_exc
+
+    @staticmethod
+    def _try_atomic_create(path: Path, text: str) -> None:
+        """Atomically create the file, raising FileExistsError if the destination exists."""
+        max_attempts = 100
+        for _ in range(max_attempts):
+            # A short sibling name works even when the destination basename is at its length limit.
+            staged = path.with_name(f".nf-{secrets.token_urlsafe(7)}")
+            if staged.name.casefold() == path.name.casefold():
+                continue
+            try:
+                stream = staged.open("x", encoding="utf-8", errors="surrogateescape", newline="")
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise OSError(
+                f"Could not allocate a temporary file for atomic creation of '{path}' "
+                f"after trying {max_attempts} candidate names."
+            )
+
+        with ExitStack() as cleanup:
+            cleanup.callback(_remove_create_temp, staged)
+            with stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            # Possible this can now raise a FileExistsError due to race with another session not sharing our bag
+            if os.name == "nt":
+                os.rename(staged, path)  # Windows rename fails if the destination exists.
+                cleanup.pop_all()  # Rename consumed the temporary name.
+            else:
+                os.link(staged, path)
 
     def _check_extraneous_args(self, args_provided: Set[str], command: str) -> None:
         allowed_by_cmd: dict[str, set[str]] = {
@@ -502,28 +590,20 @@ class TextEditor(CodeFunction):
 
     def _truncate_with_inline_warning(self, s: str) -> str:
         """
-        Truncate `s` at the limit and append the inline truncation warning on the last line.
+        Truncate `s` at the limit and mark the last line inline only if it is incomplete.
 
         Example before numbering:
             "    if x < calcu[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER ...]"
 
-        Call only when truncation happened (or is about to happen) so the warning suffix is applied
-        exactly once. The function defensively trims to the limit in case the caller has not already
-        done so.
+        Call only when truncation happened (or is about to happen).
         """
         lim = self.max_characters
         if lim is None or lim <= 0:
             return s
-        warning = f"[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {lim} CHARACTERS]"
-        truncated = s[:lim] if self._needs_truncation(s) else s
-        trailing_break = ""
-        if truncated.endswith("\r\n"):
-            truncated = truncated[:-2]
-            trailing_break = "\r\n"
-        elif truncated.endswith(("\n", "\r")):
-            trailing_break = truncated[-1]
-            truncated = truncated[:-1]
-        return f"{truncated}{warning}{trailing_break}"
+        truncated = s[:lim]
+        if truncated.endswith("\n"):
+            return truncated
+        return f"{truncated}[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {lim} CHARACTERS]"
 
     def _append_post_numbering_truncation_notice(self, s: str) -> str:
         """
@@ -538,10 +618,9 @@ class TextEditor(CodeFunction):
             34|    if x < calcu[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER ...]
             [WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]
         """
-        notice = "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
-        if s.endswith(("\r\n", "\n", "\r")):
-            return s + notice
-        return s + "\n" + notice
+        if s.endswith("\n"):
+            return s + "[WARNING: OUTPUT TRUNCATED. ADDITIONAL LINES OMITTED. RE-SCOPE VIEW RANGE IF NEEDED.]"
+        return s + "\n[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
 
     def _add_line_numbers(self, s: str, *, start_at: int = 1) -> str:
         """
@@ -554,7 +633,7 @@ class TextEditor(CodeFunction):
         if not s:
             return s
         # Preserve original EOLs by keeping ends when splitting.
-        parts = s.splitlines(keepends=True)
+        parts = _split_file_lines(s)
         return "".join(f"{i}|{line}" for i, line in enumerate(parts, start=start_at))
 
     def _stat_mtime_ns(self, p: Path) -> Optional[int]:
@@ -591,14 +670,14 @@ class TextEditor(CodeFunction):
         Read text while preserving exact newline characters and unknown bytes.
         - encoding='utf-8', errors='surrogateescape' keeps undecodable bytes round-trippable
           (decoded into U+DC80..U+DCFF) and writes them back as the original bytes.
-        - newline='' preserves CRLF vs LF exactly.
+        - The reader preserves LF and CRLF exactly.
         """
         if not p.exists():
             raise FileNotFoundError(f"Path not found: {p}")
         if not p.is_file():
             raise TextEditorException(f"Path is not a file: {p}")
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="\n") as f:
                 return f.read()
         except PermissionError as exc:
             raise PermissionError(f"while reading '{p}': {exc}") from exc
@@ -611,7 +690,7 @@ class TextEditor(CodeFunction):
           1) create temp file in same directory
           2) write with utf-8 + surrogateescape, fsync
           3) set permissions:
-             - existing file: preserve original mode
+             - existing file: preserve original mode and, when possible, group
              - new file: apply 0666 & ~umask (typical default; commonly 0644)
           4) os.replace to destination
           5) fsync parent directory (POSIX durability)
@@ -637,6 +716,12 @@ class TextEditor(CodeFunction):
             # Permissions: preserve when overwriting; otherwise use 0666 & ~umask for new files
             try:
                 st = p.stat()
+                if os.name == "posix":
+                    try:
+                        if os.stat(tmp_path).st_gid != st.st_gid:
+                            os.chown(tmp_path, -1, st.st_gid)
+                    except (OSError, AttributeError, NotImplementedError) as exc:
+                        logging.getLogger(__name__).debug("Could not preserve group %d for %r: %s", st.st_gid, p, exc)
                 os.chmod(tmp_path, st.st_mode)  # existing file: preserve
             except FileNotFoundError:
                 # New file: set default permissions like 0666 masked by current umask
@@ -694,10 +779,10 @@ class TextEditor(CodeFunction):
         """Heuristic: detect if `text` appears to include line numbers from the view output."""
         return bool(TextEditor._LINE_NUMBER_PATTERN.search(text))
 
-    def _read_range_stream(self, p: Path, start: int, end_inclusive: int) -> tuple[str, int, bool]:
+    def _read_range_stream(self, p: Path, start: int, end_inclusive: int) -> tuple[str, int, bool, Optional[int]]:
         """
         Stream only the requested 1-indexed inclusive [start, end_inclusive] lines.
-        Returns (snippet, last_line_seen, truncated_by_max_characters).
+        Returns (snippet, last_line_seen, truncated_by_max_characters, omitted_final_line).
 
         We enforce self.max_characters during streaming to avoid large allocations, but
         continue reading (without appending) until end_inclusive to validate bounds.
@@ -709,9 +794,10 @@ class TextEditor(CodeFunction):
         out_len = 0
         was_truncated = False
         last_line = 0
+        omitted_final_line = None
 
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            with p.open("r", encoding="utf-8", errors="replace", newline="\n") as f:
                 for i, line in enumerate(f, 1):
                     last_line = i
                     if i < start:
@@ -730,17 +816,23 @@ class TextEditor(CodeFunction):
                             else:
                                 was_truncated = True
                     if i >= end_inclusive:
+                        # wc -l misses the next line only if the remaining text contains no LF.
+                        while chunk := f.readline(64 * 1024):
+                            if chunk.endswith("\n"):
+                                omitted_final_line = None
+                                break
+                            omitted_final_line = i + 1
                         break
         except PermissionError as exc:
-            raise PermissionError(f"while reading '{p}': {exc}") from exc
+            raise PermissionError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
         except OSError as exc:
-            raise OSError(f"while reading '{p}': {exc}") from exc
+            raise OSError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
 
-        return "".join(out_parts), last_line, was_truncated
+        return "".join(out_parts), last_line, was_truncated, omitted_final_line
 
     def _read_from_start_stream(self, p: Path, start: int) -> tuple[str, int, bool]:
         """
-        Stream from 1-indexed line `start` to EOF.
+        Stream from 1-indexed line `start` until EOF or confirmed truncation.
         Returns (snippet, last_line_seen, truncated_by_max_characters).
         """
         limit = getattr(self, "max_characters", None)
@@ -752,7 +844,7 @@ class TextEditor(CodeFunction):
         last_line = 0
 
         try:
-            with p.open("r", encoding="utf-8", errors="surrogateescape", newline="") as f:
+            with p.open("r", encoding="utf-8", errors="replace", newline="\n") as f:
                 for i, line in enumerate(f, 1):
                     last_line = i
                     if i < start:
@@ -770,11 +862,12 @@ class TextEditor(CodeFunction):
                                     was_truncated = True
                             else:
                                 was_truncated = True
-                # EOF reached
+                    if was_truncated:
+                        break
         except PermissionError as exc:
-            raise PermissionError(f"while reading '{p}': {exc}") from exc
+            raise PermissionError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
         except OSError as exc:
-            raise OSError(f"while reading '{p}': {exc}") from exc
+            raise OSError(_replace_surrogates(f"while reading '{p}': {exc}")) from exc
 
         return "".join(out_parts), last_line, was_truncated
 

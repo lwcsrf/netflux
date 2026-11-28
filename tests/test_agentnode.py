@@ -48,6 +48,10 @@ class _FakeAgentNode(AgentNode):
         self.ctx.post_success("ok")
 
 class TestAgentNodeUtilities(unittest.TestCase):
+    def test_tool_result_escapes_surrogates_and_preserves_unicode(self):
+        text = "café/\udce9/🙂\n\ud800"
+        self.assertEqual(AgentNode.escape_tool_result_surrogates(text), "café/\\udce9/🙂\n\\ud800")
+
     def test_intermediate_events_publish_stable_snapshots(self):
         fn = AgentFunction(
             name="events", desc="", args=[], system_prompt="system",

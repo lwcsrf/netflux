@@ -1,3 +1,4 @@
+import os
 import tempfile
 import threading
 import unittest
@@ -45,6 +46,154 @@ class TestTextEditorBasicOperations(unittest.TestCase):
             self.assertIn("1|line1\n", output)
             self.assertIn("2|line2\n", output)
             self.assertNotIn("OUTPUT TRUNCATED", output)
+
+    def test_view_replaces_invalid_utf8_in_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes("café\r\n".encode("utf-8") + b"caf\xe9 \xe2\x82\nlast\xff\n")
+            for start, end, expected in (
+                (None, None, "1|café\r\n2|caf\ufffd \ufffd\n3|last\ufffd\n"),
+                (1, 2, "1|café\r\n2|caf\ufffd \ufffd\n"),
+                (2, -1, "2|caf\ufffd \ufffd\n3|last\ufffd\n"),
+            ):
+                with self.subTest(start=start, end=end):
+                    result = self.editor.call(
+                        self.ctx, command="view", path=str(path), view_start_line=start, view_end_line=end,
+                    )
+                    self.assertEqual(result, expected)
+
+    @unittest.skipUnless(os.name == "posix" and os.fsdecode(b"\xff") == "\udcff", "requires byte filenames")
+    def test_directory_view_replaces_surrogates_in_entry_names(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            directory = Path(tmpdir)
+            (directory / os.fsdecode(b"bad_\xff_dir")).mkdir()
+            (directory / os.fsdecode(b"bad_\xff_file")).touch()
+            result = self.editor.call(self.ctx, command="view", path=tmpdir)
+            self.assertEqual(result, "bad_\ufffd_dir/\nbad_\ufffd_file")
+
+    @unittest.skipUnless(os.name == "posix" and os.fsdecode(b"\xff") == "\udcff", "requires byte filenames")
+    def test_view_missing_symlink_target_has_printable_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            link = Path(tmpdir, "link")
+            link.symlink_to(os.fsdecode(b"missing_\xff"))
+            with self.assertRaises(FileNotFoundError) as cm:
+                self.editor.call(self.ctx, command="view", path=str(link))
+            self.assertIn("missing_\ufffd", str(cm.exception))
+
+    def test_edits_preserve_invalid_utf8(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes(b"old\r\ncaf\xe9 \x80\xff\n")
+            self.editor.call(self.ctx, command="str_replace", path=str(path), old_str="old", new_str="new")
+            self.editor.call(self.ctx, command="insert", path=str(path), insert_line=1, new_str="extra\n")
+            self.assertEqual(path.read_bytes(), b"new\r\nextra\ncaf\xe9 \x80\xff\n")
+
+    def test_view_end_past_eof_returns_available_lines_and_warning(self) -> None:
+        warning = "\n[warning: requested end line 20 exceeds the file's last line (2).]".upper()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            for data, start, expected in (
+                (b"first\r\nlast\r\n", None, "1|first\r\n2|last\r\n" + warning),
+                (b"first\nlast", 2, "2|last\n[WARNING: There is no trailing LF on the final line]" + warning),
+            ):
+                with self.subTest(data=data, start=start):
+                    path.write_bytes(data)
+                    result = self.editor.call(
+                        self.ctx, command="view", path=str(path), view_start_line=start, view_end_line=20,
+                    )
+                    self.assertEqual(expected, result)
+
+    def test_view_start_past_eof_still_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes(b"first\nlast")
+            with self.assertRaisesRegex(TextEditorException, r"view_start_line 3 exceeds file line count \(2\)"):
+                self.editor.call(self.ctx, command="view", path=str(path), view_start_line=3, view_end_line=20)
+
+    def test_view_truncation_warnings_for_partial_and_complete_lines(self) -> None:
+        incomplete = "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]"
+        omitted = "[WARNING: OUTPUT TRUNCATED. ADDITIONAL LINES OMITTED. RE-SCOPE VIEW RANGE IF NEEDED.]"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            path.write_bytes(b"first\r\nsecond\nthird\n")
+            for limit, expected in (
+                (3, "1|fir[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER 3 CHARACTERS]\n" + incomplete),
+                (6, "1|first\r[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER 6 CHARACTERS]\n" + incomplete),
+                (7, "1|first\r\n" + omitted),
+                (14, "1|first\r\n2|second\n" + omitted),
+            ):
+                self.editor.max_characters = limit
+                for start, end in ((None, None), (1, 3), (1, -1)):
+                    with self.subTest(limit=limit, start=start, end=end):
+                        self.assertEqual(self.editor.handle_view(str(path), start, end), expected)
+                with self.subTest(limit=limit, end=20):
+                    self.assertEqual(
+                        self.editor.handle_view(str(path), 1, 20),
+                        expected + "\n[warning: requested end line 20 exceeds the file's last line (3).]".upper(),
+                    )
+
+    def test_displayed_lines_match_view_and_insert_positions(self) -> None:
+        for separator in ("\r", "\u2028", "\v", "\u2029"):
+            with self.subTest(separator=separator), tempfile.TemporaryDirectory() as tmpdir:
+                path = str(Path(tmpdir, "file.txt"))
+                middle = f"B{separator}C\n"
+                created = self.editor.handle_create(self.ctx, path, f"A\n{middle}D\n")
+                self.assertIn("Successfully wrote 3 lines", created)
+                numbered = ["1|A\n", f"2|{middle}", "3|D\n"]
+                self.assertEqual(self.editor.handle_view(path, None, None), "".join(numbered))
+                for i, line in enumerate(numbered, 1):
+                    self.assertEqual(self.editor.handle_view(path, i, i), line)
+                self.assertEqual(self.editor.handle_view(path, 2, -1), "".join(numbered[1:]))
+
+                self.editor.handle_insert(self.ctx, path, 2, "X\n")
+                self.assertEqual(Path(path).read_bytes(), f"A\n{middle}X\nD\n".encode("utf-8"))
+
+    def test_view_warns_only_when_explicit_end_matches_wc_l_and_omits_final_line(self) -> None:
+        no_lf = "\n[WARNING: There is no trailing LF on the final line]"
+
+        def warning(line: int) -> str:
+            return ("[Warning: The file's last line has no terminating newline and is just outside the requested range. "
+                    f"Request line {line} explicitly for it.]").upper()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir, "file.txt")
+            # The lookahead's first 64 KiB ends with CR, and the next read begins with LF.
+            split_crlf = b"a\n" + b"x" * (64 * 1024 - 1) + b"\r\nlast"
+            for data, end, expected in [
+                (b"a\r\nb\r\nc", 2, "1|a\r\n2|b\r\n\n" + warning(3)),
+                (b"a\nb\nc", 1, "1|a\n"),
+                (b"a\nb\nc\n", 2, "1|a\n2|b\n"),
+                (b"a\nb", 2, "1|a\n2|b" + no_lf),
+                (b"a\nb", -1, "1|a\n2|b" + no_lf),
+                (b"a\nb", None, "1|a\n2|b" + no_lf),
+                (b"a\rb\nc", 1, "1|a\rb\n\n" + warning(2)),
+                (b"a\rb\nc", 2, "1|a\rb\n2|c" + no_lf),
+                (b"a\rb\r", 1, "1|a\rb\r" + no_lf),
+                (b"a\nb\r", 1, "1|a\n\n" + warning(2)),
+                (split_crlf, 1, "1|a\n"),
+            ]:
+                with self.subTest(data=data[:32], end=end):
+                    path.write_bytes(data)
+                    self.assertEqual(expected, self.editor.handle_view(str(path), None, end))
+
+            path.write_bytes("A\nB\u2028C".encode("utf-8"))
+            self.assertEqual(self.editor.handle_view(str(path), 1, 1), "1|A\n\n" + warning(2))
+            self.assertEqual(self.editor.handle_view(str(path), 2, 2), "2|B\u2028C" + no_lf)
+
+            path.write_bytes(b"a\rc\n" * 124 + b"x" * 100_000)
+            for cutoff_line in (124, 2):
+                with self.subTest(cutoff_line=cutoff_line):
+                    limit = (cutoff_line - 1) * len("a\rc\n") + len("a\r")
+                    self.editor.max_characters = limit
+                    output = self.editor.call(
+                        self.ctx, command="view", path=str(path), view_start_line=1, view_end_line=124,
+                    )
+                    expected = [f"{i}|a\rc" for i in range(1, cutoff_line)] + [
+                        f"{cutoff_line}|a\r[WARNING: OUTPUT TRUNCATED ABRUPTLY AFTER {limit} CHARACTERS]",
+                        "[WARNING: OUTPUT TRUNCATED. LINE ABOVE IS INCOMPLETE. RE-SCOPE VIEW RANGE IF NEEDED.]",
+                        warning(125),
+                    ]
+                    self.assertEqual("\n".join(expected), output)
 
     def test_str_replace_single_match_updates_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -127,6 +276,17 @@ class TestTextEditorBasicOperations(unittest.TestCase):
                 "start\nline1\nline2\nend\n",
                 target.read_text(encoding="utf-8"),
             )
+
+    def test_insert_at_beginning_preserves_utf8_bom(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "t.py"
+            target.write_bytes(b"\xef\xbb\xbfimport sys\n")
+
+            self.editor.call(
+                self.ctx, command="insert", path=str(target), insert_line=0, new_str="import os\n",
+            )
+
+            self.assertEqual(target.read_bytes(), b"\xef\xbb\xbfimport os\nimport sys\n")
 
     def test_insert_line_out_of_range_raises(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -267,6 +427,68 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
             # No additional siblings (alternate files) should have been created.
             self.assertEqual(before_paths, after_paths)
 
+    def test_failed_create_removes_staging_file_and_can_be_retried(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmpdir:
+                directory = Path(tmpdir)
+                target = directory / "settings.json"
+                if existing:
+                    target.write_bytes(b"original")
+                before = set(directory.iterdir())
+                proposal = '{"name":"Café"}\r\n'
+
+                with patch.object(os, "fsync", side_effect=OSError("injected fsync failure")):
+                    with self.assertRaisesRegex(OSError, "injected fsync failure"):
+                        self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+                self.assertEqual(set(directory.iterdir()), before)
+
+                if existing:
+                    with self.assertRaisesRegex(FileExistsError, "Successfully wrote"):
+                        self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+                    self.assertEqual(target.read_bytes(), b"original")
+                else:
+                    self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+                    self.assertTrue(target.is_file())
+                created, = set(directory.iterdir()) - before
+                self.assertEqual(created.read_bytes(), proposal.encode("utf-8"))
+
+    def test_create_preserves_competing_file_at_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir).resolve() / "document.txt"
+            proposal = "complete\r\nproposal\n"
+            publish_name = "rename" if os.name == "nt" else "link"
+            publish = getattr(os, publish_name)
+
+            def publish_with_competitor(staged, destination):
+                destination = Path(destination)
+                self.assertTrue(self.editor._get_file_lock(self.ctx, destination).locked())
+                self.assertFalse(destination.exists())
+                self.assertEqual(Path(staged).parent, destination.parent)
+                self.assertEqual(Path(staged).read_bytes(), proposal.encode("utf-8"))
+                if destination == target:
+                    target.write_bytes(b"competing contents")
+                return publish(staged, destination)
+
+            with patch.object(os, publish_name, side_effect=publish_with_competitor):
+                with self.assertRaisesRegex(FileExistsError, "Successfully wrote") as cm:
+                    self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+            self.assertEqual(target.read_bytes(), b"competing contents")
+            alternate, = set(target.parent.iterdir()) - {target}
+            self.assertIn(str(alternate), str(cm.exception))
+            self.assertEqual(alternate.read_bytes(), proposal.encode("utf-8"))
+
+    def test_staging_name_collisions_retry_the_original_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, ".nf-requested")
+            occupied = target.with_name(".nf-occupied")
+            occupied.write_bytes(b"existing")
+            with patch("netflux.func_lib.text_editor_func.secrets.token_urlsafe",
+                       side_effect=["requested", "occupied", "available"]):
+                self.editor.call(self.ctx, command="create", path=str(target), file_text="proposal")
+            self.assertEqual(set(target.parent.iterdir()), {target, occupied})
+            self.assertEqual(target.read_bytes(), b"proposal")
+            self.assertEqual(occupied.read_bytes(), b"existing")
+
     def test_create_on_existing_file_uses_expected_suffix_pattern(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)
@@ -395,7 +617,7 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
     def test_raise_create_conflict_message_on_alternate_success(self) -> None:
         editor = TextEditor()
         p = Path("/original/path.txt")
-        file_text = "line1\nline2\n"
+        file_text = "line1\rcontinued\nline2\u2028continued\n"
 
         # Patch helper to simulate a successful alternate write without touching filesystem.
         with patch.object(
@@ -404,9 +626,9 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
             return_value=(Path("/alternate/path.txt"), None),
         ) as mock_alt:
             with self.assertRaises(FileExistsError) as cm:
-                editor._raise_create_conflict(p, file_text)
+                editor._raise_create_conflict(self.ctx, p, file_text)
 
-        mock_alt.assert_called_once_with(p, file_text)
+        mock_alt.assert_called_once_with(self.ctx, p, file_text)
         msg = str(cm.exception)
         self.assertIn("File already exists:", msg)
         self.assertIn(str(p), msg)
@@ -427,9 +649,9 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
             return_value=(Path("/alternate/path.txt"), alt_exc),
         ) as mock_alt:
             with self.assertRaises(FileExistsError) as cm:
-                editor._raise_create_conflict(p, file_text)
+                editor._raise_create_conflict(self.ctx, p, file_text)
 
-        mock_alt.assert_called_once_with(p, file_text)
+        mock_alt.assert_called_once_with(self.ctx, p, file_text)
         msg = str(cm.exception)
         self.assertIn("File already exists:", msg)
         self.assertIn(str(p), msg)
