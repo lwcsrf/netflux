@@ -425,6 +425,68 @@ class TestTextEditorCreateBehavior(unittest.TestCase):
             # No additional siblings (alternate files) should have been created.
             self.assertEqual(before_paths, after_paths)
 
+    def test_failed_create_removes_staging_file_and_can_be_retried(self) -> None:
+        for existing in (False, True):
+            with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmpdir:
+                directory = Path(tmpdir)
+                target = directory / "settings.json"
+                if existing:
+                    target.write_bytes(b"original")
+                before = set(directory.iterdir())
+                proposal = '{"name":"Café"}\r\n'
+
+                with patch.object(os, "fsync", side_effect=OSError("injected fsync failure")):
+                    with self.assertRaisesRegex(OSError, "injected fsync failure"):
+                        self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+                self.assertEqual(set(directory.iterdir()), before)
+
+                if existing:
+                    with self.assertRaisesRegex(FileExistsError, "Successfully wrote"):
+                        self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+                    self.assertEqual(target.read_bytes(), b"original")
+                else:
+                    self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+                    self.assertTrue(target.is_file())
+                created, = set(directory.iterdir()) - before
+                self.assertEqual(created.read_bytes(), proposal.encode("utf-8"))
+
+    def test_create_preserves_competing_file_at_publication(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir).resolve() / "document.txt"
+            proposal = "complete\r\nproposal\n"
+            publish_name = "rename" if os.name == "nt" else "link"
+            publish = getattr(os, publish_name)
+
+            def publish_with_competitor(staged, destination):
+                destination = Path(destination)
+                self.assertTrue(self.editor._get_file_lock(self.ctx, destination).locked())
+                self.assertFalse(destination.exists())
+                self.assertEqual(Path(staged).parent, destination.parent)
+                self.assertEqual(Path(staged).read_bytes(), proposal.encode("utf-8"))
+                if destination == target:
+                    target.write_bytes(b"competing contents")
+                return publish(staged, destination)
+
+            with patch.object(os, publish_name, side_effect=publish_with_competitor):
+                with self.assertRaisesRegex(FileExistsError, "Successfully wrote") as cm:
+                    self.editor.call(self.ctx, command="create", path=str(target), file_text=proposal)
+            self.assertEqual(target.read_bytes(), b"competing contents")
+            alternate, = set(target.parent.iterdir()) - {target}
+            self.assertIn(str(alternate), str(cm.exception))
+            self.assertEqual(alternate.read_bytes(), proposal.encode("utf-8"))
+
+    def test_staging_name_collisions_retry_the_original_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir, ".nf-requested")
+            occupied = target.with_name(".nf-occupied")
+            occupied.write_bytes(b"existing")
+            with patch("netflux.func_lib.text_editor_func.secrets.token_urlsafe",
+                       side_effect=["requested", "occupied", "available"]):
+                self.editor.call(self.ctx, command="create", path=str(target), file_text="proposal")
+            self.assertEqual(set(target.parent.iterdir()), {target, occupied})
+            self.assertEqual(target.read_bytes(), b"proposal")
+            self.assertEqual(occupied.read_bytes(), b"existing")
+
     def test_create_on_existing_file_uses_expected_suffix_pattern(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             base_dir = Path(tmpdir)

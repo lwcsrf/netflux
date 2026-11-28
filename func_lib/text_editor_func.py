@@ -1,6 +1,8 @@
+from contextlib import ExitStack
 from io import StringIO
 from pathlib import Path
 import tempfile
+import logging
 import os
 import re
 import secrets
@@ -21,6 +23,13 @@ def _split_file_lines(text: str) -> list[str]:
 def _replace_surrogates(text: str) -> str:
     """Make filesystem names safe to display in UTF-8 tool results."""
     return re.sub(r"[\ud800-\udfff]", "\ufffd", text)
+
+
+def _remove_create_temp(path: Path) -> None:
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logging.getLogger(__name__).warning("Could not remove temporary file %r after create", path, exc_info=True)
 
 
 class TextEditorException(Exception):
@@ -356,9 +365,6 @@ class TextEditor(CodeFunction):
                 raise IsADirectoryError(f"Path is a directory: {p}")
             self._raise_create_conflict(ctx, p, file_text)
 
-        # Race-safe create:
-        # Use exclusive create ('x') so if another process creates the file between our
-        # existence check and the open, the OS raises FileExistsError and we don't overwrite.
         try:
             p.parent.mkdir(parents=True, exist_ok=True)
         except PermissionError as exc:
@@ -368,8 +374,7 @@ class TextEditor(CodeFunction):
 
         try:
             with self._get_file_lock(ctx, p):
-                with p.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
-                    f.write(file_text)
+                self._try_atomic_create(p, file_text)
         except FileExistsError as exc:
             self._raise_create_conflict(ctx, p, file_text, original_exc=exc)
         except PermissionError as exc:
@@ -503,18 +508,50 @@ class TextEditor(CodeFunction):
 
             try:
                 with self._get_file_lock(ctx, alt_path):
-                    with alt_path.open("x", encoding="utf-8", errors="surrogateescape", newline="") as f:
-                        f.write(file_text)
+                    self._try_atomic_create(alt_path, file_text)
                 return alt_path, None
             except FileExistsError as exc:
                 last_exc = exc
-                continue
             except PermissionError as exc:
                 return alt_path, PermissionError(f"while creating alternate file '{alt_path}': {exc}")
             except OSError as exc:
                 return alt_path, OSError(f"while creating alternate file '{alt_path}': {exc}")
 
         return alt_path, last_exc
+
+    @staticmethod
+    def _try_atomic_create(path: Path, text: str) -> None:
+        """Atomically create the file, raising FileExistsError if the destination exists."""
+        max_attempts = 100
+        for _ in range(max_attempts):
+            # A short sibling name works even when the destination basename is at its length limit.
+            staged = path.with_name(f".nf-{secrets.token_urlsafe(7)}")
+            if staged.name.casefold() == path.name.casefold():
+                continue
+            try:
+                stream = staged.open("x", encoding="utf-8", errors="surrogateescape", newline="")
+            except FileExistsError:
+                continue
+            break
+        else:
+            raise OSError(
+                f"Could not allocate a temporary file for atomic creation of '{path}' "
+                f"after trying {max_attempts} candidate names."
+            )
+
+        with ExitStack() as cleanup:
+            cleanup.callback(_remove_create_temp, staged)
+            with stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+
+            # Possible this can now raise a FileExistsError due to race with another session not sharing our bag
+            if os.name == "nt":
+                os.rename(staged, path)  # Windows rename fails if the destination exists.
+                cleanup.pop_all()  # Rename consumed the temporary name.
+            else:
+                os.link(staged, path)
 
     def _check_extraneous_args(self, args_provided: Set[str], command: str) -> None:
         allowed_by_cmd: dict[str, set[str]] = {
