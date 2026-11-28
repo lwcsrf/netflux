@@ -287,16 +287,16 @@ class TextEditor(CodeFunction):
                 "If intention was to delete `old_str`, use empty string for `new_str`.")
 
         p = self._resolve_path(path)
-        if not p.exists():
-            raise FileNotFoundError(f"Path not found: {p}")
-        if p.is_dir():
-            raise IsADirectoryError(f"Path is a directory: {p}")
-        if not p.is_file():
-            raise TextEditorException(f"Path is not a regular file: {p}")
-
         lock = self._get_file_lock(ctx, p)
         lock.acquire()
         try:
+            if not p.exists():
+                raise FileNotFoundError(f"Path not found: {p}")
+            if p.is_dir():
+                raise IsADirectoryError(f"Path is a directory: {p}")
+            if not p.is_file():
+                raise TextEditorException(f"Path is not a regular file: {p}")
+
             # Mid-air guard: record mtime before we read
             mtime_before = self._stat_mtime_ns(p)
             content = self._read_text_preserve_eols(p)
@@ -395,16 +395,16 @@ class TextEditor(CodeFunction):
             raise TextEditorException("Missing argument: new_str")
 
         p = self._resolve_path(path)
-        if not p.exists():
-            raise FileNotFoundError(f"Path not found: {p}")
-        if p.is_dir():
-            raise IsADirectoryError(f"Path is a directory: {p}")
-        if not p.is_file():
-            raise TextEditorException(f"Path is not a regular file: {p}")
-
         lock = self._get_file_lock(ctx, p)
         lock.acquire()
         try:
+            if not p.exists():
+                raise FileNotFoundError(f"Path not found: {p}")
+            if p.is_dir():
+                raise IsADirectoryError(f"Path is a directory: {p}")
+            if not p.is_file():
+                raise TextEditorException(f"Path is not a regular file: {p}")
+
             # Mid-air guard: record mtime before we read
             mtime_before = self._stat_mtime_ns(p)
             content = self._read_text_preserve_eols(p)
